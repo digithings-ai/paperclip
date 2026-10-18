@@ -78,6 +78,10 @@ import {
   type WorktreeRunExecutionActivationState,
 } from "./instance-settings.js";
 import { queueIssueAssignmentWakeup, type IssueAssignmentWakeupDeps } from "./issue-assignment-wakeup.js";
+import {
+  isRoutineExecutionIssueLive,
+  isRoutineStrandedGateEnabled,
+} from "./routines/execution-liveness.js";
 import { logActivity } from "./activity-log.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 import { runtimePublicOrigin } from "./cloud-runtime-identity.js";
@@ -1232,6 +1236,44 @@ export function routineService(
         if (!row.originId) continue;
         rowsByOriginId.set(row.originId, row);
       }
+
+      // DIG-4067: default-off liveness gate. Legacy behavior is preserved
+      // exactly while the gate is off; when on, a stale open issue with a
+      // deferred wake or an open native finalization still reads live.
+      if (isRoutineStrandedGateEnabled()) {
+        const stillMissing = missingRoutineIds.filter(
+          (routineId) => !rowsByOriginId.has(routineId),
+        );
+        for (const routineId of stillMissing) {
+          const candidate = await db
+            .select()
+            .from(issues)
+            .where(
+              and(
+                eq(issues.companyId, companyId),
+                eq(issues.originKind, "routine_execution"),
+                eq(issues.originId, routineId),
+                inArray(issues.status, OPEN_ISSUE_STATUSES),
+                visibleIssueCondition(),
+              ),
+            )
+            .orderBy(desc(issues.updatedAt), desc(issues.createdAt))
+            .limit(1)
+            .then((rows) => rows[0] ?? null);
+          if (
+            candidate &&
+            (await isRoutineExecutionIssueLive(db, {
+              companyId: candidate.companyId,
+              id: candidate.id,
+              status: candidate.status,
+              updatedAt: candidate.updatedAt,
+              executionRunId: candidate.executionRunId,
+            }))
+          ) {
+            rowsByOriginId.set(routineId, candidate);
+          }
+        }
+      }
     }
 
     const map = new Map<string, RoutineListItem["activeIssue"]>();
@@ -1558,7 +1600,7 @@ export function routineService(
       .then((rows) => rows[0]?.issues ?? null);
     if (executionBoundIssue) return executionBoundIssue;
 
-    return executor
+    const legacyIssue = await executor
       .select()
       .from(issues)
       .innerJoin(
@@ -1582,6 +1624,42 @@ export function routineService(
       .orderBy(desc(issues.updatedAt), desc(issues.createdAt))
       .limit(1)
       .then((rows) => rows[0]?.issues ?? null);
+    if (legacyIssue) return legacyIssue;
+
+    // DIG-4067: default-off liveness gate. Legacy behavior is preserved
+    // exactly while the gate is off; when on, a stale open issue with a
+    // deferred wake or an open native finalization still reads live.
+    if (!isRoutineStrandedGateEnabled()) return null;
+
+    const candidate = await executor
+      .select()
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, routine.companyId),
+          eq(issues.originKind, originKind),
+          eq(issues.originId, originId),
+          inArray(issues.status, OPEN_ISSUE_STATUSES),
+          visibleIssueCondition(),
+          ...(fingerprintCondition ? [fingerprintCondition] : []),
+        ),
+      )
+      .orderBy(desc(issues.updatedAt), desc(issues.createdAt))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    if (
+      candidate &&
+      (await isRoutineExecutionIssueLive(executor, {
+        companyId: candidate.companyId,
+        id: candidate.id,
+        status: candidate.status,
+        updatedAt: candidate.updatedAt,
+        executionRunId: candidate.executionRunId,
+      }))
+    ) {
+      return candidate;
+    }
+    return null;
   }
 
   // DIG-3729: resolve a routine's standing issue by primary key.
