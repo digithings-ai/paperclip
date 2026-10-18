@@ -3117,16 +3117,23 @@ const ISSUE_LIST_STORM_WINDOW_MS = 500;
 const ISSUE_LIST_STORM_THRESHOLD = 4;
 const ISSUE_LIST_MAX_ACTOR_CLIENT_INFLIGHT = 8;
 
+type IssueListDegraded = {
+  skippedRows: number;
+  auxiliaryUnavailable: boolean;
+};
+
 type IssueListPreparedResponse =
   | {
       kind: "compact";
       body: CompactIssue[];
       etag: string;
       cacheControl: string;
+      degraded?: IssueListDegraded;
     }
   | {
       kind: "full";
       body: unknown[];
+      degraded?: IssueListDegraded;
     };
 
 type IssueListCacheStatus = "miss" | "hit" | "coalesced" | "stale" | "retry";
@@ -3394,7 +3401,11 @@ async function coordinateIssueListGet(input: {
         visibilityHint: input.req.header("x-paperclip-tab-visible") ?? null,
       };
       logger.warn(event, "request_storm_detected");
-      input.diagnostics?.onStormDetected?.(event);
+      try {
+        input.diagnostics?.onStormDetected?.(event);
+      } catch (err) {
+        logger.warn({ err }, "issue list storm diagnostics hook failed");
+      }
     }
     const response = await existing.promise;
     return { response, cacheStatus: "coalesced", identicalInFlightCount };
@@ -3422,10 +3433,14 @@ async function coordinateIssueListGet(input: {
 
   issueListActorClientInflight.set(actorClientKey, actorClientInflight + 1);
   const promise = (async () => {
-    await input.diagnostics?.onComputeStart?.({
-      companyId: input.companyId,
-      cacheKeyHash: input.requestKey.keyHash,
-    });
+    try {
+      await input.diagnostics?.onComputeStart?.({
+        companyId: input.companyId,
+        cacheKeyHash: input.requestKey.keyHash,
+      });
+    } catch (err) {
+      logger.warn({ err }, "issue list compute-start diagnostics hook failed");
+    }
     return input.compute();
   })();
   const inflightEntry: IssueListInflightEntry = {
@@ -3499,6 +3514,40 @@ function logIssueListRequest(input: {
       "safe authenticated GET observed",
     );
   });
+}
+
+/**
+ * Settle per-row access decisions for a list response. A single row whose
+ * access check rejects must exclude that row (fail-closed), never reject the
+ * whole list (DIG-934: one bad row 500'd the company issues list).
+ */
+export async function settleIssueAccessDecisions<T>(
+  rows: T[],
+  decideOne: (row: T) => Promise<{ allowed?: boolean } | boolean | null | undefined>,
+  report?: IssueListDegraded,
+): Promise<T[]> {
+  const kept = await Promise.all(
+    rows.map(async (row) => {
+      try {
+        const decision = await decideOne(row);
+        return {
+          row,
+          keep:
+            typeof decision === "boolean"
+              ? decision
+              : decision?.allowed === true,
+        };
+      } catch (err) {
+        if (report) report.skippedRows += 1;
+        logger.warn(
+          { err, issueId: (row as { id?: unknown })?.id ?? null },
+          "issue list access check failed for a row; excluding it instead of failing the list",
+        );
+        return { row, keep: false };
+      }
+    }),
+  );
+  return kept.filter((entry) => entry.keep).map((entry) => entry.row);
 }
 
 export function issueRoutes(
@@ -5224,11 +5273,12 @@ export function issueRoutes(
 
   async function filterIssuesForActor<
     T extends Parameters<typeof decideIssueAccess>[1],
-  >(req: Request, rows: T[]) {
-    const decisions = await Promise.all(
-      rows.map((issue) => decideIssueAccess(req, issue, "issue:read")),
+  >(req: Request, rows: T[], report?: IssueListDegraded) {
+    return settleIssueAccessDecisions(
+      rows,
+      (issue) => decideIssueAccess(req, issue, "issue:read"),
+      report,
     );
-    return rows.filter((_, index) => decisions[index]?.allowed);
   }
 
   async function actorCanReadCompanyScope(req: Request, companyId: string) {
@@ -8145,16 +8195,38 @@ export function issueRoutes(
       allowTtlCache: compactView,
       diagnostics: opts.issueListDiagnostics,
       compute: async () => {
+        const degraded: IssueListDegraded = {
+          skippedRows: 0,
+          auxiliaryUnavailable: false,
+        };
         const rawResult = await svc.list(companyId, listFilters);
         const result = (await actorCanReadCompanyScope(req, companyId))
           ? rawResult
-          : await filterIssuesForActor(req, rawResult);
+          : await filterIssuesForActor(req, rawResult, degraded);
         const issueIds = result.map((issue) => issue.id);
         if (compactView) {
-          const [handoffStates, recoveryActionByIssue] = await Promise.all([
-            listSuccessfulRunHandoffStates(db, companyId, issueIds),
-            recoveryActionsSvc.listActiveForIssues(companyId, issueIds),
-          ]);
+          const handoffStates = await listSuccessfulRunHandoffStates(
+            db,
+            companyId,
+            issueIds,
+          ).catch((err) => {
+            logger.warn(
+              { err, companyId, issueCount: issueIds.length },
+              "issue list handoff states unavailable; continuing without them",
+            );
+            degraded.auxiliaryUnavailable = true;
+            return new Map();
+          });
+          const recoveryActionByIssue = await recoveryActionsSvc
+            .listActiveForIssues(companyId, issueIds)
+            .catch((err) => {
+              logger.warn(
+                { err, companyId, issueCount: issueIds.length },
+                "issue list recovery actions unavailable; continuing without them",
+              );
+              degraded.auxiliaryUnavailable = true;
+              return new Map();
+            });
           const actor = getActorInfo(req);
           await Promise.all(
             result.map(async (issue) => {
@@ -8183,12 +8255,33 @@ export function issueRoutes(
             body: compactResult,
             etag: compactIssueListEtag(compactResult),
             cacheControl: "private, must-revalidate",
+            ...(degraded.skippedRows > 0 || degraded.auxiliaryUnavailable
+              ? { degraded: { ...degraded } }
+              : {}),
           };
         }
-        const [handoffStates, recoveryActionByIssue] = await Promise.all([
-          listSuccessfulRunHandoffStates(db, companyId, issueIds),
-          recoveryActionsSvc.listActiveForIssues(companyId, issueIds),
-        ]);
+        const handoffStates = await listSuccessfulRunHandoffStates(
+          db,
+          companyId,
+          issueIds,
+        ).catch((err) => {
+          logger.warn(
+            { err, companyId, issueCount: issueIds.length },
+            "issue list handoff states unavailable; continuing without them",
+          );
+          degraded.auxiliaryUnavailable = true;
+          return new Map();
+        });
+        const recoveryActionByIssue = await recoveryActionsSvc
+          .listActiveForIssues(companyId, issueIds)
+          .catch((err) => {
+            logger.warn(
+              { err, companyId, issueCount: issueIds.length },
+              "issue list recovery actions unavailable; continuing without them",
+            );
+            degraded.auxiliaryUnavailable = true;
+            return new Map();
+          });
         const actor = getActorInfo(req);
         await Promise.all(
           result.map(async (issue) => {
@@ -8212,6 +8305,9 @@ export function issueRoutes(
             successfulRunHandoff: handoffStates.get(issue.id) ?? null,
             activeRecoveryAction: recoveryActionByIssue.get(issue.id) ?? null,
           })),
+          ...(degraded.skippedRows > 0 || degraded.auxiliaryUnavailable
+            ? { degraded: { ...degraded } }
+            : {}),
         };
       },
     });
@@ -8238,6 +8334,12 @@ export function issueRoutes(
       return;
     }
 
+    if (coordinated.response.degraded) {
+      res.setHeader(
+        "X-Paperclip-Issue-List-Degraded",
+        `skipped-rows=${coordinated.response.degraded.skippedRows};auxiliary=${coordinated.response.degraded.auxiliaryUnavailable ? "unavailable" : "ok"}`,
+      );
+    }
     if (coordinated.response.kind === "compact") {
       res.setHeader("Cache-Control", coordinated.response.cacheControl);
       res.setHeader("ETag", coordinated.response.etag);
