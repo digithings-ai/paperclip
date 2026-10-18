@@ -4366,7 +4366,16 @@ export function recoveryService(
       operatorCancelExempted: 0,
       onboardingFirstTaskExempted: 0,
       skipped: 0,
+      skippedReasons: {} as Record<string, number>,
       issueIds: [] as string[],
+    };
+
+    // Reason-coded skip ladder (DIG-4064): every `continue` that counts a
+    // skip also bumps its ladder rung, so `skipped` always equals the sum
+    // of `skippedReasons` without changing any recovery behaviour.
+    const bumpSkipped = (reason: string): void => {
+      result.skipped += 1;
+      result.skippedReasons[reason] = (result.skippedReasons[reason] ?? 0) + 1;
     };
 
     const candidateIssueIds = candidates.map((issue) => issue.id);
@@ -4398,7 +4407,7 @@ export function recoveryService(
         await settleSlackConversation(db, issue.companyId, issue.id);
         const [current] = await db.select({ externalConversationState: externalConversationStateSql() })
           .from(issues).where(and(eq(issues.companyId, issue.companyId), eq(issues.id, issue.id)));
-        if (current?.externalConversationState === "waiting") { result.skipped += 1; continue; }
+        if (current?.externalConversationState === "waiting") { bumpSkipped("chat_channel_waiting_for_settlement"); continue; }
       }
       if (issue.conversationAgentId) {
         const lastRun = await getLatestIssueRun(issue.companyId, issue.id);
@@ -4408,12 +4417,12 @@ export function recoveryService(
             if (current) Object.assign(issue, current);
           }
         }
-        if (!(await instanceSettingsService(db).getExperimental()).enableAgentChat) { result.skipped += 1; continue; }
+        if (!(await instanceSettingsService(db).getExperimental()).enableAgentChat) { bumpSkipped("agent_chat_experiment_disabled"); continue; }
         {
           await deliverConversationComments(db, issue, deps.enqueueWakeup);
         }
       }
-      if (isWaitingConversation(issue)) { result.skipped += 1; continue; }
+      if (isWaitingConversation(issue)) { bumpSkipped("waiting_conversation"); continue; }
       const executionState = issue.status === "in_review"
         ? parseIssueExecutionState(issue.executionState)
         : null;
@@ -4430,7 +4439,7 @@ export function recoveryService(
           ? participantAgentId
           : issue.assigneeAgentId;
       if (!agentId) {
-        result.skipped += 1;
+        bumpSkipped("missing_assignee_agent");
         continue;
       }
 
@@ -4441,7 +4450,7 @@ export function recoveryService(
       if (
         unfinishedGoalBindings.has(`${issue.companyId}:${issue.id}:${agentId}`)
       ) {
-        result.skipped += 1;
+        bumpSkipped("durable_goal_owns_continuation");
         continue;
       }
 
@@ -4455,7 +4464,7 @@ export function recoveryService(
         latestRun?.status === "succeeded" &&
         parseObject(latestRun.resultJson).finalizationReasonCode === "conversation_turn_finished"
       ) {
-        result.skipped += 1;
+        bumpSkipped("conversation_publication_window");
         continue;
       }
 
@@ -4470,7 +4479,7 @@ export function recoveryService(
           } else if (outcome === "escalated") {
             result.escalated += 1;
             result.issueIds.push(issue.id);
-          } else result.skipped += 1;
+          } else bumpSkipped("legacy_continuation_no_action");
           continue;
         }
       }
@@ -4485,7 +4494,7 @@ export function recoveryService(
         agent.companyId === issue.companyId &&
         (await hasCurrentNativePassiveWait(issue, latestRun))
       ) {
-        result.skipped += 1;
+        bumpSkipped("paused_with_native_passive_wait");
         continue;
       }
       if (issue.status !== "in_review" && !agentInvokable) {
@@ -4499,7 +4508,7 @@ export function recoveryService(
             result.escalated += 1;
             result.issueIds.push(issue.id);
           } else {
-            result.skipped += 1;
+            bumpSkipped("disposition_repair_declined_uninvokable");
           }
         } else {
           const updated = await escalateStrandedAssignedIssue({
@@ -4514,7 +4523,7 @@ export function recoveryService(
             result.escalated += 1;
             result.issueIds.push(issue.id);
           } else {
-            result.skipped += 1;
+            bumpSkipped("escalation_declined_uninvokable");
           }
         }
         continue;
@@ -4527,12 +4536,12 @@ export function recoveryService(
           issue.status === "in_review" ? agentId : null,
         )
       ) {
-        result.skipped += 1;
+        bumpSkipped("active_execution_path");
         continue;
       }
 
       if (await hasPendingWakeInteraction(issue.companyId, issue.id)) {
-        result.skipped += 1;
+        bumpSkipped("pending_wake_interaction");
         continue;
       }
 
@@ -4545,7 +4554,7 @@ export function recoveryService(
         issue.id,
       );
       if (activeRecoveryAction?.ownerType === "board") {
-        result.skipped += 1;
+        bumpSkipped("board_owned_recovery_action");
         continue;
       }
 
@@ -4557,7 +4566,7 @@ export function recoveryService(
           treeControlSvc,
         )
       ) {
-        result.skipped += 1;
+        bumpSkipped("pause_hold_suppresses_recovery");
         continue;
       }
 
@@ -4584,7 +4593,7 @@ export function recoveryService(
           })
         ).kind !== "clear"
       ) {
-        result.skipped += 1;
+        bumpSkipped("chat_control_recovery_stop");
         continue;
       }
       if (isOperatorCancelledRun(executionRecoverySource, agentId)) {
@@ -4630,7 +4639,7 @@ export function recoveryService(
             result.escalated += 1;
             result.issueIds.push(issue.id);
           } else {
-            result.skipped += 1;
+            bumpSkipped("disposition_repair_declined_over_budget");
           }
         } else {
           const updated = await escalateStrandedAssignedIssue({
@@ -4649,7 +4658,7 @@ export function recoveryService(
             result.escalated += 1;
             result.issueIds.push(issue.id);
           } else {
-            result.skipped += 1;
+            bumpSkipped("escalation_declined_over_budget");
           }
         }
         continue;
@@ -4673,7 +4682,7 @@ export function recoveryService(
           result.escalated += 1;
           result.issueIds.push(issue.id);
         } else {
-          result.skipped += 1;
+          bumpSkipped("native_blocked_wait_repair_declined");
         }
         continue;
       }
@@ -4681,7 +4690,7 @@ export function recoveryService(
         latestRun?.status === "succeeded" &&
         (await hasPersistedDurableWaitPath(issue, latestRun))
       ) {
-        result.skipped += 1;
+        bumpSkipped("persisted_durable_wait_path");
         continue;
       }
       const recoveryNow = new Date();
@@ -4696,7 +4705,7 @@ export function recoveryService(
           recoveryNow,
         )
       ) {
-        result.skipped += 1;
+        bumpSkipped("provider_quota_monitor_pending");
         continue;
       }
       if (
@@ -4712,7 +4721,7 @@ export function recoveryService(
           result.escalated += 1;
           result.issueIds.push(issue.id);
         } else {
-          result.skipped += 1;
+          bumpSkipped("stranded_recovery_issue_escalation_declined");
         }
         continue;
       }
@@ -4726,7 +4735,7 @@ export function recoveryService(
       if (latestRun && adapterFailureClassification) {
         const targetAgentId = getAdapterFailureRecoveryTargetAgentId(issue);
         if (!targetAgentId || latestRun.agentId !== targetAgentId) {
-          result.skipped += 1;
+          bumpSkipped("adapter_failure_target_mismatch");
           continue;
         }
 
@@ -4745,7 +4754,7 @@ export function recoveryService(
             result.issueIds.push(issue.id);
             continue;
           }
-          result.skipped += 1;
+          bumpSkipped("adapter_monitor_not_scheduled");
           continue;
         } else {
           const updated = await escalateStrandedAssignedIssue({
@@ -4765,7 +4774,7 @@ export function recoveryService(
             result.escalated += 1;
             result.issueIds.push(issue.id);
           } else {
-            result.skipped += 1;
+            bumpSkipped("configuration_incomplete_escalation_declined");
           }
           continue;
         }
@@ -4803,17 +4812,17 @@ export function recoveryService(
 
         if (!successfulRunSinceResolution) {
           if (!agentInvokable) {
-            result.skipped += 1;
+            bumpSkipped("accepted_continuation_agent_not_invokable");
             continue;
           }
 
           if (await hasQueuedIssueWake(issue.companyId, issue.id, agentId)) {
-            result.skipped += 1;
+            bumpSkipped("accepted_continuation_wake_queued");
             continue;
           }
 
           if (await isInvocationBudgetBlocked(issue, agentId)) {
-            result.skipped += 1;
+            bumpSkipped("accepted_continuation_budget_blocked");
             continue;
           }
 
@@ -4848,7 +4857,7 @@ export function recoveryService(
               result.escalated += 1;
               result.issueIds.push(issue.id);
             } else {
-              result.skipped += 1;
+              bumpSkipped("review_park_repair_no_action");
             }
             continue;
           }
@@ -4877,7 +4886,7 @@ export function recoveryService(
               result.escalated += 1;
               result.issueIds.push(issue.id);
             } else {
-              result.skipped += 1;
+              bumpSkipped("accepted_continuation_cancel_escalation_declined");
             }
             continue;
           }
@@ -4908,7 +4917,7 @@ export function recoveryService(
             result.continuationRequeued += 1;
             result.issueIds.push(issue.id);
           } else {
-            result.skipped += 1;
+            bumpSkipped("accepted_continuation_requeue_declined");
           }
           continue;
         }
@@ -4916,7 +4925,7 @@ export function recoveryService(
 
       if (issue.status === "in_review") {
         if (!participantAgentId || !pendingExecutionState) {
-          result.skipped += 1;
+          bumpSkipped("review_participant_or_state_missing");
           continue;
         }
         const participantLatestRun = participantLatestRunForRecovery;
@@ -4937,10 +4946,10 @@ export function recoveryService(
               result.escalated += 1;
               result.issueIds.push(issue.id);
             } else {
-              result.skipped += 1;
+              bumpSkipped("review_participant_unavailable_escalation_declined");
             }
           } else {
-            result.skipped += 1;
+            bumpSkipped("review_participant_waiting_nonterminal");
           }
           continue;
         }
@@ -4968,7 +4977,7 @@ export function recoveryService(
             result.providerQuotaMonitored += 1;
             result.issueIds.push(issue.id);
           } else {
-            result.skipped += 1;
+            bumpSkipped("review_participant_quota_monitor_declined");
           }
           continue;
         }
@@ -4994,7 +5003,7 @@ export function recoveryService(
             result.escalated += 1;
             result.issueIds.push(issue.id);
           } else {
-            result.skipped += 1;
+            bumpSkipped("review_participant_configuration_incomplete_declined");
           }
           continue;
         }
@@ -5011,7 +5020,7 @@ export function recoveryService(
             result.escalated += 1;
             result.issueIds.push(issue.id);
           } else {
-            result.skipped += 1;
+            bumpSkipped("review_participant_not_invokable");
           }
           continue;
         }
@@ -5033,7 +5042,7 @@ export function recoveryService(
             result.escalated += 1;
             result.issueIds.push(issue.id);
           } else {
-            result.skipped += 1;
+            bumpSkipped("review_participant_recovery_escalation_declined");
           }
           continue;
         }
@@ -5045,12 +5054,12 @@ export function recoveryService(
             participantAgentId,
           )
         ) {
-          result.skipped += 1;
+          bumpSkipped("review_participant_wake_queued");
           continue;
         }
 
         if (await isInvocationBudgetBlocked(issue, participantAgentId)) {
-          result.skipped += 1;
+          bumpSkipped("review_participant_budget_blocked");
           continue;
         }
 
@@ -5095,10 +5104,10 @@ export function recoveryService(
             result.escalated += 1;
             result.issueIds.push(issue.id);
           } else {
-            result.skipped += 1;
+            bumpSkipped("review_terminal_escalation_declined_uninvokable");
           }
         } else {
-          result.skipped += 1;
+          bumpSkipped("review_participant_requeue_declined");
         }
         continue;
       }
@@ -5117,12 +5126,12 @@ export function recoveryService(
           }
 
           if (await hasQueuedIssueWake(issue.companyId, issue.id)) {
-            result.skipped += 1;
+            bumpSkipped("todo_initial_wake_queued");
             continue;
           }
 
           if (await isInvocationBudgetBlocked(issue, agentId)) {
-            result.skipped += 1;
+            bumpSkipped("todo_initial_budget_blocked");
             continue;
           }
 
@@ -5134,7 +5143,7 @@ export function recoveryService(
             result.assignmentDispatched += 1;
             result.issueIds.push(issue.id);
           } else {
-            result.skipped += 1;
+            bumpSkipped("todo_initial_dispatch_declined");
           }
           continue;
         }
@@ -5143,7 +5152,7 @@ export function recoveryService(
           latestRun.status === "succeeded" &&
           !(await wasTodoHandedBackDuringOrAfterLatestRun(issue, latestRun))
         ) {
-          result.skipped += 1;
+          bumpSkipped("todo_succeeded_no_handback");
           continue;
         }
 
@@ -5165,13 +5174,13 @@ export function recoveryService(
             result.escalated += 1;
             result.issueIds.push(issue.id);
           } else {
-            result.skipped += 1;
+            bumpSkipped("assignment_recovery_escalation_declined");
           }
           continue;
         }
 
         if (await isInvocationBudgetBlocked(issue, agentId)) {
-          result.skipped += 1;
+          bumpSkipped("todo_assignment_budget_blocked");
           continue;
         }
 
@@ -5214,16 +5223,16 @@ export function recoveryService(
             result.escalated += 1;
             result.issueIds.push(issue.id);
           } else {
-            result.skipped += 1;
+            bumpSkipped("assignment_retry_exhausted_escalation_declined");
           }
         } else {
-          result.skipped += 1;
+          bumpSkipped("assignment_dispatch_declined");
         }
         continue;
       }
 
       if (!latestRun && !issue.checkoutRunId && !issue.executionRunId) {
-        result.skipped += 1;
+        bumpSkipped("no_run_no_checkout");
         continue;
       }
       if (readDispositionRepairAttempt(latestRun)) {
@@ -5236,18 +5245,18 @@ export function recoveryService(
           result.escalated += 1;
           result.issueIds.push(issue.id);
         } else {
-          result.skipped += 1;
+          bumpSkipped("disposition_repair_no_action");
         }
         continue;
       }
       const handoffEvidence = isExhaustedSuccessfulRunHandoff(latestRun);
       if (handoffEvidence) {
         if (isPluginManagedIssueLifecycle(issue)) {
-          result.skipped += 1;
+          bumpSkipped("plugin_managed_handoff");
           continue;
         }
         if (!handoffEvidence.exhausted) {
-          result.skipped += 1;
+          bumpSkipped("handoff_not_exhausted");
           continue;
         }
 
@@ -5266,7 +5275,7 @@ export function recoveryService(
         // returns null for them and they escalate exactly as before.
         if (latestRun?.status === "interrupted") {
           if (await isInvocationBudgetBlocked(issue, agentId)) {
-            result.skipped += 1;
+            bumpSkipped("handoff_interrupted_budget_blocked");
             continue;
           }
           const retried = await enqueueStrandedIssueRecovery({
@@ -5302,7 +5311,7 @@ export function recoveryService(
           correctiveRunId: handoffEvidence.correctiveRunId,
           persistedEvidence: priorHandoffAction?.evidence ?? null,
         })) {
-          result.skipped += 1;
+          bumpSkipped("handoff_already_escalated");
           continue;
         }
         const updated = await escalateStrandedAssignedIssue({
@@ -5316,7 +5325,7 @@ export function recoveryService(
           result.successfulRunHandoffEscalated += 1;
           result.issueIds.push(issue.id);
         } else {
-          result.skipped += 1;
+          bumpSkipped("handoff_escalation_declined");
         }
         continue;
       }
@@ -5330,13 +5339,13 @@ export function recoveryService(
         const workspace = parseObject(parseObject(successfulRun.contextSnapshot).paperclipWorkspace);
         if (workspace.mode === "shared_workspace" && (await healthyOpenChildIssues(issue, true)).length > 0) {
           result.productiveContinuationObserved += 1;
-          result.skipped += 1;
+          bumpSkipped("shared_workspace_child_waiting");
           continue;
         }
 
         if (!isProductiveContinuationRun(successfulRun)) {
           result.successfulContinuationObserved += 1;
-          result.skipped += 1;
+          bumpSkipped("continuation_not_productive");
           continue;
         }
 
@@ -5364,7 +5373,7 @@ export function recoveryService(
               result.escalated += 1;
               result.issueIds.push(issue.id);
             } else {
-              result.skipped += 1;
+              bumpSkipped("productive_retry_escalation_declined");
             }
             continue;
           }
@@ -5372,7 +5381,7 @@ export function recoveryService(
         }
 
         if (await isInvocationBudgetBlocked(issue, agentId)) {
-          result.skipped += 1;
+          bumpSkipped("productive_retry_budget_blocked");
           continue;
         }
 
@@ -5388,7 +5397,7 @@ export function recoveryService(
           result.continuationRequeued += 1;
           result.issueIds.push(issue.id);
         } else {
-          result.skipped += 1;
+          bumpSkipped("productive_requeue_declined");
         }
         continue;
       }
@@ -5414,7 +5423,7 @@ export function recoveryService(
             result.escalated += 1;
             result.issueIds.push(issue.id);
           } else {
-            result.skipped += 1;
+            bumpSkipped("continuation_disposition_repair_no_action");
           }
           continue;
         }
@@ -5437,7 +5446,7 @@ export function recoveryService(
             result.escalated += 1;
             result.issueIds.push(issue.id);
           } else {
-            result.skipped += 1;
+            bumpSkipped("nonretryable_failure_escalation_declined");
           }
           continue;
         }
@@ -5470,7 +5479,7 @@ export function recoveryService(
               result.escalated += 1;
               result.issueIds.push(issue.id);
             } else {
-              result.skipped += 1;
+              bumpSkipped("lost_execution_retry_escalation_declined");
             }
             continue;
           }
@@ -5481,7 +5490,7 @@ export function recoveryService(
               classification.baseBackoffMs *
               Math.pow(2, Math.max(0, consecutive - 1));
             if (elapsed < requiredDelay) {
-              result.skipped += 1;
+              bumpSkipped("backoff_delay_not_elapsed");
               continue;
             }
           }
@@ -5489,7 +5498,7 @@ export function recoveryService(
       }
 
       if (await isInvocationBudgetBlocked(issue, agentId)) {
-        result.skipped += 1;
+        bumpSkipped("continuation_budget_blocked");
         continue;
       }
 
@@ -5533,22 +5542,30 @@ export function recoveryService(
           result.escalated += 1;
           result.issueIds.push(issue.id);
         } else {
-          result.skipped += 1;
+          bumpSkipped("bounded_retry_spent_escalation_declined");
         }
       } else {
-        result.skipped += 1;
+        bumpSkipped("continuation_requeue_declined");
       }
     }
 
     const orphanBlockerRecovery = await reconcileUnassignedBlockingIssues();
     result.orphanBlockersAssigned = orphanBlockerRecovery.assigned;
     result.skipped += orphanBlockerRecovery.skipped;
+    if (orphanBlockerRecovery.skipped > 0) {
+      result.skippedReasons.orphan_blocker_carryover =
+        (result.skippedReasons.orphan_blocker_carryover ?? 0) + orphanBlockerRecovery.skipped;
+    }
     result.issueIds.push(...orphanBlockerRecovery.issueIds);
 
     const activeRecovery = await reconcileActiveRecoveryActions();
     result.continuationRequeued += activeRecovery.requeued;
     result.escalated += activeRecovery.escalated;
     result.skipped += activeRecovery.skipped;
+    if (activeRecovery.skipped > 0) {
+      result.skippedReasons.active_recovery_carryover =
+        (result.skippedReasons.active_recovery_carryover ?? 0) + activeRecovery.skipped;
+    }
     result.issueIds.push(...activeRecovery.issueIds);
     result.issueIds = [...new Set(result.issueIds)];
 
