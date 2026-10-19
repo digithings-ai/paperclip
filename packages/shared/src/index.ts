@@ -2821,6 +2821,9 @@ export * from "./browser-use.js";
 export * from "./types/skill-source.js";
 export * from "./validators/skill-source.js";
 export * from "./github-skill-repository.js";
+export * from "./public-mcp.js";
+export * from "./mcp-setup.js";
+
 
 export { aiConnectionRouterSlug, aiConnectionRouterAppDefinition, aiConnectionRouterPluginKey } from "./ai-connection-router.js";
 export { isAppAggregator, aggregatorManagementUrl, aggregatorAppsSyncSchema, aggregatorAppsRefreshSchema, arcadeDiscoverySetupSchema, type AggregatorAppSnapshot, type AggregatorAppsResponse, type ArcadeDiscoverySetupInput } from "./aggregator-apps.js";

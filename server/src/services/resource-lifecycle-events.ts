@@ -23,3 +23,8 @@ export async function recordAgentStatusEvent(db: Db, companyId: string, agentId:
   if (!action) return;
   await db.insert(resourceLifecycleEvents).values({ companyId, resourceType: "agent", resourceId: agentId, action });
 }
+
+/** Call while holding the project row lock, in the mutation transaction. */
+export async function recordProjectUpdateEvent(db: Db, companyId: string, projectId: string): Promise<void> {
+  await db.insert(resourceLifecycleEvents).values({ companyId, resourceType: "project", resourceId: projectId, action: "update" });
+}

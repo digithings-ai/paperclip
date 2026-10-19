@@ -110,6 +110,14 @@ proofs, encryption keys, environment variables, provider credentials, command
 arguments, or an unsanitized stderr stream. Detailed failed-attempt diagnostics
 remain in the bounded `native_run_finalizations.recovery_history` ledger.
 
+For a local Codex turn lost while runnerd was stopped, the canonical `turn.failed`
+event retains `error.code: "provider_turn_lost_on_restore"` and
+`error.recoverable: true`. It records the interrupted turn, not a final task
+outcome. There is no synthesized result for that interruption. An admitted
+same-session continuation emits its own `turn.submitted`, accepted turn ID, and
+terminal events; only the final outcome closes the run. Reconstructed thread
+history retains the original error so reconciliation and live delivery agree.
+
 ## Native Local Process Stop Evidence
 
 The server writes `native.local_process_stopped` in the same transaction that

@@ -129,6 +129,13 @@ permission, and requester scope decisions through saved browser interactions.
 
 ## Validation ladder
 
+The explicit-only [public MCP suite](../tests/runner-e2e/PUBLIC-MCP.md) evaluates
+paid assistant delegation, later retrieval, feedback, review, uncertain retries
+and permission boundaries. It uses the Product E2E fixtures, launcher, evidence
+packaging and dashboard, with separate external-assistant and team-worker billing.
+The [2026-10-01 results](plans/2026-10-01-public-mcp-paid-eval-results.md) retain
+two complete model matrices, provenance, costs and the earlier failure history.
+
 Start with credential-free checks and a catalog listing. For Product E2E:
 
 ```sh
@@ -406,3 +413,5 @@ ambiguous proposals, and the existing card-click path with native Claude/Codex.
 See the [suite contract](../tests/runner-e2e/README.md#conversational-confirmation-replies-explicit-only).
 
 Hiring notification accounting now also requires exact completed action attribution. Missing native/provider ID mapping is uncomparable evidence; it must not be reported as a model task regression or waived through name/order matching. The fixture waits for both known completion callbacks and settled bracketed observations, including the gap before pending outbox work becomes a wake. Strict action replay and original machine verdicts are retained separately.
+
+The explicit-only [planning guidance utility comparison](../tests/runner-e2e/PLAN-TASK-GUIDANCE.md) measures task decomposition and handoffs with current, short, and disabled skills.

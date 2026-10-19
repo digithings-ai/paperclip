@@ -592,7 +592,7 @@ conversation lifecycles, and protection against replaying superseded requests.
 | Action | Board | Agent |
 |---|---|---|
 | Create company | yes | no |
-| Hire/create agent | yes (direct) | request via approval |
+| Hire/create agent | yes (direct) | new standard agents: direct via `canCreateAgents`; low-trust policy or approval gates can restrict |
 | Pause/resume agent | yes | pause: no; resume: direct `agents:configure` grant only |
 | Create/update task | yes | yes |
 | Force reassign task | yes | limited |
@@ -610,6 +610,14 @@ agent actor calling `POST /agents/:agentId/resume` must pass the protected
 access does not bypass that decision, and `agents:suggest-changes` alone cannot
 apply the lifecycle change. Pause, clear-error, terminate, approval, and
 key-management routes remain board-only.
+
+An ordinary standard agent receives a direct `agents:configure` grant on
+creation. Existing agents keep their current permissions; no backfill runs.
+Low-trust and managed built-in agents do not receive this default. See
+[agent permission defaults](agent-permission-defaults.md) for the full inventory.
+Agent-authenticated changes cannot set or restore host-executed process adapter
+configuration, including commands and environment values. Agent-authenticated
+rollbacks cannot restore host-executed workspace commands either.
 
 ### 9.3.1 Shared default-open issue writes
 
@@ -1907,6 +1915,18 @@ unavailable. Preserve current ownership and newer-work fences. See
 - GitHub.com, manual refresh only. No upstream editing, polling, webhook sync, commits,
   or pull-request creation in this milestone.
 
+## Public assistant connection (opt-in)
+
+The user-authorized MCP surface connects assistants to an explicitly selected
+company as the consenting person. It exposes first-party task reads, additive
+task creation and comments, durable documents and approval links. It reuses
+existing domain authorization and scheduling; OAuth does not grant agent
+identity, native run ownership, approval decisions or third-party credentials.
+See [Public MCP](public-mcp.md) for the implemented instance-side boundary,
+configuration, plugin packages and outstanding hosted release gates. The
+[delivery plan](plans/2026-09-30-paperclip-public-mcp-and-plugins.md) separates
+external agent participation and granted third-party tools into later releases.
+
 ### Experimental AI connection routing
 
 Opt-in plugin routers may represent a pool as an AI runtime binding. Core keeps
@@ -1926,3 +1946,13 @@ per-turn snapshot participates in session compatibility, so subsequent turns
 remove stale instructions after edits or access revocation. See
 [Connection instructions](connections/CONNECTION-INSTRUCTIONS.md) for contracts,
 UI conventions, custom adapter integration, and initial memory templates.
+
+### Native provider capacity retry
+
+Committed, run-bound Codex `serverOverloaded` terminal failures display the model
+capacity error directly and schedule at most two automatic retries, after one
+and two minutes. Retries share the execution failure budget, retain task history,
+and honor current ownership, review, governance, pause, dependency, budget, and
+cleanup gates. Restart or duplicate finalization must not create another
+successor. Permanent model/auth incompatibility and usage-limit exhaustion retain
+their existing operator recovery requirements.

@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 
 import { flushSync } from "react-dom";
+import { MemoryRouter } from "react-router-dom";
 import { createRoot, type Root } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { INSTANCE_FEATURE_KEYS } from "@paperclipai/shared";
@@ -19,6 +20,10 @@ const mockInstanceSettingsApi = vi.hoisted(() => ({
 
 vi.mock("@/api/instanceSettings", () => ({
   instanceSettingsApi: mockInstanceSettingsApi,
+}));
+
+vi.mock("@/context/CompanyContext", () => ({
+  useCompany: () => ({ selectedCompany: { id: "butter", issuePrefix: "BUT" } }),
 }));
 
 vi.mock("../context/BreadcrumbContext", () => ({
@@ -80,6 +85,7 @@ function defaultExperimentalSettings(): InstanceExperimentalSettingsPayload {
     enableStreamlinedUi: true,
     enableApps: true,
     enableMcpAggregators: true,
+    enablePublicMcp: false,
     enableChatConnectors: false,
     enableMemoryConnectors: false,
     enablePipelines: false,
@@ -167,7 +173,9 @@ describe("InstanceExperimentalSettings — Conference Room Chat card (PAP-11233)
     flushSync(() => {
       root!.render(
         <QueryClientProvider client={queryClient}>
-          <InstanceExperimentalSettings />
+          <MemoryRouter initialEntries={["/BUT/company/settings/instance/experimental"]}>
+            <InstanceExperimentalSettings />
+          </MemoryRouter>
         </QueryClientProvider>,
       );
     });
@@ -246,6 +254,20 @@ describe("InstanceExperimentalSettings — Conference Room Chat card (PAP-11233)
     await renderPage();
     expect(container.querySelector('button[aria-label="Toggle MCP aggregators experimental setting"]')).toBeNull();
     expect(container.textContent).not.toContain("MCP aggregators");
+  });
+
+  it("defaults assistant connections off and persists an explicit toggle in both directions", async () => {
+    await renderPage();
+    const selector = 'button[aria-label="Toggle assistant connections experimental setting"]';
+    expect(container.querySelector(selector)?.getAttribute("aria-checked")).toBe("false");
+    expect(container.textContent).toContain("work already delegated continues");
+    for (const enabled of [true, false]) {
+      await act(() => container.querySelector<HTMLButtonElement>(selector)!.click());
+      await flushReact();
+      expect(mockInstanceSettingsApi.updateExperimental).toHaveBeenLastCalledWith({ enablePublicMcp: enabled });
+      expect(container.querySelector(selector)?.getAttribute("aria-checked")).toBe(String(enabled));
+      expect(Boolean(container.querySelector('a[href="/BUT/apps/assistant-connection"]'))).toBe(enabled);
+    }
   });
 
   it("defaults chat connectors off and persists an explicit toggle in both directions", async () => {
@@ -787,7 +809,9 @@ describe("InstanceExperimentalSettings — cloud-managed keys", () => {
     flushSync(() => {
       root!.render(
         <QueryClientProvider client={queryClient}>
-          <InstanceExperimentalSettings />
+          <MemoryRouter initialEntries={["/BUT/company/settings/instance/experimental"]}>
+            <InstanceExperimentalSettings />
+          </MemoryRouter>
         </QueryClientProvider>,
       );
     });
@@ -940,7 +964,9 @@ describe("InstanceExperimentalSettings — card ordering and headings (PAP-393)"
     flushSync(() => {
       root!.render(
         <QueryClientProvider client={queryClient}>
-          <InstanceExperimentalSettings />
+          <MemoryRouter initialEntries={["/BUT/company/settings/instance/experimental"]}>
+            <InstanceExperimentalSettings />
+          </MemoryRouter>
         </QueryClientProvider>,
       );
     });
@@ -1055,7 +1081,9 @@ describe("InstanceExperimentalSettings — operator-hidden cards", () => {
     flushSync(() => {
       root!.render(
         <QueryClientProvider client={queryClient}>
-          <InstanceExperimentalSettings />
+          <MemoryRouter initialEntries={["/BUT/company/settings/instance/experimental"]}>
+            <InstanceExperimentalSettings />
+          </MemoryRouter>
         </QueryClientProvider>,
       );
     });

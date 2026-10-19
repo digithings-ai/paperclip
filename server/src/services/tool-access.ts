@@ -288,6 +288,7 @@ type ActorInfo = {
     | "board_key"
     | "agent_key"
     | "agent_jwt"
+    | "mcp_oauth"
     | "cloud_tenant";
 };
 
@@ -10762,6 +10763,7 @@ export function toolAccessService(
         | "board_key"
         | "agent_key"
         | "agent_jwt"
+        | "mcp_oauth"
         | "cloud_tenant";
       issueId?: string | null;
       heartbeatRunId?: string | null;
@@ -11775,6 +11777,7 @@ export function toolAccessService(
         | "board_key"
         | "agent_key"
         | "agent_jwt"
+        | "mcp_oauth"
         | "cloud_tenant";
       issueId?: string | null;
       heartbeatRunId?: string | null;
