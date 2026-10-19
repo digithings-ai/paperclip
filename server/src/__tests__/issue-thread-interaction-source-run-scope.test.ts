@@ -105,6 +105,7 @@ describePg("issue-thread interaction sourceRunId is bound to the interaction's o
     const producerIssueId = randomUUID();
     const producerRunId = randomUUID();
     const targetRunId = randomUUID();
+    const unboundRunId = randomUUID();
     await db.insert(companies).values({
       id: companyId,
       name: "DIG-2422 sourceRunId scope",
@@ -140,8 +141,19 @@ describePg("issue-thread interaction sourceRunId is bound to the interaction's o
         contextSnapshot: { issueId: targetIssueId },
         resultJson: { summary: "Work done on this task." },
       },
+      {
+        // An agent-level wake carries no issue binding at all: no issueId, no
+        // taskId and no nativeIssueId. This is the shape that let a card be
+        // written with a sourceRunId that can never resolve for any issue.
+        id: unboundRunId,
+        companyId,
+        agentId,
+        status: "running",
+        contextSnapshot: { wakeSource: "on_demand", wakeTriggerDetail: "manual" },
+        resultJson: { summary: "Manual board watch." },
+      },
     ]);
-    return { companyId, agentId, targetIssueId, producerIssueId, producerRunId, targetRunId };
+    return { companyId, agentId, targetIssueId, producerIssueId, producerRunId, targetRunId, unboundRunId };
   }
 
   it.each(INTERACTION_KINDS)(
@@ -224,6 +236,53 @@ describePg("issue-thread interaction sourceRunId is bound to the interaction's o
         payload: INTERACTION_KINDS[2].payload,
         title: "DIG-2422 first-id match",
         sourceRunId: targetRunId,
+      });
+
+    expect(res.status).toBe(422);
+    expect(res.body?.error).toBe("sourceRunId must belong to the same issue");
+
+    const rows = await db.select({ id: issueThreadInteractions.id }).from(issueThreadInteractions);
+    expect(rows).toHaveLength(0);
+  });
+
+  it.each(INTERACTION_KINDS)(
+    "refuses a $kind whose sourceRunId names a run that is bound to no issue at all",
+    async ({ kind, payload }) => {
+      const { companyId, targetIssueId, unboundRunId } = await seed();
+      const res = await request(boardApp(companyId))
+        .post(`/api/issues/${targetIssueId}/interactions`)
+        .send({ kind, payload, title: `unbound source run ${kind}`, sourceRunId: unboundRunId });
+
+      expect(res.status).toBe(422);
+      expect(res.body?.error).toBe("sourceRunId must belong to the same issue");
+
+      const rows = await db.select({ id: issueThreadInteractions.id }).from(issueThreadInteractions);
+      // The refusal must not have half-written the interaction.
+      expect(rows).toHaveLength(0);
+    },
+  );
+
+  it("refuses an agent actor whose own run is bound to no issue at all", async () => {
+    const { companyId, agentId, targetIssueId, unboundRunId } = await seed();
+    // The target task is in_progress, assigned to this agent and holds no
+    // checkout, so the agent's own run adopts the checkout. That is the
+    // production path: the route stamps the acting agent's own run id, so the
+    // sourceRunId of an agent-level wake is an unbound run.
+    const testApp = express();
+    testApp.use(express.json());
+    testApp.use((req, _res, next) => {
+      (req as any).actor = { type: "agent", source: "agent_key", companyId, agentId, runId: unboundRunId };
+      next();
+    });
+    testApp.use("/api", issueRoutes(db, {} as any, {}));
+    testApp.use(errorHandler);
+
+    const res = await request(testApp)
+      .post(`/api/issues/${targetIssueId}/interactions`)
+      .send({
+        kind: "request_confirmation",
+        payload: INTERACTION_KINDS[2].payload,
+        title: "unbound source run agent ownership",
       });
 
     expect(res.status).toBe(422);
