@@ -1,0 +1,12 @@
+name: CI probe
+on:
+  push:
+    branches: [dig4446/ci-probe]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "probe ok"
