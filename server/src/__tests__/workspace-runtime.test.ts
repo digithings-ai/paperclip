@@ -1,4 +1,4 @@
-import { execFile, spawn } from "node:child_process";
+import { execFile, execFileSync, spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import fs from "node:fs/promises";
@@ -10015,6 +10015,56 @@ describe("realizeExecutionWorkspace with an exact existing branch", () => {
     expect(workspace.created).toBe(false);
     expect(await readGit(workspace.cwd, ["rev-parse", "HEAD"])).toBe(branchTip);
     expect(await readGit(repoRoot, ["rev-parse", "feature/legacy-checkout"])).toBe(branchTip);
+  });
+
+  const lsofAvailable = (() => {
+    try {
+      execFileSync("lsof", ["-a", "-d", "cwd", "-F", "pn"], { stdio: "ignore" });
+      return true;
+    } catch (error) {
+      return (error as NodeJS.ErrnoException).code !== "ENOENT";
+    }
+  })();
+
+  it("reuses the managed worktree for the same branch when the guard is off", async () => {
+    const repoRoot = await createTempRepo();
+    await createBranchWithCommit(repoRoot, "feature/guard-off", "guard-off.txt");
+    const managedPath = path.join(repoRoot, ".paperclip", "worktrees", "feature", "guard-off");
+    await runGit(repoRoot, ["worktree", "add", managedPath, "feature/guard-off"]);
+
+    const workspace = await realizeExistingBranch(repoRoot, "feature/guard-off");
+
+    expect(workspace.created).toBe(false);
+    expect(await fs.realpath(workspace.cwd)).toBe(await fs.realpath(managedPath));
+  });
+
+  it.skipIf(!lsofAvailable)("refuses a worktree that a live process is working in when the guard is on", async () => {
+    const repoRoot = await createTempRepo();
+    await createBranchWithCommit(repoRoot, "feature/guard-on", "guard-on.txt");
+    const managedPath = path.join(repoRoot, ".paperclip", "worktrees", "feature", "guard-on");
+    await runGit(repoRoot, ["worktree", "add", managedPath, "feature/guard-on"]);
+    const holder = spawn(process.execPath, ["-e", "setTimeout(() => {}, 30000)"], {
+      cwd: managedPath,
+      stdio: "ignore",
+    });
+    await new Promise<void>((resolve) => holder.once("spawn", () => resolve()));
+    await new Promise<void>((resolve) => setTimeout(resolve, 500));
+    const previousGuard = process.env.PAPERCLIP_WORKSPACE_GUARD;
+    process.env.PAPERCLIP_WORKSPACE_GUARD = "1";
+    try {
+      await expect(realizeExistingBranch(repoRoot, "feature/guard-on")).rejects.toThrow(/Workspace busy/);
+
+      const exited = new Promise<void>((resolve) => holder.once("exit", () => resolve()));
+      holder.kill();
+      await exited;
+      const workspace = await realizeExistingBranch(repoRoot, "feature/guard-on");
+
+      expect(workspace.created).toBe(false);
+      expect(await fs.realpath(workspace.cwd)).toBe(await fs.realpath(managedPath));
+    } finally {
+      if (previousGuard === undefined) delete process.env.PAPERCLIP_WORKSPACE_GUARD;
+      else process.env.PAPERCLIP_WORKSPACE_GUARD = previousGuard;
+    }
   });
 
   it("does not let exact-branch reuse inherit runtime ownership", async () => {

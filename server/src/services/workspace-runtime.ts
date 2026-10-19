@@ -99,6 +99,7 @@ import {
   type PersistedExposureRowSnapshot,
 } from "./runtime-exposure/port-reservation.js";
 import { resolveTailscaleDnsName } from "./runtime-exposure/tailscale-hostname.js";
+import { workspaceHasLiveHolder } from "./workspace-occupancy.js";
 
 export function resolveShell(): string {
   const fallback = process.platform === "win32" ? "sh" : "/bin/sh";
@@ -940,6 +941,14 @@ async function runExpensiveGitStatus(input: {
 
 function formatShortSha(value: string | null | undefined) {
   return value ? value.slice(0, 12) : "unknown";
+}
+
+async function assertWorkspaceNotOccupied(worktreePath: string): Promise<void> {
+  if (process.env.PAPERCLIP_WORKSPACE_GUARD !== "1") return;
+  if (!(await workspaceHasLiveHolder(worktreePath))) return;
+  throw new Error(
+    `Workspace busy: ${worktreePath} already has a live process inside. Retry when it exits.`,
+  );
 }
 
 function gitErrorIncludes(error: unknown, needle: string) {
@@ -3538,6 +3547,7 @@ export async function realizeExecutionWorkspace(input: {
   if (existingWorktree) {
     const reusable = await validateReusableWorktree(worktreePath);
     if (reusable.validation?.valid) {
+      await assertWorkspaceNotOccupied(worktreePath);
       return await reuseExistingWorktree(worktreePath, reusable.branchName, reusable.warnings);
     }
     const validation = reusable.validation;
@@ -3562,6 +3572,7 @@ export async function realizeExecutionWorkspace(input: {
   if (registeredBranchWorktree) {
     const reusable = await validateReusableWorktree(registeredBranchWorktree);
     if (reusable.validation?.valid) {
+      await assertWorkspaceNotOccupied(registeredBranchWorktree);
       return await reuseExistingWorktree(registeredBranchWorktree, reusable.branchName, reusable.warnings);
     }
     const validation = reusable.validation;
@@ -3727,6 +3738,10 @@ export async function realizeExecutionWorkspace(input: {
       if (!reusablePath || !await isGitCheckout(reusablePath)) {
         throw attachError;
       }
+      // Two runs on one branch used to share this directory silently. When the
+      // guard is enabled, refuse instead of reusing a worktree that a live
+      // process is working in. Stateless on purpose: see workspace-occupancy.ts.
+      await assertWorkspaceNotOccupied(reusablePath);
       return await reuseExistingWorktree(reusablePath);
     }
   }
