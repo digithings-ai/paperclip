@@ -189,6 +189,25 @@ export class WorkspaceRuntimeValidationFailure extends Error {
   }
 }
 
+/**
+ * A worktree that a live process is working in.
+ *
+ * The class is separate from WorkspaceRuntimeValidationFailure on purpose: that
+ * failure drives a board-owned recovery action, and a busy worktree clears
+ * itself as soon as the process inside it exits. The code keeps the reason
+ * machine-readable.
+ */
+class WorkspaceRuntimeBusyError extends Error {
+  code = "workspace_busy" as const;
+  resultJson: Record<string, unknown>;
+
+  constructor(message: string, resultJson: Record<string, unknown>) {
+    super(message);
+    this.name = "WorkspaceRuntimeBusyError";
+    this.resultJson = resultJson;
+  }
+}
+
 export interface RuntimeServiceRef {
   id: string;
   companyId: string;
@@ -943,11 +962,20 @@ function formatShortSha(value: string | null | undefined) {
   return value ? value.slice(0, 12) : "unknown";
 }
 
+/**
+ * Refuse to hand out a worktree that a live process is working in.
+ *
+ * Scope: this guards the paths that hand an existing directory to a run. The
+ * project-primary strategy hands out the project checkout itself and is out of
+ * scope by design. The check is stateless and off by default; set
+ * PAPERCLIP_WORKSPACE_GUARD=1 to enable it.
+ */
 async function assertWorkspaceNotOccupied(worktreePath: string): Promise<void> {
   if (process.env.PAPERCLIP_WORKSPACE_GUARD !== "1") return;
   if (!(await workspaceHasLiveHolder(worktreePath))) return;
-  throw new Error(
+  throw new WorkspaceRuntimeBusyError(
     `Workspace busy: ${worktreePath} already has a live process inside. Retry when it exits.`,
+    { workspaceBusy: { worktreePath } },
   );
 }
 
@@ -3545,9 +3573,9 @@ export async function realizeExecutionWorkspace(input: {
 
   const existingWorktree = await directoryExists(worktreePath);
   if (existingWorktree) {
+    await assertWorkspaceNotOccupied(worktreePath);
     const reusable = await validateReusableWorktree(worktreePath);
     if (reusable.validation?.valid) {
-      await assertWorkspaceNotOccupied(worktreePath);
       return await reuseExistingWorktree(worktreePath, reusable.branchName, reusable.warnings);
     }
     const validation = reusable.validation;
@@ -3570,9 +3598,9 @@ export async function realizeExecutionWorkspace(input: {
 
   const registeredBranchWorktree = await findRegisteredGitWorktreeByBranch(repoRoot, branchName);
   if (registeredBranchWorktree) {
+    await assertWorkspaceNotOccupied(registeredBranchWorktree);
     const reusable = await validateReusableWorktree(registeredBranchWorktree);
     if (reusable.validation?.valid) {
-      await assertWorkspaceNotOccupied(registeredBranchWorktree);
       return await reuseExistingWorktree(registeredBranchWorktree, reusable.branchName, reusable.warnings);
     }
     const validation = reusable.validation;
