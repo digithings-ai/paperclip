@@ -15,6 +15,77 @@ import { issueService } from "./issues.js";
 type Run = typeof heartbeatRuns.$inferSelect;
 export const LEGACY_RECOVERY_CAUSE = "legacy_execution_requires_reconciliation";
 
+/**
+ * DIG-4075 (DIG-2152 design item 4): the first-class cause carried when a
+ * `routine_execution` issue is stranded with no competent owner.
+ *
+ * The legacy terminalize loop is a board-owned `active_run_watchdog` at
+ * `maxAttempts`: the recovery sweep's `ownerType === "board"` rung matches it
+ * again on every tick, so the issue never reaches a decision. Resolving or
+ * terminalizing it silently is the wrong answer; it must escalate to
+ * `blocked`, and this cause is what names why.
+ */
+export const ROUTINE_EXECUTION_STRANDED_CAUSE = "routine_execution_stranded";
+
+/**
+ * Skip reasons that mean "somebody competent owns this": a live execution path,
+ * an in-flight wake, a durable wait with a dedicated owner, or an explicit
+ * authority (board hold, plugin lifecycle, handoff budget) still holds the work.
+ *
+ * Every other reason is a silent abandonment when the issue is a
+ * `routine_execution` issue, and must resolve to `blocked` instead of looping
+ * (DIG-4075 / DIG-2152 design item 4). The reasons are grouped by the authority
+ * that keeps the skip correct:
+ *
+ * - board / handoff authority still holds automatic budget;
+ * - a live or queued execution path exists;
+ * - a durable wait or a dedicated subsystem owns the continuation.
+ *
+ * `board_owned_recovery_action` is owned only while the board action still has
+ * automatic budget: an exhausted action is the legacy terminalize loop, so its
+ * caller escalates before consulting this set (see
+ * {@link routineExecutionSkipNeedsBlockedEscalation}).
+ */
+export const ROUTINE_EXECUTION_OWNED_SKIP_REASONS: ReadonlySet<string> = new Set([
+  // An explicit authority still holds the work with automatic budget left.
+  "board_owned_recovery_action",
+  "handoff_not_exhausted",
+  "handoff_already_escalated",
+  "pause_hold_suppresses_recovery",
+  "plugin_managed_handoff",
+  // A live execution path or an in-flight wake owns the next step.
+  "active_execution_path",
+  "pending_wake_interaction",
+  "accepted_continuation_wake_queued",
+  "review_participant_wake_queued",
+  "todo_initial_wake_queued",
+  "backoff_delay_not_elapsed",
+  // A durable wait or a dedicated subsystem owns the continuation.
+  "durable_goal_owns_continuation",
+  "waiting_conversation",
+  "chat_channel_waiting_for_settlement",
+  "conversation_publication_window",
+  "chat_control_recovery_stop",
+  "paused_with_native_passive_wait",
+  "persisted_durable_wait_path",
+  "provider_quota_monitor_pending",
+  "shared_workspace_child_waiting",
+  "review_participant_waiting_nonterminal",
+]);
+
+/**
+ * True when a skip on this issue must resolve to `blocked` rather than being
+ * dropped. Only `routine_execution` issues are in scope; every other origin
+ * keeps its exact existing skip behaviour.
+ */
+export function routineExecutionSkipNeedsBlockedEscalation(input: {
+  originKind?: string | null;
+  skipReason: string;
+}): boolean {
+  if (input.originKind !== "routine_execution") return false;
+  return !ROUTINE_EXECUTION_OWNED_SKIP_REASONS.has(input.skipReason);
+}
+
 /** Error families describe availability, not whether earlier actions happened. */
 export function legacyExecutionNeedsReconciliation(
   run: Pick<Run, "runtimeMode" | "status" | "errorCode" | "resultJson"> & Partial<Pick<Run, "scheduledRetryAttempt" | "scheduledRetryReason" | "contextSnapshot">>,

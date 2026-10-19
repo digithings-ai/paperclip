@@ -88,11 +88,17 @@ import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
 import { emitAgentTaskRun } from "../agent-task-run-telemetry.js";
 import { budgetService } from "../budgets.js";
 import { unadmittedChatWakeupCondition } from "../durable-chat-wakeup.js";
-import { issueRecoveryActionService } from "../issue-recovery-actions.js";
+import {
+  isRecoveryBudgetExhausted,
+  issueRecoveryActionService,
+} from "../issue-recovery-actions.js";
 import {
   legacyExecutionNeedsReconciliationWithEvidence,
+  ROUTINE_EXECUTION_STRANDED_CAUSE,
+  routineExecutionSkipNeedsBlockedEscalation,
   terminalizeLegacyExecution,
 } from "../legacy-execution-recovery.js";
+import { isRoutineExecutionIssueLive } from "../routines/execution-liveness.js";
 import { issueTreeControlService } from "../issue-tree-control.js";
 import { isExternalChatPresentationContext } from "../heartbeat-run-summary.js";
 import {
@@ -133,7 +139,9 @@ import {
   sandboxProviderPluginRemedy,
   buildExecutionReviewParticipantRecoveryNoticeSeed,
   buildExecutionReviewParticipantUnavailableNoticeSeed,
+  buildRoutineExecutionStrandedNoticeSeed,
   buildStrandedRecoveryEscalationNotice,
+  ROUTINE_EXECUTION_STRANDED_NOTICE_TITLE,
   type StrandedRecoveryNoticeSeed,
 } from "./stranded-notice.js";
 import {
@@ -253,7 +261,8 @@ export type StrandedRecoveryCause =
   | "provider_transport_failed"
   | "provider_frame_too_large"
   | "execution_review_participant_recovery"
-  | typeof SUCCESSFUL_RUN_MISSING_STATE_REASON;
+  | typeof SUCCESSFUL_RUN_MISSING_STATE_REASON
+  | typeof ROUTINE_EXECUTION_STRANDED_CAUSE;
 
 const NATIVE_RUNNER_RECOVERY_CAUSES = new Set<StrandedRecoveryCause>([
   "native_session_interrupted",
@@ -309,6 +318,8 @@ function recoveryCauseTitle(cause: StrandedRecoveryCause) {
       return "configuration incomplete";
     case "execution_review_participant_recovery":
       return "reviewer recovery failed";
+    case ROUTINE_EXECUTION_STRANDED_CAUSE:
+      return "routine execution stranded";
     case "provider_quota":
       return "provider quota unavailable";
     case SUCCESSFUL_RUN_MISSING_STATE_REASON:
@@ -2559,7 +2570,9 @@ export function recoveryService(
                           ) ?? "error",
                         )}, then explicitly retry the original owner or reassign.`
                       : "Board operator: bind the missing secret(s) named in the run failure, then explicitly retry the original owner or reassign."
-                    : recoveryCause === "execution_review_participant_recovery"
+                    : recoveryCause === ROUTINE_EXECUTION_STRANDED_CAUSE
+                      ? "Board operator: this routine execution is stranded with no competent owner and no live execution path. Automatic recovery will not re-drive it; explicitly retry, reassign, or intentionally resolve the task."
+                      : recoveryCause === "execution_review_participant_recovery"
                       ? "Board operator: repair the failed review participant path, restore a live reviewer, explicitly reassign, or record an intentional resolution."
                       : "Board operator: inspect the evidence, repair the runtime if appropriate, then explicitly retry the original owner, reassign, or intentionally resolve the task.",
       wakePolicy: isProviderQuotaWait
@@ -4038,7 +4051,12 @@ export function recoveryService(
     const shouldPostEscalationComment =
       recoveryAction.attemptCount === 1 ||
       input.recoveryCause === "workspace_validation_failed" ||
-      input.recoveryCause === "configuration_incomplete";
+      input.recoveryCause === "configuration_incomplete" ||
+      // DIG-4075: this cause is reached from a board action that already spent
+      // its automatic budget, so `attemptCount` is never 1. The stranded
+      // routine execution must still get its first-class notice, because the
+      // skip reason that named it is the only record of why it was abandoned.
+      input.recoveryCause === ROUTINE_EXECUTION_STRANDED_CAUSE;
     if (shouldPostEscalationComment) {
       const escalationCommentMarker = `Recovery action: \`${recoveryAction.id}\``;
 
@@ -4047,6 +4065,7 @@ export function recoveryService(
           id: issueComments.id,
           body: issueComments.body,
           metadata: issueComments.metadata,
+          presentation: issueComments.presentation,
         })
         .from(issueComments)
         .where(
@@ -4057,15 +4076,28 @@ export function recoveryService(
         )
         .orderBy(desc(issueComments.createdAt))
         .limit(50)
-        .then((rows) =>
-          rows.some(
+        .then((rows) => {
+          // DIG-4075: this escalation may retain an already-exhausted board
+          // action, so the marker dedupe would suppress the notice behind an
+          // earlier notice for a different cause. Dedupe it by its own
+          // first-class title instead, so the board always sees why the
+          // routine execution was abandoned. The issue leaves the open-issue
+          // candidate set once it is `blocked`, so this cannot repeat per tick.
+          if (input.recoveryCause === ROUTINE_EXECUTION_STRANDED_CAUSE) {
+            return rows.some(
+              (row) =>
+                (row.presentation as { title?: string } | null)?.title ===
+                ROUTINE_EXECUTION_STRANDED_NOTICE_TITLE,
+            );
+          }
+          return rows.some(
             (row) =>
               noticeMetadataReferencesRecoveryAction(
                 row.metadata,
                 recoveryAction.id,
               ) || (row.body ?? "").includes(escalationCommentMarker),
-          ),
-        );
+          );
+        });
 
       if (!hasEscalationComment) {
         if (notice) {
@@ -4373,7 +4405,31 @@ export function recoveryService(
     // Reason-coded skip ladder (DIG-4064): every `continue` that counts a
     // skip also bumps its ladder rung, so `skipped` always equals the sum
     // of `skippedReasons` without changing any recovery behaviour.
+    //
+    // DIG-4075 (DIG-2152 design item 4): a `routine_execution` issue skipped
+    // for a reason that does not mean "somebody competent owns this" is not a
+    // correct skip — it is a silent abandonment. Those are collected here and
+    // resolved to `blocked` after the ladder instead of being counted as
+    // skips. Every other origin keeps the exact existing behaviour.
+    let currentIssue: typeof issues.$inferSelect | null = null;
+    const routineExecutionEscalations: Array<{
+      issue: typeof issues.$inferSelect;
+      skipReason: string;
+    }> = [];
     const bumpSkipped = (reason: string): void => {
+      if (
+        currentIssue &&
+        routineExecutionSkipNeedsBlockedEscalation({
+          originKind: currentIssue.originKind,
+          skipReason: reason,
+        })
+      ) {
+        routineExecutionEscalations.push({
+          issue: currentIssue,
+          skipReason: reason,
+        });
+        return;
+      }
       result.skipped += 1;
       result.skippedReasons[reason] = (result.skippedReasons[reason] ?? 0) + 1;
     };
@@ -4403,6 +4459,7 @@ export function recoveryService(
     }
 
     for (const issue of candidates) {
+      currentIssue = issue;
       if (issue.originKind === "chat_channel") {
         await settleSlackConversation(db, issue.companyId, issue.id);
         const [current] = await db.select({ externalConversationState: externalConversationStateSql() })
@@ -4549,11 +4606,38 @@ export function recoveryService(
       // continuation path. Generic stranded-work recovery must not race that
       // authority by launching another provider turn (most importantly after
       // bounded native-session recovery has reached terminal exhaustion).
+      //
+      // DIG-4075: this rung is also the legacy terminalize loop. A board-owned
+      // `active_run_watchdog` that has spent its automatic budget matches here
+      // on every tick, so a `routine_execution` issue never reaches a decision.
+      // At maxAttempts, with no live execution path (the recovery union plus
+      // the Leaf 2 grace window), escalate to `blocked` with the first-class
+      // stranded cause instead of skipping forever.
       const activeRecoveryAction = await recoveryActionsSvc.getActiveForIssue(
         issue.companyId,
         issue.id,
       );
       if (activeRecoveryAction?.ownerType === "board") {
+        if (
+          issue.originKind === "routine_execution" &&
+          isRecoveryBudgetExhausted(activeRecoveryAction.evidence ?? {}) &&
+          !(await isRoutineExecutionIssueLive(db, {
+            companyId: issue.companyId,
+            id: issue.id,
+            status: issue.status,
+            updatedAt: issue.updatedAt,
+            executionRunId: issue.executionRunId,
+          }))
+        ) {
+          // The board action spent its automatic budget (maxAttempts) and the
+          // issue still has no live path. Escalate the issue instead of
+          // re-skipping the same hold on every tick.
+          routineExecutionEscalations.push({
+            issue,
+            skipReason: "board_owned_recovery_action",
+          });
+          continue;
+        }
         bumpSkipped("board_owned_recovery_action");
         continue;
       }
@@ -5546,6 +5630,52 @@ export function recoveryService(
         }
       } else {
         bumpSkipped("continuation_requeue_declined");
+      }
+    }
+    currentIssue = null;
+
+    // DIG-4075: routine executions skipped without a competent owner are the
+    // silent abandonments DIG-2152 exists to end. Resolve them to `blocked`
+    // with the first-class stranded cause instead of dropping them, so the
+    // next sweep selects a decided issue rather than the same undecided one.
+    //
+    // The rung that collected the skip looked at a snapshot; re-read liveness
+    // (the hasActiveExecutionPath union plus the Leaf 2 grace window) before
+    // writing `blocked`, so a run, wake, or native finalization that appeared
+    // after the rung is never blocked under. `blocked` is issue-wide, so the
+    // check is for any agent, not just the source assignee.
+    for (const { issue, skipReason } of routineExecutionEscalations) {
+      if (
+        await isRoutineExecutionIssueLive(db, {
+          companyId: issue.companyId,
+          id: issue.id,
+          status: issue.status,
+          updatedAt: issue.updatedAt,
+          executionRunId: issue.executionRunId,
+        })
+      ) {
+        result.skipped += 1;
+        result.skippedReasons[skipReason] =
+          (result.skippedReasons[skipReason] ?? 0) + 1;
+        continue;
+      }
+      const latestRun = await getLatestIssueRun(issue.companyId, issue.id);
+      const updated = await escalateStrandedAssignedIssue({
+        issue,
+        previousStatus: issue.status as StrandedPreviousStatus,
+        latestRun,
+        recoveryCause: ROUTINE_EXECUTION_STRANDED_CAUSE,
+        notice: buildRoutineExecutionStrandedNoticeSeed(skipReason),
+      });
+      if (updated) {
+        result.escalated += 1;
+        result.issueIds.push(issue.id);
+      } else {
+        // The escalation was declined; keep the skip accounting honest so
+        // `skipped` still equals the sum of `skippedReasons`.
+        result.skipped += 1;
+        result.skippedReasons[skipReason] =
+          (result.skippedReasons[skipReason] ?? 0) + 1;
       }
     }
 
