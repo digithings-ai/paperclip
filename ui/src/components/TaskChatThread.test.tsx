@@ -1803,6 +1803,32 @@ describe("TaskChatThread runtime transcript selection", () => {
     expect(container.textContent).not.toContain("The runner stopped");
   });
 
+  it.each([
+    "The 'gpt-6.1-sol' model is not supported when using Codex with a ChatGPT account.",
+    "The selected model is not supported by the current ChatGPT connection. Choose a supported model or a compatible AI connection.",
+  ])("promotes a rejected model above the runner's generated failure response: %s", (error) => {
+    nativeTranscriptState.transcriptByRun.set("model-rejected", [{
+      kind: "run_result", ts: "2026-08-25T18:00:01.000Z",
+      summary: "The Codex run failed before it completed.",
+      disposition: "needs_review", objectiveSatisfied: false, verification: [],
+      remainingWork: [], blocker: null, artifacts: [],
+    }]);
+    render(<TaskChatThread comments={[]} onAdd={async () => {}} linkedRuns={[{
+      runId: "model-rejected", runtimeMode: "native", status: "failed",
+      errorCode: "native_provider_model_rejected",
+      error,
+      agentId: "agent-1", agentName: "Runner", adapterType: "paperclip_runner",
+      createdAt: "2026-08-25T18:00:00.000Z", startedAt: "2026-08-25T18:00:00.000Z",
+      finishedAt: "2026-08-25T18:00:02.000Z",
+    }]} />);
+    const marker = container.querySelector('[data-testid="task-chat-collapsible-marker"]');
+    expect(marker?.textContent).toContain("Model unavailable");
+    flushSync(() => marker!.querySelector<HTMLButtonElement>('button[aria-expanded="false"]')!.click());
+    expect(container.textContent).toContain(error);
+    expect(container.textContent).toContain("clear the task's model override, then retry");
+    expect(container.textContent).not.toContain("after returning a final response");
+  });
+
   it("keeps workspace contention out of the conversation's cancellation markers", () => {
     render(<TaskChatThread comments={[]} onAdd={async () => {}} linkedRuns={[{
       runId: "workspace-wait", runtimeMode: "native", status: "cancelled", errorCode: "workspace_busy",

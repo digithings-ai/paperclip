@@ -1,5 +1,9 @@
 # Paid runner full-stack E2E
 
+The [public MCP suite](PUBLIC-MCP.md) adds explicit paid assistant/plugin journeys
+with authenticated browser consent, real MCP tool use and independently graded
+team execution. Select `--suite public-mcp`; it is excluded from `--all`.
+
 For family selection, ownership, provenance, history, and failure taxonomy,
 see the [Paperclip evaluation guide](../../doc/evals.md). This README is the
 authoritative runbook for Product E2E runner cells; the separate Runner Evals
@@ -796,6 +800,12 @@ The temporary Paperclip home, embedded database, raw workspace, master key,
 and unredacted logs are removed after each attempt. Daytona teardown destroys
 the environment and any reusable leases through the public API; provider-side
 auto-stop/archive/delete values remain as cancellation backstops.
+
+## Planning guidance utility
+
+The explicit-only [planning comparison](PLAN-TASK-GUIDANCE.md) tests current, short,
+and disabled planning skills across four saved business outcomes on native Codex.
+It adds twelve single-attempt cells and does not expand `--all`.
 
 ## GitHub Actions
 

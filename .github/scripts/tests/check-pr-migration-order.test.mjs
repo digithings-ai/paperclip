@@ -41,3 +41,40 @@ test('fails when a PR inserts a migration before the target branch tip', () => {
   assert.match(result.message, /0229_from_stale_branch\.sql/);
   assert.doesNotMatch(result.message, /- packages\/db\/src\/migrations\/0231_valid_but_after_stale\.sql/);
 });
+
+test('passes when an import replaces a target-branch migration with the same number', () => {
+  const result = checkMigrationOrder(
+    [migration('0230_fork_only'), migration('0231_fork_only')],
+    [migration('0230_canonical_upstream'), migration('0231_canonical_upstream')],
+    [
+      migration('0230_canonical_upstream'),
+      migration('0231_canonical_upstream'),
+      migration('0232_fork_only_renumbered'),
+    ],
+  );
+
+  assert.equal(result.passed, true);
+});
+
+test('fails when a number freed by the PR is still used by another file', () => {
+  const result = checkMigrationOrder(
+    [migration('0230_fork_only')],
+    [migration('0230_canonical_upstream')],
+    [migration('0230_fork_only'), migration('0230_canonical_upstream')],
+  );
+
+  assert.equal(result.passed, false);
+  assert.match(result.message, /more than one file for a migration number/);
+  assert.match(result.message, /0230: .*0230_canonical_upstream\.sql/);
+});
+
+test('fails when an out-of-order import frees no target-branch number', () => {
+  const result = checkMigrationOrder(
+    [migration('0230_on_master')],
+    [migration('0229_old_import')],
+    [migration('0229_old_import'), migration('0230_on_master')],
+  );
+
+  assert.equal(result.passed, false);
+  assert.match(result.message, /0229_old_import\.sql/);
+});

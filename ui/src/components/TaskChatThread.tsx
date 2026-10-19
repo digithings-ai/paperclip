@@ -1637,7 +1637,9 @@ export function TaskChatThread(props: TaskChatThreadProps) {
             ? "native_runner_timed_out"
             : "native_runner_process_exited");
         const label =
-          code === "native_provider_approval_required" && source.status === "failed"
+          code === "native_provider_model_rejected" && source.status === "failed"
+            ? "Model unavailable"
+            : code === "native_provider_approval_required" && source.status === "failed"
             ? "Approval required"
             : code === "native_provider_usage_limit" && source.status === "failed"
             ? "Usage limit reached"
@@ -1659,7 +1661,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
               : code === "native_provider_approval_required"
                 ? "This operation requires approval, but this runner has no interactive approval handler. Review the operation and update the agent's permission setting before retrying."
                 : code === "native_provider_model_rejected"
-                ? "The provider rejected the selected model. Check the model ID and your account's access, save the agent configuration, then retry. View the run for the provider's full error."
+                ? `${meta?.error || "The provider rejected the selected model."} Choose a supported model or clear the task's model override, then retry.`
                 : code === "native_provider_usage_limit" &&
                     source.status === "failed"
                   ? "The model provider has reached its current usage limit. Try again after the limit resets."

@@ -198,10 +198,10 @@ describePostgres("Resource lifecycle events", () => {
     await db.insert(projects).values({ id: oldProjectId, companyId, name: "Existing project" });
     await agentService(db).update(oldAgentId, { name: "Renamed agent" });
     await projectService(db).update(oldProjectId, { name: "Renamed project" });
-    expect(await events()).toEqual([]);
+    expect(await events()).toEqual([expect.objectContaining({ action: "update", resourceId: oldProjectId })]);
     const agent = await createAgent();
     const project = await projectService(db).create(companyId, { name: "New project" });
-    expect((await events()).map(row => row.resourceId).sort()).toEqual([agent.id, project.id].sort());
+    expect((await events()).filter(row => row.action === "create").map(row => row.resourceId).sort()).toEqual([agent.id, project.id].sort());
   });
 
   it("scopes resource identities by company and type", async () => {
@@ -218,4 +218,47 @@ describePostgres("Resource lifecycle events", () => {
     await db.delete(companies).where(eq(companies.id, otherCompanyId));
     expect(await db.select().from(resourceLifecycleEvents).where(eq(resourceLifecycleEvents.companyId, otherCompanyId))).toEqual([]);
   });
+
+  it("captures project and workspace updates, batches repository replacement, and ignores archive-only changes", async () => {
+    const service = projectService(db);
+    const project = await service.createWithRepositories(companyId, { name: "Mutable project" }, [
+      { id: "1", fullName: "fixture/one", url: "https://github.com/fixture/one", connections: [] },
+    ]);
+    expect((await events()).map(row => row.action)).toEqual(["create"]);
+    await service.update(project.id, { name: "Updated project" });
+    const workspace = await service.createWorkspace(project.id, { repoUrl: "https://github.com/fixture/two" });
+    await service.updateWorkspace(project.id, workspace!.id, { repoRef: "main" });
+    await service.removeWorkspace(project.id, workspace!.id);
+    const beforeReplace = (await events()).length;
+    await service.replaceRepositories(project.id, [
+      { id: "3", fullName: "fixture/three", url: "https://github.com/fixture/three", connections: [] },
+      { id: "4", fullName: "fixture/four", url: "https://github.com/fixture/four", connections: [] },
+    ]);
+    expect(await events()).toHaveLength(beforeReplace + 1);
+    const beforeArchive = await events();
+    await service.update(project.id, { archivedAt: new Date(), name: undefined });
+    expect(await events()).toEqual(beforeArchive);
+    expect((await service.getById(project.id))?.workspaces).toHaveLength(2);
+    expect(beforeArchive.sort((a, b) => a.id - b.id).map(row => row.action)).toEqual(["create", "update", "update", "update", "update", "update"]);
+  });
+
+  it("rolls back project and repository mutations when their update record fails", async () => {
+    const service = projectService(db);
+    const project = await service.create(companyId, { name: "Retained project" });
+    const workspace = await service.createWorkspace(project.id, { repoUrl: "https://github.com/fixture/retained" });
+    const before = await events();
+    await db.execute(sql`ALTER TABLE resource_lifecycle_events ADD CONSTRAINT fixture_reject_update CHECK (action <> 'update') NOT VALID`);
+    try {
+      await expect(service.update(project.id, { name: "Rejected update" })).rejects.toThrow();
+      await expect(service.createWorkspace(project.id, { repoUrl: "https://github.com/fixture/rejected" })).rejects.toThrow();
+      await expect(service.updateWorkspace(project.id, workspace!.id, { repoRef: "rejected" })).rejects.toThrow();
+      await expect(service.removeWorkspace(project.id, workspace!.id)).rejects.toThrow();
+      await expect(service.replaceRepositories(project.id, [])).rejects.toThrow();
+      expect(await service.getById(project.id)).toMatchObject({ name: "Retained project", workspaces: [expect.objectContaining({ id: workspace!.id, repoRef: null })] });
+      expect(await events()).toEqual(before);
+    } finally {
+      await db.execute(sql`ALTER TABLE resource_lifecycle_events DROP CONSTRAINT fixture_reject_update`);
+    }
+  });
+
 });

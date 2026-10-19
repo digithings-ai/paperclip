@@ -469,6 +469,28 @@ Warm sandbox reuse must match the current host Git tip and branch as well as the
 file snapshot and saved stamp, including managed nested repositories. A history
 or branch mismatch restages the host before the next run begins.
 
+### Native provider model capacity
+
+A committed Codex `turn.failed` event with `codexErrorInfo: serverOverloaded`,
+bound to the failed terminal turn and pinned execution identity, surfaces
+“Selected model is at capacity. Please try a different model.” directly.
+Paperclip preserves the accepted result and task history, then atomically records
+a durable automatic retry with its status decision. The first retry waits one
+minute; the second waits two minutes. Both spend the existing failure-retry
+budget. Exhaustion requires an explicit retry or a model change.
+
+Retries use a fresh provider session and the normal task context, without an
+automatic model switch. Consumed wake input and continuation receipts stay on
+the failed run; `retryOfRunId` supplies task history without lending the new run
+its predecessor's resume authority. Finalization replay and restart reuse the
+same successor.
+Scheduling preserves pending review authority and respects task holds; promotion,
+claim, and dispatch recheck ownership, dependencies, governance, pause, budget,
+and execution locks. Claim also waits for the predecessor's provider execution,
+workspace finalization, and environment cleanup to settle. Model incompatibility,
+usage-limit exhaustion, unknown failures, and unbound diagnostic text do not
+qualify as capacity failures.
+
 ### Workspace scan failures before provider startup
 
 Repository discovery distinguishes an ordinary folder from a failed Git read.
@@ -999,6 +1021,19 @@ session and retires only the exact predecessor's obsolete recovery hold while
 recording the proof and successor lineage. Retained provider files are not edited.
 
 Bootstrap retries, exact-checkpoint resumes, and fresh replacement sessions share three total provider attempts, including the original attempt. Linked run IDs, controller restarts, and duplicate wakes do not reset this budget. Automatic attempts retain the 30-second delay. Replacement scheduling and predecessor lineage commit together, with one successor per predecessor and admission through the normal task locks, authorization, pause, approval, and budget gates.
+
+An exact local Codex restart can restore the conversation after losing its active
+turn. Runnerd records this as `provider_turn_lost_on_restore`, with no invented
+task result. The admitted restart attempt may send one continuation in that same
+conversation. It preserves the workspace and asks the agent to reconcile unfinished
+commands and external actions before proceeding. It does not resend the task or
+tool calls. An outcome that cannot be reconciled remains a blocker. The continuation
+uses the existing durable one-shot recovery marker; recovery adopts an accepted
+turn if the controller dies before checkpointing its ID. The interrupted terminal
+is checkpointed before submission. Real provider failures, accepted semantic
+results, intentional stops, and historical unmarked failures keep their existing
+terminal behavior. This continuation uses the already charged restart attempt and
+does not reset the provider-attempt budget.
 
 Provider execution and control-plane finalization have different clocks. A healthy provider can think or execute a long tool without output. Once execution settles, recovery and finalization control steps have a 60-second deadline, checked on startup and every 15 seconds. With a healthy database and scheduler, an abandoned transition must be repaired or surfaced within 90 seconds. Terminal persistence must not wait on provider cleanup or publication; a late finalizer cannot change a reassigned or closed task or release another run's locks. Historical ambiguous runs are never automatically replayed after an upgrade.
 

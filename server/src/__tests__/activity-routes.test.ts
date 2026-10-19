@@ -101,7 +101,7 @@ async function requestApp(
   }
 }
 
-describe.sequential("activity routes", () => {
+describe("activity routes", () => {
   beforeEach(() => {
     for (const mock of Object.values(mockActivityService)) mock.mockReset();
     for (const mock of Object.values(mockHeartbeatService)) mock.mockReset();
