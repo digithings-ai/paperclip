@@ -572,6 +572,72 @@ describe("releaseIssueExecution", () => {
     expect(result.outcome.kind).toBe("promoted");
   });
 
+  it("does not reopen a completed task when the deferred wake carries only board-key automation comments", async () => {
+    const commentIds = ["board-key-closing-note"];
+    const queue = [
+      wakeCandidate({
+        agentId: ISSUE.assigneeAgentId!,
+        requestedByActorType: "user",
+        deferredCommentIds: commentIds,
+        deferredContextSeed: {
+          wakeReason: "issue_commented",
+          wakeCommentIds: commentIds,
+          boardKeyCommentIds: commentIds,
+        },
+      }),
+    ];
+    const transaction = createFakeTransaction({
+      findNextDeferredWake: vi.fn(async () => queue.shift() ?? null),
+      reopenIssue: vi.fn(async () => ({ ...ISSUE, status: "todo" })),
+    });
+    const release = createReleaseIssueExecution({
+      issueLock: createFakeIssueLock(createFakeHost(), transaction, {
+        ...ISSUE,
+        status: "done",
+      }),
+      recovery: createFakeRecovery(),
+    });
+
+    const result = await release({ companyId: RUN.companyId, runId: RUN.id, now: new Date() });
+
+    expect(transaction.reopenIssue).not.toHaveBeenCalled();
+    expect(transaction.cancelDeferredWake).toHaveBeenCalledTimes(1);
+    expect(result.outcome.kind).toBe("released");
+  });
+
+  it("still reopens a completed task when a human comment joins a deferred board-key automation comment", async () => {
+    const commentIds = ["board-key-closing-note", "human-follow-up"];
+    const queue = [
+      wakeCandidate({
+        agentId: ISSUE.assigneeAgentId!,
+        requestedByActorType: "user",
+        deferredCommentIds: commentIds,
+        deferredContextSeed: {
+          wakeReason: "issue_commented",
+          wakeCommentIds: commentIds,
+          boardKeyCommentIds: ["board-key-closing-note"],
+        },
+      }),
+    ];
+    const transaction = createFakeTransaction({
+      findNextDeferredWake: vi.fn(async () => queue.shift() ?? null),
+      reopenIssue: vi.fn(async () => ({ ...ISSUE, status: "todo" })),
+    });
+    const release = createReleaseIssueExecution({
+      issueLock: createFakeIssueLock(createFakeHost(), transaction, {
+        ...ISSUE,
+        status: "done",
+      }),
+      recovery: createFakeRecovery(),
+    });
+
+    const result = await release({ companyId: RUN.companyId, runId: RUN.id, now: new Date() });
+
+    expect(transaction.reopenIssue).toHaveBeenCalledTimes(1);
+    expect(transaction.finalizePromotedWake).toHaveBeenCalledTimes(1);
+    expect(result.outcome.kind).toBe("promoted");
+  });
+
   it.each(["done_live", "cancelled_live", "done_missing", "done_self", "done_no_resume", "done_untracked_comment"])("handles explicit agent feedback after completion: %s", async (scenario) => {
     const commentIds = ["accepted-agent-feedback"];
     const queue = [wakeCandidate({
