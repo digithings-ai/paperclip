@@ -14,8 +14,12 @@ function formatMigrationNumber(number) {
   return String(number).padStart(4, '0');
 }
 
-export function checkMigrationOrder(baseMigrationFiles, prMigrationFiles) {
-  const invalidFiles = [...baseMigrationFiles, ...prMigrationFiles]
+export function checkMigrationOrder(
+  baseMigrationFiles,
+  prMigrationFiles,
+  headMigrationFiles,
+) {
+  const invalidFiles = [...baseMigrationFiles, ...prMigrationFiles, ...(headMigrationFiles ?? [])]
     .filter((file) => !parseMigration(file));
 
   if (invalidFiles.length > 0) {
@@ -38,14 +42,56 @@ export function checkMigrationOrder(baseMigrationFiles, prMigrationFiles) {
     (latest, migration) => migration.number > latest.number ? migration : latest,
     { file: '(none)', number: -1 },
   );
-  const outOfOrder = prMigrations.filter(
-    (migration) => migration.number <= latestBaseMigration.number,
-  );
+
+  // The head tree is the only thing that ships, so a number may be reused only
+  // when exactly one file carries it there. This lets a fork replace one of its
+  // own migrations with a canonical upstream migration of the same number.
+  const headFiles = headMigrationFiles ? new Set(headMigrationFiles) : null;
+  if (headFiles) {
+    const filesByNumber = new Map();
+    for (const migration of headMigrationFiles.map(parseMigration)) {
+      const files = filesByNumber.get(migration.number) ?? [];
+      files.push(migration.file);
+      filesByNumber.set(migration.number, files);
+    }
+    const duplicates = [...filesByNumber.entries()]
+      .filter(([, files]) => files.length > 1);
+
+    if (duplicates.length > 0) {
+      return {
+        passed: false,
+        message: [
+          'The resulting migration tree has more than one file for a migration number:',
+          ...duplicates.map(
+            ([number, files]) =>
+              `- ${formatMigrationNumber(number)}: ${files.join(', ')}`,
+          ),
+          '',
+          'Each migration number must belong to exactly one file. Rename or delete the files',
+          'that share a number, and keep each SQL filename, matching meta snapshot, and',
+          'packages/db/src/migrations/meta/_journal.json entry aligned.',
+        ].join('\n'),
+      };
+    }
+  }
+
+  const outOfOrder = prMigrations.filter((migration) => {
+    if (migration.number > latestBaseMigration.number) {
+      return false;
+    }
+    // A number freed by this PR (the base file with it is gone) can be taken by
+    // an imported canonical migration. The duplicate check above still applies.
+    const replacesBaseMigration = headFiles && baseMigrations.some(
+      (baseMigration) =>
+        baseMigration.number === migration.number && !headFiles.has(baseMigration.file),
+    );
+    return !replacesBaseMigration;
+  });
 
   if (outOfOrder.length === 0) {
     return {
       passed: true,
-      message: `All new migrations follow ${latestBaseMigration.file}.`,
+      message: `All new migrations follow ${latestBaseMigration.file} or replace a target-branch migration.`,
     };
   }
 
@@ -93,7 +139,14 @@ function main() {
     'diff', '--name-only', '--diff-filter=A', '-z', `${baseSha}...${headSha}`, '--',
     MIGRATIONS_DIRECTORY,
   ]).filter((file) => file.endsWith('.sql'));
-  const result = checkMigrationOrder(baseMigrationFiles, prMigrationFiles);
+  const headMigrationFiles = gitPaths([
+    'ls-tree', '-r', '--name-only', '-z', headSha, '--', MIGRATIONS_DIRECTORY,
+  ]).filter((file) => file.endsWith('.sql'));
+  const result = checkMigrationOrder(
+    baseMigrationFiles,
+    prMigrationFiles,
+    headMigrationFiles,
+  );
 
   if (result.passed) {
     console.log(result.message);
