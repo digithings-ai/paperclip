@@ -88,6 +88,21 @@ jobs:
       - name: Validate the brand denylist
         run: pnpm check:tokens
 
+      # Upstream's reusable workflow ran these repository guard suites in its
+      # policy job. This fork owns its pull-request CI now, so the fork runs
+      # them here instead: without this the fork would silently lose the
+      # guard coverage pr-trusted.yml provided. Verified green in this fork's
+      # own CI on 14 Oct 2026 (run 38646433342, job "ci / policy").
+      - name: Run the repository guard suites
+        run: |
+          node --test ./scripts/check-no-git-push.test.mjs
+          node --test ./scripts/check-module-boundaries.test.mjs
+          node --test '.github/scripts/tests/*.test.mjs'
+          node --test ./scripts/__tests__/run-vitest-stable-shard.test.mjs
+          node --test ./scripts/__tests__/e2e-shard.test.mjs
+          node --test ./scripts/__tests__/release-verify-workflow.test.mjs ./scripts/cloud-source-verification.test.mjs ./scripts/standard-image-contract.test.mjs
+          node --test ./scripts/__tests__/build-standalone-concurrency.test.mjs
+
       - name: Block manual lockfile edits
         if: >-
           github.head_ref != 'chore/refresh-lockfile' &&

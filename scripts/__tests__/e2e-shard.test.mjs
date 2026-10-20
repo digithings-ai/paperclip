@@ -26,14 +26,16 @@ function runShard(args) {
 }
 
 function readTrustedPrWorkflow() {
-  const caller = readFileSync(prCallerWorkflow, "utf8");
-  assert.match(
-    caller,
-    /^\s+uses: paperclipai\/paperclip\/\.github\/workflows\/pr-trusted\.yml@master\s*$/m,
-    "pr.yml must call the trusted workflow from CODEOWNERS-protected master",
-  );
   // Validate proposed workflow changes locally; CI executes the merged master version.
   return readFileSync(trustedPrWorkflow, "utf8");
+}
+
+// The fork owns its pull-request CI (DIG-4446). Upstream's reusable workflow
+// routes jobs to an AWS runner label this fork does not have, and resolves its
+// lanes from upstream's master, so this file must not call another
+// repository's workflow again.
+function readForkPrWorkflow() {
+  return readFileSync(prCallerWorkflow, "utf8");
 }
 
 function readWorkflowJobs(workflow) {
@@ -157,8 +159,33 @@ test("shard arguments are validated", () => {
   }
 });
 
-test("pr.yml calls the trusted PR workflow from master", () => {
-  assert.ok(readTrustedPrWorkflow().length > 0);
+test("the fork's PR workflow stays fork-owned", () => {
+  const workflow = readForkPrWorkflow();
+
+  assert.doesNotMatch(
+    workflow,
+    /^[ \t]+uses:[ \t]+[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+\/\.github\/workflows\//m,
+    "pr.yml must not call a reusable workflow owned by another repository: upstream's pr-trusted.yml routes jobs to a runner label this fork does not have and resolves its lanes from upstream's master",
+  );
+
+  const runners = [...workflow.matchAll(/^[ \t]*runs-on:[ \t]*(.+)$/gm)].map((match) => match[1].trim());
+  assert.ok(runners.length > 0, "pr.yml must declare at least one job");
+  for (const runner of runners) {
+    assert.equal(
+      runner,
+      "ubuntu-latest",
+      `every job must run on a GitHub-hosted runner this fork has, found: ${runner}`,
+    );
+  }
+
+  const jobs = readWorkflowJobs(workflow);
+  const verify = jobs.get("verify");
+  assert.ok(
+    verify,
+    "pr.yml must define a `verify` aggregate job: the fork's master is not protected, so the aggregate is the only status a pull request reports",
+  );
+  assert.match(verify, /^ {4}needs: \[policy, typecheck, tests\]$/m);
+  assert.match(verify, /^ {4}if: \$\{\{ always\(\) \}\}$/m);
 });
 
 test("the trusted PR workflow keeps a stable aggregate check named e2e over the shard matrix", () => {
