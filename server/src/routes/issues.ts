@@ -2332,18 +2332,22 @@ function isClosedIssueStatus(
   return status === "done" || status === "cancelled";
 }
 
+/**
+ * The actor sources the platform can report for a comment author.
+ *
+ * Derived from the platform helper instead of a hand-written union: when a
+ * new source is added (the public-MCP OAuth path, for example) the platform
+ * widens its own type and this signature widens with it, instead of failing
+ * to compile at the call sites.
+ */
+type CommentActorSource = ReturnType<typeof getActorInfo>["actorSource"];
+
 function shouldImplicitlyMoveCommentedIssueToTodo(input: {
   issueStatus: string | null | undefined;
   assigneeAgentId: string | null | undefined;
   actorType: "agent" | "user";
   actorId: string;
-  actorSource:
-    | "local_implicit"
-    | "session"
-    | "board_key"
-    | "cloud_tenant"
-    | "agent_key"
-    | "agent_jwt";
+  actorSource: CommentActorSource;
   actorRunId: string | null | undefined;
   checkoutRunId: string | null | undefined;
   executionRunId: string | null | undefined;

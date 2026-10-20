@@ -328,6 +328,20 @@ function boardKeyActor() {
   };
 }
 
+// A public-MCP OAuth user is a signed-in human, not board automation. The
+// reopen suppression is scoped to the board API key, so this path must keep
+// reopening closed issues.
+function mcpOauthBoardActor(userId = "55555555-5555-4555-8555-555555555555") {
+  return {
+    type: "board",
+    userId,
+    sessionId: "session-mcp-1",
+    companyIds: ["company-1"],
+    source: "mcp_oauth",
+    isInstanceAdmin: false,
+  };
+}
+
 function sessionBoardActor(userId = "44444444-4444-4444-8444-444444444444") {
   return {
     type: "board",
@@ -919,6 +933,33 @@ describe("issue comment reopen routes", () => {
 
     const res = await request(
       await installActor(createApp(), sessionBoardActor()),
+    )
+      .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
+      .send({ body: "Please continue with the follow-up." });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      "11111111-1111-4111-8111-111111111111",
+      { status: "todo" },
+    );
+    await waitForWakeup(() =>
+      expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+        "22222222-2222-4222-8222-222222222222",
+        expect.objectContaining({ reason: "issue_reopened_via_comment" }),
+      ),
+    );
+  });
+
+  it("still implicitly reopens a closed issue for a public-MCP OAuth user comment", async () => {
+    const issue = makeIssue("done");
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(
+      async (_id: string, patch: Record<string, unknown>) =>
+        makeIssueUpdateReceipt(issue, patch),
+    );
+
+    const res = await request(
+      await installActor(createApp(), mcpOauthBoardActor()),
     )
       .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
       .send({ body: "Please continue with the follow-up." });
