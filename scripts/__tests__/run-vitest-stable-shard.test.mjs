@@ -428,3 +428,40 @@ test("filtered collection must match the exact assigned case identities, includi
     assert.throws(() => assertSelectedTests(expected, actual, lineShardFile));
   }
 });
+
+// Release verification on master (release-verify.yml after #15619 and #15831)
+// selects the without-chat-or-native-runner server group plus a separate
+// native-runner lane, and runs the db project in its own workspaces-c lane.
+// This source predates those lanes, so the groups are mirrored here so the
+// stable promotion of this commit verifies under master's workflow contract.
+for (const caller of ["Release", "Cloud readiness", "another caller"]) {
+  test(`release server, chat, and native lanes cover every server suite once under ${caller}`, () => {
+    const env = { GITHUB_WORKFLOW: caller };
+    const full = dryRunJson(["--mode", "general", "--group", "general-server", "--shard-index", "0", "--shard-count", "1"], env);
+    const files = Array.from({ length: 10 }, (_, index) => dryRunJson([
+      "--mode", "general", "--group", "general-server-without-chat-or-native-runner",
+      "--shard-index", String(index), "--shard-count", "10",
+    ], env)).flatMap((shard) => shard.selectedGeneralServerSuites);
+    const native = dryRunJson(["--mode", "general", "--group", "general-server-native-runner"], env);
+    const combined = [...files, chatSuitePath, ...native.selectedGeneralServerSuites];
+    assert.equal(new Set(combined).size, combined.length, "lanes must not overlap");
+    assert.deepEqual(combined.sort(), full.selectedGeneralServerSuites.sort());
+  });
+}
+
+test("workspaces-c runs the db project alone and workspaces-b no longer carries it", () => {
+  const workspacesC = dryRunJson(["--mode", "general", "--group", "general-workspaces-c"]);
+  assert.deepEqual(workspacesC.workspaceProjects, ["@paperclipai/db"]);
+  assert.equal(workspacesC.workspacesVitestShard, null);
+  const workspacesB = dryRunJson(["--mode", "general", "--group", "general-workspaces-b"]);
+  assert.ok(!workspacesB.workspaceProjects.includes("@paperclipai/db"), "db must not run twice");
+  assert.ok(workspacesB.workspaceProjects.length > 0, "workspaces-b must still run its other projects");
+  const workspacesA = dryRunJson(["--mode", "general", "--group", "general-workspaces-a"]);
+  const all = [...workspacesA.workspaceProjects, ...workspacesB.workspaceProjects, ...workspacesC.workspaceProjects];
+  assert.equal(new Set(all).size, all.length, "no project may run in two workspace lanes");
+});
+
+test("shard flags are rejected for the workspaces-c group", () => {
+  const result = dryRun(["--mode", "general", "--group", "general-workspaces-c", "--shard-index", "0", "--shard-count", "3"]);
+  assert.notEqual(result.status, 0, "workspaces-c must not accept shard flags");
+});

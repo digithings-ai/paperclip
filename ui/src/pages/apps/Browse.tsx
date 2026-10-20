@@ -9,6 +9,7 @@ import {
   isRetiredComposioConnection,
   RETIRED_COMPOSIO_MESSAGE,
 } from "@paperclipai/shared";
+import { AssistantConnectionCard, useAssistantConnections } from "./AssistantConnection";
 import { ManagedAiConnectionRow } from "@/components/ai-connections/ManagedAiConnectionDetails";
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -329,6 +330,7 @@ export function Browse({ renderAccountDetails = (connection) => connection.conne
   const queryClient = useQueryClient();
   const { pushToast } = useToast();
   const { selectedCompanyId } = useCompany();
+  const assistantConnections = useAssistantConnections();
   const { userId: viewingUserId, settled: identitySettled } = useAccountIdentity();
   const { enabled: chatConnectorsEnabled } = useChatConnectorsEnabled();
   const { enabled: memoryConnectorsEnabled } = useMemoryConnectorsEnabled();
@@ -818,6 +820,9 @@ export function Browse({ renderAccountDetails = (connection) => connection.conne
     }
     setAggregatorToConnect(app);
   }
+  const showAssistantConnection = (source === "paperclip" || source === "all" ||
+    (source === "installed" && (!assistantConnections.isSuccess || assistantConnections.rows.some(row => !row.revokedAt)))) &&
+    (!trimmed || "assistant connection (mcp) paperclip codex claude opencode".includes(trimmed));
   const showCustomConnector =
     (source === "paperclip" || source === "all") && (!trimmed || "connect your own tool custom mcp server".includes(trimmed));
 
@@ -839,7 +844,7 @@ export function Browse({ renderAccountDetails = (connection) => connection.conne
     applicationsQuery.isError ||
     connectionsQuery.isError ||
     chatEndpointsQuery.isError;
-  const nothingMatches = visibleRows.length === 0 && !showCustomConnector;
+  const nothingMatches = visibleRows.length === 0 && !showCustomConnector && !showAssistantConnection;
 
   return (
     <div ref={catalogTop} className="max-w-5xl space-y-5 pb-12">
@@ -899,6 +904,7 @@ export function Browse({ renderAccountDetails = (connection) => connection.conne
         </div>
       ) : (
         <div className="space-y-3" role="list" aria-label="Connector list">
+          {showAssistantConnection && <AssistantConnectionCard onNavigate={navigate} />}
           {paginatedRows.map((row) => (
             <ConnectorCard
               renderAccountDetails={renderAccountDetails}

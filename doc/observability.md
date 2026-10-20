@@ -443,6 +443,43 @@ values become `unknown`. A signal such as `SIGKILL` does not establish who sent
 it or prove an out-of-memory kill. These fields do not change error grouping
 or run outcomes, and do not include process output or adapter result payloads.
 
+For a native Codex turn that ends with a structured HTTP 400 model/ChatGPT
+compatibility rejection, the run records `native_provider_model_rejected`
+and a fixed message that asks the user to select a supported model or connection.
+This requires a committed runner terminal for the selected model and the exact
+failed turn. Agent text, tool output, unrelated turns, and unknown provider
+errors do not create this classification. The provider diagnostic contains only
+`provider=codex`, `category=model_auth_incompatible`, `status=400`, and
+`authMode=chatgpt`. It excludes the model name and provider response. This does
+not change credentials, select a fallback model, replay a turn, or alter the
+accepted semantic result or cleanup. The existing configuration-blocker recovery
+path requires a configuration change instead of automatically retrying the same
+model and connection. Native finalization also derives this evidence from the
+committed event and the run's pinned provider configuration before it can queue
+a failed-result retry. This survives a controller restart before the adapter
+diagnostic is saved. Invalid bindings, missing evidence, or a mismatched event
+hash do not grant this classification. A current worker's task is blocked for a
+configuration change. A pending review instead keeps its original decision and
+status version, releases execution, and creates no automatic recovery action.
+After repairing the configuration, explicitly retry the reviewer to resolve the
+same pending review. The Board's exact failed-run Retry accepts this classified
+native failure only while its saved review is still current and pending; caller
+payloads cannot select a different review. Dispatch checks that assignment again.
+Superseded or completed reviews retain their authority.
+
+Cloud portfolio proxy failures have an event-local `cloud_portfolio` context.
+It contains only the phase (`fetch`, `http_response`, `response_body`, or
+`response_write`), upstream HTTP status when available, elapsed milliseconds,
+and an allowlisted network error code. Unknown values become `unknown` or
+`null`; elapsed time outside 0–60,000 ms becomes `null`. Codes come from at
+most four error/cause objects' own data properties, never error messages.
+`DEADLINE_EXCEEDED` means the request's own ten-second signal was aborted.
+The route's warning uses the same safe fields. Neither record includes URLs,
+headers, cookies, bodies, user/stack IDs, or the original exception. Sentry
+receives a plain error with the existing generic message and default grouping.
+The context does not change the HTTP response, authentication, cookies, cache,
+deadline, or single-fetch behavior, and does not carry into unrelated events.
+
 An unconfirmed adapter Stop timeout has an event-local `adapter_stop` context:
 the run UUID, built-in adapter type, native/legacy runtime mode, configured
 wait duration, and whether abort was requested. Invalid identities become

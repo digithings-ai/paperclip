@@ -34,7 +34,7 @@ import { listCurrentRuntimeServicesForProjectWorkspaces } from "./workspace-runt
 import { parseProjectExecutionWorkspacePolicy } from "./execution-workspace-policy.js";
 import { mergeProjectWorkspaceRuntimeConfig, readProjectWorkspaceRuntimeConfig } from "./project-workspace-runtime-config.js";
 import { resolveManagedProjectWorkspaceDir } from "../home-paths.js";
-import { recordResourceCreationEvent } from "./resource-lifecycle-events.js";
+import { recordProjectUpdateEvent, recordResourceCreationEvent } from "./resource-lifecycle-events.js";
 
 type ProjectRow = typeof projects.$inferSelect;
 type ProjectWorkspaceRow = typeof projectWorkspaces.$inferSelect;
@@ -568,7 +568,7 @@ async function ensureSinglePrimaryWorkspace(
     );
 }
 
-export function projectService(db: Db) {
+export function projectService(db: Db, options: { captureWorkspaceUpdates?: boolean } = {}) {
   const createProject = async (
     companyId: string,
     data: Omit<typeof projects.$inferInsert, "companyId"> & { goalIds?: string[] },
@@ -838,7 +838,7 @@ export function projectService(db: Db) {
 
     createWithRepositories: async (companyId: string, data: Parameters<typeof createProject>[1], repositories: import("@paperclipai/shared").ProjectRepository[]): Promise<ProjectWithGoals> => {
       return db.transaction(async (tx) => {
-        const service = projectService(tx as unknown as Db);
+        const service = projectService(tx as unknown as Db, { captureWorkspaceUpdates: false });
         const project = await service.create(companyId, data);
         for (const repo of repositories) {
           await service.createWorkspace(project.id, { name: repo.fullName, repoUrl: repo.url, metadata: { githubRepositoryId: repo.id } });
@@ -851,7 +851,7 @@ export function projectService(db: Db) {
       return db.transaction(async (tx) => {
         const [project] = await tx.select().from(projects).where(eq(projects.id, projectId)).for("update");
         if (!project) return null;
-        const service = projectService(tx as unknown as Db);
+        const service = projectService(tx as unknown as Db, { captureWorkspaceUpdates: false });
         const existing = await service.listWorkspaces(projectId);
         const ids = new Set(repositories.map((repo) => repo.id));
         for (const workspace of existing) {
@@ -878,6 +878,7 @@ export function projectService(db: Db) {
           } else await service.createWorkspace(projectId, { name: repo.fullName, repoUrl: repo.url, metadata: { githubRepositoryId: repo.id } });
         }
         await tx.update(projects).set({ updatedAt: new Date() }).where(eq(projects.id, projectId));
+        await recordProjectUpdateEvent(tx as unknown as Db, project.companyId, projectId);
         return service.getById(projectId);
       });
     },
@@ -887,13 +888,14 @@ export function projectService(db: Db) {
     update: async (
       id: string,
       data: Partial<typeof projects.$inferInsert> & { goalIds?: string[] },
-    ): Promise<ProjectWithGoals | null> => {
+    ): Promise<ProjectWithGoals | null> => db.transaction(async tx => {
+      const db = tx as unknown as Db;
       const { goalIds: inputGoalIds, ...projectData } = data;
       const ids = resolveGoalIds({ goalIds: inputGoalIds, goalId: projectData.goalId });
       const existingProject = await db
         .select({ id: projects.id, companyId: projects.companyId, name: projects.name })
         .from(projects)
-        .where(eq(projects.id, id))
+        .where(eq(projects.id, id)).for("update")
         .then((rows) => rows[0] ?? null);
       if (!existingProject) return null;
       if (ids && ids.length > 0) {
@@ -935,10 +937,14 @@ export function projectService(db: Db) {
         await syncGoalLinks(db, id, row.companyId, ids);
       }
 
+      if (Object.entries(projectData).some(([key, value]) => value !== undefined && key !== "archivedAt" && key !== "updatedAt") || ids !== undefined) {
+        await recordProjectUpdateEvent(db, row.companyId, id);
+      }
+
       const [withGoals] = await attachGoals(db, [row]);
       const [enriched] = withGoals ? await attachWorkspaces(db, [withGoals]) : [];
       return enriched ?? null;
-    },
+    }),
 
     clearExecutionWorkspaceEnvironmentSelection: async (companyId: string, environmentId: string) => {
       const rows = await db
@@ -954,16 +960,9 @@ export function projectService(db: Db) {
         const policy = parseProjectExecutionWorkspacePolicy(row.executionWorkspacePolicy);
         if (policy?.environmentId !== environmentId) continue;
 
-        await db
-          .update(projects)
-          .set({
-            executionWorkspacePolicy: {
-              ...policy,
-              environmentId: null,
-            },
-            updatedAt: new Date(),
-          })
-          .where(eq(projects.id, row.id));
+        await projectService(db).update(row.id, {
+          executionWorkspacePolicy: { ...policy, environmentId: null },
+        });
         cleared += 1;
       }
 
@@ -1004,11 +1003,12 @@ export function projectService(db: Db) {
     createWorkspace: async (
       projectId: string,
       data: CreateWorkspaceInput,
-    ): Promise<ProjectWorkspace | null> => {
+    ): Promise<ProjectWorkspace | null> => db.transaction(async tx => {
+      const db = tx as unknown as Db;
       const project = await db
         .select()
         .from(projects)
-        .where(eq(projects.id, projectId))
+        .where(eq(projects.id, projectId)).for("update")
         .then((rows) => rows[0] ?? null);
       if (!project) return null;
 
@@ -1079,14 +1079,19 @@ export function projectService(db: Db) {
         return row;
       });
 
+      if (created && options.captureWorkspaceUpdates !== false) {
+        await recordProjectUpdateEvent(db, created.companyId, projectId);
+      }
       return created ? toWorkspace(created) : null;
-    },
+    }),
 
     updateWorkspace: async (
       projectId: string,
       workspaceId: string,
       data: UpdateWorkspaceInput,
-    ): Promise<ProjectWorkspace | null> => {
+    ): Promise<ProjectWorkspace | null> => db.transaction(async tx => {
+      const db = tx as unknown as Db;
+      await db.select({ id: projects.id }).from(projects).where(eq(projects.id, projectId)).for("update");
       const existing = await db
         .select()
         .from(projectWorkspaces)
@@ -1231,10 +1236,15 @@ export function projectService(db: Db) {
         return row;
       });
 
+      if (updated && options.captureWorkspaceUpdates !== false) {
+        await recordProjectUpdateEvent(db, updated.companyId, projectId);
+      }
       return updated ? toWorkspace(updated) : null;
-    },
+    }),
 
-    removeWorkspace: async (projectId: string, workspaceId: string): Promise<ProjectWorkspace | null> => {
+    removeWorkspace: async (projectId: string, workspaceId: string): Promise<ProjectWorkspace | null> => db.transaction(async tx => {
+      const db = tx as unknown as Db;
+      await db.select({ id: projects.id }).from(projects).where(eq(projects.id, projectId)).for("update");
       const existing = await db
         .select()
         .from(projectWorkspaces)
@@ -1281,8 +1291,11 @@ export function projectService(db: Db) {
         return row;
       });
 
+      if (removed && options.captureWorkspaceUpdates !== false) {
+        await recordProjectUpdateEvent(db, removed.companyId, projectId);
+      }
       return removed ? toWorkspace(removed) : null;
-    },
+    }),
 
     resolveByReference: async (companyId: string, reference: string) => {
       const raw = reference.trim();

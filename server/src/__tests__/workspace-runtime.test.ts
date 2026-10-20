@@ -10017,6 +10017,165 @@ describe("realizeExecutionWorkspace with an exact existing branch", () => {
     expect(await readGit(repoRoot, ["rev-parse", "feature/legacy-checkout"])).toBe(branchTip);
   });
 
+  const lsofUsable = async (): Promise<boolean> => {
+    try {
+      await new Promise<void>((resolve, reject) => {
+        execFile("lsof", ["-v"], { timeout: 5000 }, (error) => {
+          if (error) reject(error);
+          else resolve();
+        });
+      });
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  const skipWithoutLsof = async (ctx: { skip?: () => void }): Promise<boolean> => {
+    if (await lsofUsable()) return false;
+    const skip = ctx.skip;
+    if (typeof skip === "function") skip.call(ctx);
+    return true;
+  };
+
+  const holderVisible = async (pid: number, targetPath: string): Promise<boolean> => {
+    const resolvedTarget = await fs.realpath(targetPath).catch(() => targetPath);
+    const stdout = await new Promise<string>((resolve) => {
+      execFile(
+        "lsof",
+        ["-a", "-d", "cwd", "-F", "pn"],
+        { timeout: 5000, maxBuffer: 8 * 1024 * 1024 },
+        (error, out) => {
+          resolve(error ? "" : String(out ?? ""));
+        },
+      );
+    });
+    let currentPid = 0;
+    for (const line of stdout.split("\n")) {
+      if (line.startsWith("p")) {
+        currentPid = Number.parseInt(line.slice(1), 10);
+        continue;
+      }
+      if (!line.startsWith("n") || currentPid !== pid) continue;
+      const cwd = line.slice(1);
+      if (cwd === resolvedTarget || cwd.startsWith(`${resolvedTarget}${path.sep}`)) return true;
+    }
+    return false;
+  };
+
+  const waitFor = async (predicate: () => Promise<boolean>, timeoutMs: number): Promise<boolean> => {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (await predicate()) return true;
+      await new Promise<void>((resolve) => setTimeout(resolve, 100));
+    }
+    return await predicate();
+  };
+
+  const startHolder = async (targetPath: string) => {
+    const holder = spawn(process.execPath, ["-e", "setTimeout(() => {}, 30000)"], {
+      cwd: targetPath,
+      stdio: "ignore",
+    });
+    await new Promise<void>((resolve) => holder.once("spawn", () => resolve()));
+    return holder;
+  };
+
+  it("reuses the managed worktree for the same branch when the guard is off", async (ctx) => {
+    if (await skipWithoutLsof(ctx)) return;
+    const repoRoot = await createTempRepo();
+    await createBranchWithCommit(repoRoot, "feature/guard-off", "guard-off.txt");
+    const managedPath = path.join(repoRoot, ".paperclip", "worktrees", "feature", "guard-off");
+    await runGit(repoRoot, ["worktree", "add", managedPath, "feature/guard-off"]);
+    const previousGuard = process.env.PAPERCLIP_WORKSPACE_GUARD;
+    delete process.env.PAPERCLIP_WORKSPACE_GUARD;
+    const holder = await startHolder(managedPath);
+    try {
+      const pid = holder.pid ?? 0;
+      expect(await waitFor(() => holderVisible(pid, managedPath), 5000)).toBe(true);
+
+      const workspace = await realizeExistingBranch(repoRoot, "feature/guard-off");
+
+      expect(workspace.created).toBe(false);
+      expect(await fs.realpath(workspace.cwd)).toBe(await fs.realpath(managedPath));
+    } finally {
+      holder.kill();
+      if (previousGuard === undefined) delete process.env.PAPERCLIP_WORKSPACE_GUARD;
+      else process.env.PAPERCLIP_WORKSPACE_GUARD = previousGuard;
+    }
+  });
+
+  it("refuses a worktree that a live process is working in when the guard is on", async (ctx) => {
+    if (await skipWithoutLsof(ctx)) return;
+    const repoRoot = await createTempRepo();
+    await createBranchWithCommit(repoRoot, "feature/guard-on", "guard-on.txt");
+    const managedPath = path.join(repoRoot, ".paperclip", "worktrees", "feature", "guard-on");
+    await runGit(repoRoot, ["worktree", "add", managedPath, "feature/guard-on"]);
+    const previousGuard = process.env.PAPERCLIP_WORKSPACE_GUARD;
+    process.env.PAPERCLIP_WORKSPACE_GUARD = "1";
+    const holder = await startHolder(managedPath);
+    try {
+      const pid = holder.pid ?? 0;
+      expect(await waitFor(() => holderVisible(pid, managedPath), 5000)).toBe(true);
+
+      let caught: unknown = null;
+      try {
+        await realizeExistingBranch(repoRoot, "feature/guard-on");
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught).toBeInstanceOf(Error);
+      const busy = caught as Error & { code?: string };
+      expect(busy.message).toContain("Workspace busy");
+      expect(busy.message).toContain(path.join(".paperclip", "worktrees", "feature", "guard-on"));
+      expect(busy.code).toBe("workspace_busy");
+
+      const exited = new Promise<void>((resolve) => holder.once("exit", () => resolve()));
+      holder.kill();
+      await exited;
+      expect(await waitFor(async () => !(await holderVisible(pid, managedPath)), 5000)).toBe(true);
+
+      const workspace = await realizeExistingBranch(repoRoot, "feature/guard-on");
+
+      expect(workspace.created).toBe(false);
+      expect(await fs.realpath(workspace.cwd)).toBe(await fs.realpath(managedPath));
+    } finally {
+      holder.kill();
+      if (previousGuard === undefined) delete process.env.PAPERCLIP_WORKSPACE_GUARD;
+      else process.env.PAPERCLIP_WORKSPACE_GUARD = previousGuard;
+    }
+  });
+
+  it("refuses a registered worktree that a live process is working in when the guard is on", async (ctx) => {
+    if (await skipWithoutLsof(ctx)) return;
+    const repoRoot = await createTempRepo();
+    await createBranchWithCommit(repoRoot, "feature/guard-registered", "guard-registered.txt");
+    const registeredPath = path.join(repoRoot, ".worktrees", "guard-registered");
+    await runGit(repoRoot, ["worktree", "add", registeredPath, "feature/guard-registered"]);
+    const previousGuard = process.env.PAPERCLIP_WORKSPACE_GUARD;
+    process.env.PAPERCLIP_WORKSPACE_GUARD = "1";
+    const holder = await startHolder(registeredPath);
+    try {
+      const pid = holder.pid ?? 0;
+      expect(await waitFor(() => holderVisible(pid, registeredPath), 5000)).toBe(true);
+
+      let caught: unknown = null;
+      try {
+        await realizeExistingBranch(repoRoot, "feature/guard-registered");
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught).toBeInstanceOf(Error);
+      const busy = caught as Error & { code?: string };
+      expect(busy.message).toContain("Workspace busy");
+      expect(busy.message).toContain(path.join(".worktrees", "guard-registered"));
+      expect(busy.code).toBe("workspace_busy");
+    } finally {
+      holder.kill();
+      if (previousGuard === undefined) delete process.env.PAPERCLIP_WORKSPACE_GUARD;
+      else process.env.PAPERCLIP_WORKSPACE_GUARD = previousGuard;
+    }
+  });
   it("does not let exact-branch reuse inherit runtime ownership", async () => {
     const repoRoot = await createTempRepo();
     await createBranchWithCommit(repoRoot, "feature/operator-owned-reuse", "operator-reuse.txt");

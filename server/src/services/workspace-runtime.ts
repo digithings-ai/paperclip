@@ -99,6 +99,7 @@ import {
   type PersistedExposureRowSnapshot,
 } from "./runtime-exposure/port-reservation.js";
 import { resolveTailscaleDnsName } from "./runtime-exposure/tailscale-hostname.js";
+import { workspaceHasLiveHolder } from "./workspace-occupancy.js";
 
 export function resolveShell(): string {
   const fallback = process.platform === "win32" ? "sh" : "/bin/sh";
@@ -184,6 +185,25 @@ export class WorkspaceRuntimeValidationFailure extends Error {
   constructor(message: string, resultJson: Record<string, unknown>) {
     super(message);
     this.name = "WorkspaceRuntimeValidationFailure";
+    this.resultJson = resultJson;
+  }
+}
+
+/**
+ * A worktree that a live process is working in.
+ *
+ * The class is separate from WorkspaceRuntimeValidationFailure on purpose: that
+ * failure drives a board-owned recovery action, and a busy worktree clears
+ * itself as soon as the process inside it exits. The code keeps the reason
+ * machine-readable.
+ */
+class WorkspaceRuntimeBusyError extends Error {
+  code = "workspace_busy" as const;
+  resultJson: Record<string, unknown>;
+
+  constructor(message: string, resultJson: Record<string, unknown>) {
+    super(message);
+    this.name = "WorkspaceRuntimeBusyError";
     this.resultJson = resultJson;
   }
 }
@@ -940,6 +960,23 @@ async function runExpensiveGitStatus(input: {
 
 function formatShortSha(value: string | null | undefined) {
   return value ? value.slice(0, 12) : "unknown";
+}
+
+/**
+ * Refuse to hand out a worktree that a live process is working in.
+ *
+ * Scope: this guards the paths that hand an existing directory to a run. The
+ * project-primary strategy hands out the project checkout itself and is out of
+ * scope by design. The check is stateless and off by default; set
+ * PAPERCLIP_WORKSPACE_GUARD=1 to enable it.
+ */
+async function assertWorkspaceNotOccupied(worktreePath: string): Promise<void> {
+  if (process.env.PAPERCLIP_WORKSPACE_GUARD !== "1") return;
+  if (!(await workspaceHasLiveHolder(worktreePath))) return;
+  throw new WorkspaceRuntimeBusyError(
+    `Workspace busy: ${worktreePath} already has a live process inside. Retry when it exits.`,
+    { workspaceBusy: { worktreePath } },
+  );
 }
 
 function gitErrorIncludes(error: unknown, needle: string) {
@@ -3536,6 +3573,7 @@ export async function realizeExecutionWorkspace(input: {
 
   const existingWorktree = await directoryExists(worktreePath);
   if (existingWorktree) {
+    await assertWorkspaceNotOccupied(worktreePath);
     const reusable = await validateReusableWorktree(worktreePath);
     if (reusable.validation?.valid) {
       return await reuseExistingWorktree(worktreePath, reusable.branchName, reusable.warnings);
@@ -3560,6 +3598,7 @@ export async function realizeExecutionWorkspace(input: {
 
   const registeredBranchWorktree = await findRegisteredGitWorktreeByBranch(repoRoot, branchName);
   if (registeredBranchWorktree) {
+    await assertWorkspaceNotOccupied(registeredBranchWorktree);
     const reusable = await validateReusableWorktree(registeredBranchWorktree);
     if (reusable.validation?.valid) {
       return await reuseExistingWorktree(registeredBranchWorktree, reusable.branchName, reusable.warnings);
@@ -3727,6 +3766,10 @@ export async function realizeExecutionWorkspace(input: {
       if (!reusablePath || !await isGitCheckout(reusablePath)) {
         throw attachError;
       }
+      // Two runs on one branch used to share this directory silently. When the
+      // guard is enabled, refuse instead of reusing a worktree that a live
+      // process is working in. Stateless on purpose: see workspace-occupancy.ts.
+      await assertWorkspaceNotOccupied(reusablePath);
       return await reuseExistingWorktree(reusablePath);
     }
   }

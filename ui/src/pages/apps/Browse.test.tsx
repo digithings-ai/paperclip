@@ -39,6 +39,9 @@ const poolListMock = vi.hoisted(() => vi.fn());
 const poolRemoveMock = vi.hoisted(() => vi.fn());
 vi.mock("@/api/ai-connection-pools", () => ({ aiConnectionPoolsApi: { list: poolListMock, remove: poolRemoveMock } }));
 
+const assistantConnectionsMock = vi.hoisted(() => vi.fn());
+vi.mock("@/api/publicMcp", () => ({ publicMcpApi: { connections: assistantConnectionsMock } }));
+
 const listGalleryMock = vi.hoisted(() => vi.fn());
 const listApplicationsMock = vi.hoisted(() => vi.fn());
 const listConnectionsMock = vi.hoisted(() => vi.fn());
@@ -179,6 +182,7 @@ describe("Connectors landing page", () => {
 
   beforeEach(() => {
     accountIdentity.userId = "board-user"; accountIdentity.settled = true;
+    assistantConnectionsMock.mockReset().mockResolvedValue([]);
     syncComposioAppsMock.mockReset().mockImplementation((...args) => listComposioAppsMock(...args));
     listComposioAppsMock.mockReset().mockResolvedValue({ apps: [] });
     refreshComposioAppsMock.mockReset().mockResolvedValue({ apps: [] });
@@ -246,6 +250,81 @@ describe("Connectors landing page", () => {
     }
     return client;
   }
+
+  it("offers assistant setup from Connections without choosing an agent", async () => {
+    await renderBrowse();
+    const button = container.querySelector<HTMLButtonElement>('[aria-label="Set up Assistant Connection (MCP)"]');
+    expect(button).not.toBeNull();
+    await act(() => button!.click());
+    expect(navigateMock).toHaveBeenCalledWith("/apps/assistant-connection");
+    expect(chatSetupMock).not.toHaveBeenCalled();
+  });
+
+  it("keeps assistant setup in the Paperclip catalog when filtering connection sources", async () => {
+    await renderBrowse(false);
+    const assistantButton = () => container.querySelector('[aria-label="Set up Assistant Connection (MCP)"]');
+    expect(assistantButton()).not.toBeNull();
+    await clickButton("Composio", container);
+    expect(assistantButton()).toBeNull();
+    await clickButton("Arcade", container);
+    expect(assistantButton()).toBeNull();
+    await clickButton("All", container);
+    await search("assistant");
+    expect(assistantButton()).not.toBeNull();
+    expect(container.textContent).not.toContain("No connectors match");
+  });
+
+  const assistantGrant = { id: "grant", companyId: "company-1", companyName: "Paperclip", clientName: "Claude", scopes: ["paperclip:read"], createdAt: "2026-10-06T00:00:00Z", revokedAt: null };
+
+  it("shows active assistant grants in Installed and removes them after revocation", async () => {
+    assistantConnectionsMock.mockResolvedValue([assistantGrant]);
+    const client = await renderBrowse(false);
+    await clickButton("Installed", container);
+    const manage = container.querySelector<HTMLButtonElement>('[aria-label="Manage Assistant Connection (MCP)"]');
+    expect(manage).not.toBeNull();
+    expect(container.querySelector('[data-app-slug="assistant-connection"]')?.textContent).toContain("Claude");
+    await act(() => manage!.click());
+    expect(navigateMock).toHaveBeenCalledWith("/apps/assistant-connection");
+    assistantConnectionsMock.mockResolvedValue([{ ...assistantGrant, revokedAt: "2026-10-06T01:00:00Z" }]);
+    await act(async () => { await client.invalidateQueries({ queryKey: ["mcp-connections"] }); });
+    await flushReact();
+    expect(container.querySelector('[data-app-slug="assistant-connection"]')).toBeNull();
+  });
+
+  it.each([
+    ["empty", []],
+    ["revoked", [{ ...assistantGrant, revokedAt: "2026-10-06T01:00:00Z" }]],
+    ["another organization", [{ ...assistantGrant, companyId: "other-company" }]],
+  ])("does not show %s assistant grants as installed", async (_label, grants) => {
+    assistantConnectionsMock.mockResolvedValue(grants);
+    await renderBrowse(false);
+    await clickButton("Installed", container);
+    expect(container.querySelector('[data-app-slug="assistant-connection"]')).toBeNull();
+  });
+
+  it("keeps pending assistant status visible in Installed until it can determine access", async () => {
+    let resolve!: (rows: typeof assistantGrant[]) => void;
+    assistantConnectionsMock.mockReturnValue(new Promise<typeof assistantGrant[]>(done => { resolve = done; }));
+    await renderBrowse(false);
+    await clickButton("Installed", container);
+    expect(container.textContent).toContain("Checking your connection status");
+    expect(container.textContent).not.toContain("No connectors match");
+    await act(() => resolve([assistantGrant]));
+    await flushReact();
+    expect(container.querySelector('[aria-label="Manage Assistant Connection (MCP)"]')).not.toBeNull();
+  });
+
+  it("shows a retryable assistant status failure in Installed instead of an empty result", async () => {
+    assistantConnectionsMock.mockRejectedValue(new Error("offline"));
+    await renderBrowse(false);
+    await clickButton("Installed", container);
+    expect(container.textContent).toContain("Couldn’t load your connection status");
+    expect(container.textContent).not.toContain("No connectors match");
+    assistantConnectionsMock.mockResolvedValue([assistantGrant]);
+    await clickButton("Try again", container);
+    await flushReact();
+    expect(container.querySelector('[aria-label="Manage Assistant Connection (MCP)"]')).not.toBeNull();
+  });
 
   function indexedApp(name: string, providers: ("composio" | "arcade" | "executor")[] = ["composio"]): AggregatorAppCatalogEntry {
     const slug = name.toLowerCase().replaceAll(" ", "-");
@@ -545,12 +624,12 @@ describe("Connectors landing page", () => {
     listApplicationsMock.mockResolvedValue({ applications: [application()] });
     listConnectionsMock.mockResolvedValue({ connections: [connection()] });
     await renderBrowse();
-    expect(container.querySelectorAll('[data-connected="false"][data-app-slug]:not([data-app-slug="custom-mcp"])')).toHaveLength(50);
-    expect(container.querySelector('[aria-label="Connector list"] > [data-app-slug]')?.getAttribute("data-app-slug")).toBe("notion");
+    expect(container.querySelectorAll('[data-connected="false"][data-app-slug]:not([data-app-slug="custom-mcp"]):not([data-app-slug="assistant-connection"])')).toHaveLength(50);
+    expect(container.querySelector('[aria-label="Connector list"] > [data-app-slug]:not([data-app-slug="assistant-connection"])')?.getAttribute("data-app-slug")).toBe("notion");
     const next = Array.from(container.querySelectorAll("button")).find((button) => button.textContent === "Next")!;
     await act(() => next.click());
     expect(container.textContent).toContain("Page 2 of");
-    expect(container.querySelector('[aria-label="Connector list"] > [data-app-slug]')?.getAttribute("data-app-slug")).toBe("notion");
+    expect(container.querySelector('[aria-label="Connector list"] > [data-app-slug]:not([data-app-slug="assistant-connection"])')?.getAttribute("data-app-slug")).toBe("notion");
     await search("Indexed App 59");
     expect(container.textContent).toContain("Page 1 of 1");
     expect(container.querySelector('[data-app-slug="indexed-app-59"]')).not.toBeNull();
@@ -968,6 +1047,7 @@ describe("Connectors landing page", () => {
         ),
       ).map((row) => row.dataset.appSlug),
     ).toEqual([
+      "assistant-connection",
       "agentmail",
       "discord",
       "github-code-review-bot",
@@ -1048,8 +1128,9 @@ describe("Connectors landing page", () => {
         '[aria-label="Connector list"] > [data-app-slug]',
       ),
     );
-    expect(rows[0]?.dataset.appSlug).toBe("notion");
-    const notion = rows[0]!;
+    const providers = rows.filter(row => row.dataset.appSlug !== "assistant-connection");
+    expect(providers[0]?.dataset.appSlug).toBe("notion");
+    const notion = providers[0]!;
     expect(notion.textContent).toContain("devinfoley@gmail.com");
     expect(notion.textContent).toContain("ops@example.com");
     expect(notion.textContent).toContain("Connected by");

@@ -2091,15 +2091,57 @@
     {
       "idx": 300,
       "version": "7",
-      "when": 1792102604505,
-      "tag": "0300_fantastic_blacklash",
+      "when": 1791260726828,
+      "tag": "0300_chunky_chamber",
       "breakpoints": true
     },
     {
       "idx": 301,
       "version": "7",
+      "when": 1791298125105,
+      "tag": "0301_lumpy_maria_hill",
+      "breakpoints": true
+    },
+    {
+      "idx": 302,
+      "version": "7",
+      "when": 1791298148518,
+      "tag": "0302_colossal_otto_octavius",
+      "breakpoints": true
+    },
+    {
+      "idx": 303,
+      "version": "7",
+      "when": 1791298395603,
+      "tag": "0303_supreme_garia",
+      "breakpoints": true
+    },
+    {
+      "idx": 304,
+      "version": "7",
+      "when": 1791298446043,
+      "tag": "0304_curvy_shadow_king",
+      "breakpoints": true
+    },
+    {
+      "idx": 305,
+      "version": "7",
+      "when": 1791300719193,
+      "tag": "0305_chubby_vin_gonzales",
+      "breakpoints": true
+    },
+    {
+      "idx": 306,
+      "version": "7",
+      "when": 1792102604505,
+      "tag": "0306_fantastic_blacklash",
+      "breakpoints": true
+    },
+    {
+      "idx": 307,
+      "version": "7",
       "when": 1792117168481,
-      "tag": "0301_overjoyed_annihilus",
+      "tag": "0307_overjoyed_annihilus",
       "breakpoints": true
     }
   ]
