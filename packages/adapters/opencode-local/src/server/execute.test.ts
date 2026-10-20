@@ -350,3 +350,99 @@ describe("ensureRemoteOpenCodeModelConfiguredAndAvailable — probe is non-fatal
     ).rejects.toThrow("Configured OpenCode model is unavailable on the remote execution target");
   });
 });
+
+describe("OpenCode recovered runs", () => {
+  let configHome: string;
+
+  const econnreset =
+    "Connection lost while reading the response: ECONNRESET: The socket connection was closed unexpectedly.";
+
+  beforeEach(async () => {
+    configHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-recovered-"));
+    vi.stubEnv("XDG_CONFIG_HOME", configHome);
+  });
+
+  afterEach(async () => {
+    vi.unstubAllEnvs();
+    await fs.rm(configHome, { recursive: true, force: true });
+  });
+
+  it("does not fail a recovered run whose CLI exited non-zero", async () => {
+    const commandPath = path.join(configHome, "fake-opencode-recovered");
+    await fs.writeFile(commandPath, "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+    runProcessMock.mockReset();
+    runProcessMock.mockResolvedValue(
+      probeResult({
+        exitCode: 1,
+        stdout: [
+          JSON.stringify({ type: "error", error: { message: econnreset } }),
+          JSON.stringify({
+            type: "text",
+            sessionID: "session_123",
+            part: { text: "Recovered after the socket dropped and finished the task" },
+          }),
+          JSON.stringify({
+            type: "step_finish",
+            sessionID: "session_123",
+            part: { reason: "done", cost: 0.001, tokens: { input: 10, output: 5, cache: {} } },
+          }),
+        ].join("\n"),
+      }),
+    );
+    const result = await execute({
+      runId: "run-recovered",
+      agent: { id: "agent-1", companyId: "company-1", name: "OpenCode", adapterType: "opencode_local", adapterConfig: {} },
+      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+      config: { command: commandPath, cwd: configHome, model: "openai/gpt-5", env: { OPENCODE_ALLOW_ALL_MODELS: "1" } },
+      context: {
+        conversationMode: true,
+        paperclipTaskMarkdown: "Do the task.",
+        paperclipWake: {
+          reason: "issue_commented", issue: { id: "chat-1", status: "in_progress", workMode: "planning" },
+          interactionKind: "request_confirmation", interactionStatus: "accepted",
+        },
+      },
+      onLog: async () => {},
+      onMeta: async () => {},
+    });
+    expect(result.exitCode).toBe(0);
+    expect(result.errorMessage).toBeNull();
+  });
+
+  it("keeps a run failed when the last error has no output after it", async () => {
+    const commandPath = path.join(configHome, "fake-opencode-fatal");
+    await fs.writeFile(commandPath, "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+    runProcessMock.mockReset();
+    runProcessMock.mockResolvedValue(
+      probeResult({
+        exitCode: 1,
+        stdout: [
+          JSON.stringify({
+            type: "text",
+            sessionID: "session_123",
+            part: { text: "Partial answer: the invoice now waits on exactly two" },
+          }),
+          JSON.stringify({ type: "error", error: { message: econnreset } }),
+        ].join("\n"),
+      }),
+    );
+    const result = await execute({
+      runId: "run-fatal",
+      agent: { id: "agent-1", companyId: "company-1", name: "OpenCode", adapterType: "opencode_local", adapterConfig: {} },
+      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+      config: { command: commandPath, cwd: configHome, model: "openai/gpt-5", env: { OPENCODE_ALLOW_ALL_MODELS: "1" } },
+      context: {
+        conversationMode: true,
+        paperclipTaskMarkdown: "Do the task.",
+        paperclipWake: {
+          reason: "issue_commented", issue: { id: "chat-1", status: "in_progress", workMode: "planning" },
+          interactionKind: "request_confirmation", interactionStatus: "accepted",
+        },
+      },
+      onLog: async () => {},
+      onMeta: async () => {},
+    });
+    expect(result.exitCode).toBe(1);
+    expect(result.errorMessage).toContain("ECONNRESET");
+  });
+});
