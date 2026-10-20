@@ -8,6 +8,7 @@ import { HttpError } from "../errors.js";
 import { claimSlackRateLimitRetry } from "./connectors/slack-retry.js";
 import { resolveSlackTaskAuthority } from "./connectors/slack-authority.js";
 import { SLACK_TOOLS } from "@paperclipai/shared";
+import type { ToolConnectionHealthStatus } from "@paperclipai/shared";
 import { slackToolsForSession } from "./connectors/slack-catalog.js";
 import { executeSlackTool } from "./connectors/slack.js";
 import { githubGuestBotConnectionForSession, githubBotToolsForSession } from "./chat-github-tools.js";
@@ -1273,8 +1274,13 @@ export function createToolGatewayService(
       // while the responsible user's grant is valid. Keep its cached active
       // catalog discoverable; execution resolves and validates that user's
       // grant, and a successful call restores the shared health indicator.
+      //
+      // "tool_timeout" is kept discoverable for the same reason: one timed
+      // out call says nothing about the connection's other tools. Only a
+      // state in which every call will fail ("error", "missing_secret")
+      // hides the connection's tools.
       or(
-        inArray(toolConnections.healthStatus, ["ok", "healthy"]),
+        inArray(toolConnections.healthStatus, ["ok", "healthy", "tool_timeout"]),
         eq(toolConnections.credentialPolicy, "per_user"),
       ),
       eq(toolApplications.companyId, companyId),
@@ -3636,7 +3642,7 @@ export function createToolGatewayService(
 
   async function markRemoteConnectionHealth(
     connection: typeof toolConnections.$inferSelect,
-    status: "ok" | "error" | "missing_secret" | "degraded",
+    status: ToolConnectionHealthStatus,
     message: string | null,
   ) {
     const now = new Date();
@@ -6316,10 +6322,15 @@ export function createToolGatewayService(
         );
       }
       if (error instanceof Error && error.name === "AbortError") {
+        // A timeout is scoped to this one call, not to the connection. The
+        // remote server may still be perfectly healthy for every other tool,
+        // and one slow tool must not remove the whole connection from every
+        // session's catalogue. Record it as its own state and let the next
+        // successful call restore "ok".
         await markRemoteConnectionHealth(
           connection,
-          "error",
-          "Remote MCP tool call timed out.",
+          "tool_timeout",
+          `Remote MCP tool call timed out: ${entry.toolName}.`,
         );
         throw new ToolGatewayHttpError(
           504,

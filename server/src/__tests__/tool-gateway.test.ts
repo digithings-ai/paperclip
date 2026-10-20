@@ -4413,6 +4413,92 @@ rl.on("line", (line) => {
     });
   }
 
+  it("keeps a connection's other tools discoverable after one tool call times out", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    const fake = await startFakeRemoteMcpServer(() => ({
+      delayMs: 75,
+      body: {
+        jsonrpc: "2.0",
+        id: "slow",
+        result: { content: [{ type: "text", text: "late" }] },
+      },
+    }));
+    try {
+      const timedOut = await createRemoteMcpTool(db, company.id, {
+        applicationKey: "timeout-visibility",
+        toolName: "kv_set",
+        url: fake.url,
+      });
+      const broken = await createRemoteMcpTool(db, company.id, {
+        applicationKey: "timeout-visibility-broken",
+        toolName: "kv_get",
+        url: fake.url,
+        healthStatus: "error",
+      });
+      await allowAllToolsForAgent(db, company.id, agent.id);
+      const gateway = createTestToolGatewayService(db);
+      const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+
+      const timedOutName = expectedConnectedToolName({
+        applicationKey: "timeout-visibility",
+        connectionId: timedOut.connection.id,
+        toolName: timedOut.catalogEntry.toolName,
+      });
+      const brokenName = expectedConnectedToolName({
+        applicationKey: "timeout-visibility-broken",
+        connectionId: broken.connection.id,
+        toolName: broken.catalogEntry.toolName,
+      });
+
+      const before = await gateway.listToolsForSession(session.token);
+      expect(before.map((tool) => tool.name)).toContain(timedOutName);
+      expect(before.map((tool) => tool.name)).not.toContain(brokenName);
+
+      await gateway.executeTool({
+        sessionToken: session.token,
+        tool: timedOutName,
+        parameters: { key: "alpha", value: "one" },
+        timeoutMs: 10,
+      }).then(
+        () => {
+          throw new Error("Expected remote MCP call to time out");
+        },
+        (error) => expectGatewayError(error, 504, "tool_timeout"),
+      );
+
+      // A timeout is scoped to that one call, so the connection is not condemned.
+      const [connection] = await db
+        .select()
+        .from(toolConnections)
+        .where(eq(toolConnections.id, timedOut.connection.id));
+      expect(connection.healthStatus).toBe("tool_timeout");
+
+      // The connection's tools stay in the catalogue, for every session.
+      const after = await gateway.listToolsForSession(session.token);
+      expect(after.map((tool) => tool.name)).toContain(timedOutName);
+      // A connection whose every call will fail is still hidden.
+      expect(after.map((tool) => tool.name)).not.toContain(brokenName);
+
+      // The timed-out tool is still resolvable by name, so the caller gets the
+      // precise 504 instead of a misleading 404 tool_not_found.
+      await gateway.executeTool({
+        sessionToken: session.token,
+        tool: timedOutName,
+        parameters: { key: "alpha", value: "two" },
+        timeoutMs: 10,
+      }).then(
+        () => {
+          throw new Error("Expected remote MCP call to time out");
+        },
+        (error) => expectGatewayError(error, 504, "tool_timeout"),
+      );
+    } finally {
+      await fake.close();
+    }
+  });
+
   it("persists hashed sessions and accepts them across gateway service instances", async () => {
     const company = await createCompany(db);
     const agent = await createAgent(db, company.id);
