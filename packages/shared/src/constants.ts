@@ -1043,6 +1043,10 @@ export const TOOL_CONNECTION_HEALTH_STATUSES = [
   "ok",
   "error",
   "missing_secret",
+  // A single remote tool call timed out. Scoped to that call, not to the
+  // connection: the connection stays discoverable so its other tools keep
+  // working and the next successful call restores "ok".
+  "tool_timeout",
 ] as const;
 export type ToolConnectionHealthStatus = (typeof TOOL_CONNECTION_HEALTH_STATUSES)[number];
 
