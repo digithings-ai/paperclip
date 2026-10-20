@@ -262,6 +262,31 @@ describePg("issue-thread interaction sourceRunId is bound to the interaction's o
     },
   );
 
+  it("accepts a board card that carries no sourceRunId", async () => {
+    const { companyId, targetIssueId } = await seed();
+    // A board actor may post a card without a source run. The route passes
+    // req.body.sourceRunId ?? null for a non-agent actor, so the service sees
+    // a null sourceRunId and the scope check must not run. This test pins the
+    // PLACEMENT of the check: if the check is later moved out of the
+    // `if (data.sourceRunId)` block, every board card without a source run
+    // is refused and this test fails.
+    const res = await request(boardApp(companyId))
+      .post(`/api/issues/${targetIssueId}/interactions`)
+      .send({
+        kind: "request_confirmation",
+        payload: INTERACTION_KINDS[2].payload,
+        title: "board card without a source run",
+      });
+
+    expect(res.status).toBe(201);
+
+    const rows = await db
+      .select({ id: issueThreadInteractions.id, sourceRunId: issueThreadInteractions.sourceRunId })
+      .from(issueThreadInteractions);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.sourceRunId).toBeNull();
+  });
+
   it("refuses an agent actor whose own run is bound to no issue at all", async () => {
     const { companyId, agentId, targetIssueId, unboundRunId } = await seed();
     // The target task is in_progress, assigned to this agent and holds no
