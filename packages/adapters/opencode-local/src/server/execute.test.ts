@@ -357,6 +357,10 @@ describe("OpenCode recovered runs", () => {
   const econnreset =
     "Connection lost while reading the response: ECONNRESET: The socket connection was closed unexpectedly.";
 
+  // A different provider fault, with a different mechanism. The recovery signal must
+  // not depend on WHICH error the run hit.
+  const noFinishReason = "OpenAI Chat stream ended without finish_reason";
+
   beforeEach(async () => {
     configHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-recovered-"));
     vi.stubEnv("XDG_CONFIG_HOME", configHome);
@@ -391,6 +395,48 @@ describe("OpenCode recovered runs", () => {
     );
     const result = await execute({
       runId: "run-recovered",
+      agent: { id: "agent-1", companyId: "company-1", name: "OpenCode", adapterType: "opencode_local", adapterConfig: {} },
+      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+      config: { command: commandPath, cwd: configHome, model: "openai/gpt-5", env: { OPENCODE_ALLOW_ALL_MODELS: "1" } },
+      context: {
+        conversationMode: true,
+        paperclipTaskMarkdown: "Do the task.",
+        paperclipWake: {
+          reason: "issue_commented", issue: { id: "chat-1", status: "in_progress", workMode: "planning" },
+          interactionKind: "request_confirmation", interactionStatus: "accepted",
+        },
+      },
+      onLog: async () => {},
+      onMeta: async () => {},
+    });
+    expect(result.exitCode).toBe(0);
+    expect(result.errorMessage).toBeNull();
+  });
+
+  it("does not fail a recovered run whose provider fault was not a transport error", async () => {
+    const commandPath = path.join(configHome, "fake-opencode-recovered-no-finish");
+    await fs.writeFile(commandPath, "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+    runProcessMock.mockReset();
+    runProcessMock.mockResolvedValue(
+      probeResult({
+        exitCode: 1,
+        stdout: [
+          JSON.stringify({ type: "error", error: { message: noFinishReason } }),
+          JSON.stringify({
+            type: "text",
+            sessionID: "session_123",
+            part: { text: "Recovered from the stream fault and finished the task" },
+          }),
+          JSON.stringify({
+            type: "step_finish",
+            sessionID: "session_123",
+            part: { reason: "done", cost: 0.001, tokens: { input: 10, output: 5, cache: {} } },
+          }),
+        ].join("\n"),
+      }),
+    );
+    const result = await execute({
+      runId: "run-recovered-no-finish",
       agent: { id: "agent-1", companyId: "company-1", name: "OpenCode", adapterType: "opencode_local", adapterConfig: {} },
       runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
       config: { command: commandPath, cwd: configHome, model: "openai/gpt-5", env: { OPENCODE_ALLOW_ALL_MODELS: "1" } },
