@@ -923,6 +923,126 @@ describe("issue comment reopen routes", () => {
     ).toMatchObject({ boardKeyCommentIds: ["comment-1"] });
   });
 
+  // The issue-update route carries the same guard as the comments route. A
+  // board-key PATCH comment on an in_progress issue still queues a
+  // user-requested comment wake; when the owning run is still active the
+  // heartbeat defers it, and promoting the deferred wake would reopen the
+  // issue the run had already finished.
+  it("marks a board-key PATCH comment wake as automation so a deferred release does not reopen", async () => {
+    const issue = makeIssue("in_progress");
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(
+      async (_id: string, patch: Record<string, unknown>) =>
+        makeIssueUpdateReceipt(issue, patch),
+    );
+
+    const res = await request(await installActor(createApp(), boardKeyActor()))
+      .patch("/api/issues/11111111-1111-4111-8111-111111111111")
+      .send({ comment: "Progress note from automation." });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    await waitForWakeup(() =>
+      expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+        "22222222-2222-4222-8222-222222222222",
+        expect.objectContaining({ reason: "issue_commented" }),
+      ),
+    );
+    const commentWake = mockHeartbeatService.wakeup.mock.calls.find(
+      ([, wakeup]: [string, { reason?: string }]) =>
+        wakeup?.reason === "issue_commented",
+    )?.[1];
+    expect(
+      (commentWake as { contextSnapshot?: Record<string, unknown> })
+        ?.contextSnapshot,
+    ).toMatchObject({ boardKeyCommentIds: ["comment-1"] });
+  });
+
+  it("does not mark a signed-in human PATCH comment wake as board-key automation", async () => {
+    const issue = makeIssue("in_progress");
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(
+      async (_id: string, patch: Record<string, unknown>) =>
+        makeIssueUpdateReceipt(issue, patch),
+    );
+
+    const res = await request(await installActor(createApp(), sessionBoardActor()))
+      .patch("/api/issues/11111111-1111-4111-8111-111111111111")
+      .send({ comment: "Please continue with the follow-up." });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    await waitForWakeup(() =>
+      expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+        "22222222-2222-4222-8222-222222222222",
+        expect.objectContaining({ reason: "issue_commented" }),
+      ),
+    );
+    const commentWake = mockHeartbeatService.wakeup.mock.calls.find(
+      ([, wakeup]: [string, { reason?: string }]) =>
+        wakeup?.reason === "issue_commented",
+    )?.[1];
+    expect(
+      (commentWake as { contextSnapshot?: Record<string, unknown> })
+        ?.contextSnapshot,
+    ).not.toHaveProperty("boardKeyCommentIds");
+  });
+
+  it("still reopens a closed issue for a board-key PATCH comment with an explicit reopen ask", async () => {
+    const issue = makeIssue("done");
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(
+      async (_id: string, patch: Record<string, unknown>) =>
+        makeIssueUpdateReceipt(issue, patch),
+    );
+
+    const res = await request(await installActor(createApp(), boardKeyActor()))
+      .patch("/api/issues/11111111-1111-4111-8111-111111111111")
+      .send({
+        comment: "New work: continue with the follow-up.",
+        reopen: true,
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    await waitForWakeup(() =>
+      expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+        "22222222-2222-4222-8222-222222222222",
+        expect.objectContaining({ reason: "issue_reopened_via_comment" }),
+      ),
+    );
+    // An explicit ask is real work. The wake must not be marked as board-key
+    // automation, or a deferred release would ignore the reopen.
+    const reopenWake = mockHeartbeatService.wakeup.mock.calls.find(
+      ([, wakeup]: [string, { reason?: string }]) =>
+        wakeup?.reason === "issue_reopened_via_comment",
+    )?.[1];
+    expect(
+      (reopenWake as { contextSnapshot?: Record<string, unknown> })
+        ?.contextSnapshot,
+    ).not.toHaveProperty("boardKeyCommentIds");
+  });
+
+  // The board-key guard sits above the closed-or-blocked status check, so a
+  // board-key comment no longer performs the implicit blocked-to-todo move
+  // either. An explicit resume ask still performs it.
+  it("does not move a blocked issue to todo for a board-key PATCH comment with no explicit ask", async () => {
+    const issue = makeIssue("blocked");
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(
+      async (_id: string, patch: Record<string, unknown>) =>
+        makeIssueUpdateReceipt(issue, patch),
+    );
+
+    const res = await request(await installActor(createApp(), boardKeyActor()))
+      .patch("/api/issues/11111111-1111-4111-8111-111111111111")
+      .send({ comment: "Still working on it." });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    const lastPatch =
+      mockIssueService.update.mock.calls[
+        mockIssueService.update.mock.calls.length - 1
+      ]?.[1];
+    expect(lastPatch).not.toMatchObject({ status: "todo" });
+  });
+
   it("still implicitly reopens a closed issue for a signed-in board user comment", async () => {
     const issue = makeIssue("done");
     mockIssueService.getById.mockResolvedValue(issue);

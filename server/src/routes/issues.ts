@@ -13150,6 +13150,18 @@ export function issueRoutes(
           : normalizedAssigneeAgentId;
       const explicitMoveToTodoRequested =
         reopenRequested || resumeRequested === true;
+      // Automation writes with the board API key are log-class notes unless
+      // they carry an explicit reopen/resume ask. Stamp the comment id on the
+      // wake so a deferred release does not revive the issue when the owning
+      // run closes it before the wake is promoted. The issue-update route
+      // carries the same guard as the comments route: without it, a board-key
+      // PATCH comment on an in_progress issue queues a user-requested comment
+      // wake, the heartbeat defers it while the owning run is still active,
+      // and the release reopens the finished issue.
+      const boardKeyCommentWithoutAsk =
+        actor.actorSource === "board_key" &&
+        reopenRequested !== true &&
+        resumeRequested !== true;
       const recoveryRelevantSourceMutationRequested =
         req.body.status !== undefined ||
         normalizedAssigneeAgentId !== undefined ||
@@ -14972,6 +14984,9 @@ export function issueRoutes(
                   ? "issue_reopened_via_comment"
                   : "issue_commented",
                 ...(reopened ? { reopenedFrom: reopenFromStatus } : {}),
+                ...(boardKeyCommentWithoutAsk
+                  ? { [BOARD_KEY_COMMENT_IDS_KEY]: [comment.id] }
+                  : {}),
                 ...(resumeRequested === true
                   ? { resumeIntent: true, followUpRequested: true }
                   : {}),
