@@ -56,13 +56,6 @@ async function assertDecisionAccess(
   }
 }
 
-/**
- * Every attention source kind points at a row with a uuid primary key, so a
- * source id must look like one. This check keeps a malformed id out of the
- * database instead of letting the query fail with a 500.
- */
-const UUID_SHAPE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
 type SourceParamsResult =
   | { ok: true; source: { sourceKind: AttentionSourceKind; sourceId: string } }
   | { ok: false; error: string };
@@ -72,15 +65,9 @@ function sourceParams(req: Parameters<typeof getActorInfo>[0]): SourceParamsResu
   if (!parsed.success) return { ok: false, error: "Invalid attention source kind" };
   const sourceId = (req.params.sourceId as string | undefined)?.trim();
   if (!sourceId || sourceId.length > 500) return { ok: false, error: "Invalid attention source identity" };
-  // Every attention source is a row with a uuid primary key. A short or
-  // malformed id can never match one, and it used to reach the database and
-  // fail there with a 500. Reject it here with the shape the caller needs.
-  if (!UUID_SHAPE.test(sourceId)) {
-    return {
-      ok: false,
-      error: "Invalid attention source identity: sourceId must be a full uuid",
-    };
-  }
+  // The shape of a source id is checked once, in the service, where every
+  // entry point passes through it. A short or malformed id can never match a
+  // source row, and it used to reach the database and fail there with a 500.
   return { ok: true, source: { sourceKind: parsed.data, sourceId } };
 }
 

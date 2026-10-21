@@ -23,6 +23,7 @@ import { logActivity } from "./activity-log.js";
 import type { AuthorizationActor } from "./authorization.js";
 import {
   canReadDecisionSource,
+  resolveDecisionRunId,
   type DecisionMutationActor,
 } from "./decision-queues.js";
 
@@ -193,6 +194,7 @@ export function decisionRetentionService(
     if (!(await canReadDecisionSource(db, input.authActor, input.companyId, input.sourceKind, input.sourceId))) {
       throw notFound("Attention source not found");
     }
+    const runId = await resolveDecisionRunId(db, input.companyId, input.actor.runId);
     const updated = await db.update(decisionRetention).set({
       keep: input.keep,
       version: sql`${decisionRetention.version} + 1`,
@@ -208,7 +210,7 @@ export function decisionRetentionService(
       actorType: input.actor.actorType,
       actorId: input.actor.actorId,
       agentId: input.actor.agentId,
-      runId: input.actor.runId,
+      runId,
       agentApiKeyId: input.actor.agentApiKeyId,
       responsibleUserIdOverride: input.actor.responsibleUserId,
       action: "decision_retention.keep_updated",
@@ -230,11 +232,13 @@ export function decisionRetentionService(
     if (!(await canReadDecisionSource(db, input.authActor, input.companyId, input.sourceKind, input.sourceId))) {
       throw notFound("Attention source not found");
     }
+    const runId = await resolveDecisionRunId(db, input.companyId, input.actor.runId);
+    const actor = { ...input.actor, runId };
     const now = new Date();
     const updated = await db.update(decisionRetention).set(input.archived ? {
       archivedAt: now,
       archivedReason: "manual",
-      ...archiveActorColumns(input.actor),
+      ...archiveActorColumns(actor),
       archiveVersion: sql`${decisionRetention.archiveVersion} + 1`,
       version: sql`${decisionRetention.version} + 1`,
       updatedAt: now,
@@ -263,7 +267,7 @@ export function decisionRetentionService(
       actorType: input.actor.actorType,
       actorId: input.actor.actorId,
       agentId: input.actor.agentId,
-      runId: input.actor.runId,
+      runId,
       agentApiKeyId: input.actor.agentApiKeyId,
       responsibleUserIdOverride: input.actor.responsibleUserId,
       action: input.archived ? "decision_retention.archived" : "decision_retention.revived",

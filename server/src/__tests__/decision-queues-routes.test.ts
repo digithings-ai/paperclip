@@ -697,12 +697,12 @@ describeEmbeddedPostgres("decision queue routes", () => {
       .put(`/api/companies/${companyId}/decision-triage/issue_thread_interaction/${shortId}`)
       .send({ decideBy: "today" });
     expect(put.status).toBe(400);
-    expect(put.body.error).toMatch(/full uuid/i);
+    expect(put.body.error).toMatch(/uuid/i);
 
     const get = await request(app(agent))
       .get(`/api/companies/${companyId}/decision-triage/issue_thread_interaction/${shortId}`);
     expect(get.status).toBe(400);
-    expect(get.body.error).toMatch(/full uuid/i);
+    expect(get.body.error).toMatch(/uuid/i);
 
     // The card itself stays untouched, and its full id still works.
     const rows = await db.select().from(decisionTriage);
@@ -711,6 +711,173 @@ describeEmbeddedPostgres("decision queue routes", () => {
       .put(`/api/companies/${companyId}/decision-triage/issue_thread_interaction/${interactionId}`)
       .send({ decideBy: "today" })
       .expect(200);
+  });
+
+  it("refuses a malformed source id on every route that takes one", async () => {
+    const { companyId, agentId, interactionId } = await seed();
+    const agent = agentActor(companyId, agentId);
+    const shortId = interactionId.slice(0, 8);
+    await request(app(agent)).post(`/api/companies/${companyId}/decision-queues`).send({
+      key: "triage",
+      title: "Triage",
+    }).expect(201);
+    await request(app(agent))
+      .post(`/api/companies/${companyId}/decision-queues/triage/items`)
+      .send({ sourceKind: "issue_thread_interaction", sourceId: interactionId })
+      .expect(201);
+
+    const routes: Array<{ method: "get" | "put" | "post" | "patch" | "delete"; path: string; body?: unknown }> = [
+      { method: "get", path: `/api/companies/${companyId}/decision-triage/issue_thread_interaction/${shortId}` },
+      {
+        method: "put",
+        path: `/api/companies/${companyId}/decision-triage/issue_thread_interaction/${shortId}`,
+        body: { decideBy: "today" },
+      },
+      {
+        method: "delete",
+        path: `/api/companies/${companyId}/decision-queues/triage/items/issue_thread_interaction/${shortId}`,
+      },
+      {
+        method: "patch",
+        path: `/api/companies/${companyId}/decision-retention/issue_thread_interaction/${shortId}`,
+        body: { keep: true },
+      },
+      { method: "post", path: `/api/companies/${companyId}/decision-retention/issue_thread_interaction/${shortId}/archive` },
+      { method: "post", path: `/api/companies/${companyId}/decision-retention/issue_thread_interaction/${shortId}/revive` },
+    ];
+    for (const route of routes) {
+      const response = await request(app(agent))[route.method](route.path).send(route.body as never);
+      expect(response.status, `${route.method} ${route.path}`).toBe(400);
+      expect(response.body.error, `${route.method} ${route.path}`).toMatch(/uuid/i);
+    }
+
+    // The body sourced route is guarded by the same service check.
+    const added = await request(app(agent))
+      .post(`/api/companies/${companyId}/decision-queues/triage/items`)
+      .send({ sourceKind: "issue_thread_interaction", sourceId: shortId });
+    expect(added.status).toBe(400);
+    expect(added.body.error).toMatch(/uuid/i);
+
+    const rows = await db.select().from(decisionTriage);
+    expect(rows).toHaveLength(0);
+  });
+
+  it("returns 404 for a well formed id that names no source", async () => {
+    const { companyId, agentId } = await seed();
+    const agent = agentActor(companyId, agentId);
+    const unknown = randomUUID();
+
+    const get = await request(app(agent))
+      .get(`/api/companies/${companyId}/decision-triage/issue_thread_interaction/${unknown}`);
+    expect(get.status).toBe(404);
+    expect(get.body.error).toMatch(/not found/i);
+
+    const put = await request(app(agent))
+      .put(`/api/companies/${companyId}/decision-triage/issue_thread_interaction/${unknown}`)
+      .send({ decideBy: "today" });
+    expect(put.status).toBe(404);
+  });
+
+  it("returns no triage row for a card that has none yet", async () => {
+    const { companyId, agentId, interactionId } = await seed();
+    const agent = agentActor(companyId, agentId);
+
+    const read = await request(app(agent))
+      .get(`/api/companies/${companyId}/decision-triage/issue_thread_interaction/${interactionId}`)
+      .expect(200);
+    expect(read.body).toBeNull();
+  });
+
+  it("keeps a run id that names no run out of the triage row", async () => {
+    const { companyId, agentId, interactionId } = await seed();
+    const withBadRun = { ...agentActor(companyId, agentId), runId: "run-1234" };
+    const withUnknownRun = { ...agentActor(companyId, agentId), runId: randomUUID() };
+
+    const bad = await request(app(withBadRun))
+      .put(`/api/companies/${companyId}/decision-triage/issue_thread_interaction/${interactionId}`)
+      .send({ decideBy: "today" })
+      .expect(200);
+    expect(bad.body.setByRunId).toBeNull();
+
+    const unknown = await request(app(withUnknownRun))
+      .put(`/api/companies/${companyId}/decision-triage/issue_thread_interaction/${interactionId}`)
+      .send({ decideBy: "whenever" })
+      .expect(200);
+    expect(unknown.body.setByRunId).toBeNull();
+
+    const events = await db.select().from(decisionTriageEvents);
+    expect(events.every((event) => event.actorRunId === null)).toBe(true);
+  });
+
+  it("writes a triage row for a user actor", async () => {
+    const { companyId, interactionId } = await seed();
+    const board = boardActor(companyId);
+
+    const written = await request(app(board))
+      .put(`/api/companies/${companyId}/decision-triage/issue_thread_interaction/${interactionId}`)
+      .send({ decideBy: "today" })
+      .expect(200);
+    expect(written.body).toMatchObject({
+      decideBy: "today",
+      setByType: "user",
+      setByUserId: "board-user",
+      setByAgentId: null,
+      version: 1,
+    });
+  });
+
+  it("accepts the uuid spellings the database accepts", async () => {
+    const { companyId, agentId, interactionId } = await seed();
+    const agent = agentActor(companyId, agentId);
+    const undashed = interactionId.replace(/-/g, "");
+    const braced = `{${interactionId}}`;
+
+    await request(app(agent))
+      .put(`/api/companies/${companyId}/decision-triage/issue_thread_interaction/${undashed}`)
+      .send({ decideBy: "today" })
+      .expect(200);
+    const read = await request(app(agent))
+      .get(`/api/companies/${companyId}/decision-triage/issue_thread_interaction/${undashed}`)
+      .expect(200);
+    expect(read.body).toMatchObject({ decideBy: "today", version: 1 });
+
+    await request(app(agent)).post(`/api/companies/${companyId}/decision-queues`).send({
+      key: "triage",
+      title: "Triage",
+    }).expect(201);
+    await request(app(agent))
+      .post(`/api/companies/${companyId}/decision-queues/triage/items`)
+      .send({ sourceKind: "issue_thread_interaction", sourceId: braced })
+      .expect(201);
+  });
+
+  it("skips a stored queue item whose source id is not a uuid", async () => {
+    const { companyId, agentId } = await seed();
+    const agent = agentActor(companyId, agentId);
+    const queue = await request(app(agent)).post(`/api/companies/${companyId}/decision-queues`).send({
+      key: "legacy",
+      title: "Legacy",
+    }).expect(201);
+
+    await db.insert(decisionQueueItems).values({
+      companyId,
+      queueId: queue.body.id,
+      sourceKind: "issue_thread_interaction",
+      sourceId: "legacy-short-id",
+      addedByType: "system",
+      addedByAgentId: null,
+      addedByUserId: null,
+      addedByRunId: null,
+      responsibleUserId: null,
+    });
+
+    const listed = await request(app(agent)).get(`/api/companies/${companyId}/decision-queues`).expect(200);
+    const legacy = listed.body.find((entry: { key: string }) => entry.key === "legacy");
+    expect(legacy.itemCount).toBe(0);
+    const items = await request(app(agent))
+      .get(`/api/companies/${companyId}/decision-queues/legacy/items`)
+      .expect(200);
+    expect(items.body).toEqual([]);
   });
 
   it("serializes concurrent partial triage updates without losing state or reusing a version", async () => {
