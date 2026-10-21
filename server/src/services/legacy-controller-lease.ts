@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { and, eq, gt, lte, sql } from "drizzle-orm";
 import { heartbeatRuns, type Db } from "@paperclipai/db";
+import { logger } from "../middleware/logger.js";
 
 // A boot UUID has meaning across containers; a numeric PID does not.
 export const legacyControllerBootId = randomUUID();
@@ -8,6 +9,20 @@ export const LEGACY_CONTROLLER_LEASE_MS = 60_000;
 export const LEGACY_CONTROLLER_RENEW_MS = 10_000;
 
 type Run = typeof heartbeatRuns.$inferSelect;
+
+/** A lost lease is not a requested stop. The distinction decides whether a
+ * finished run is recorded as cancelled or on its own adapter result. */
+export class LegacyControllerLeaseLostError extends Error {
+  constructor(message = "Legacy controller lease lost") {
+    super(message);
+    this.name = "LegacyControllerLeaseLostError";
+  }
+}
+
+export function isLegacyControllerLeaseLost(reason: unknown): boolean {
+  if (reason instanceof LegacyControllerLeaseLostError) return true;
+  return reason instanceof Error && /lease lost/i.test(reason.message);
+}
 
 /** Commit these fields in the same UPDATE that claims a queued run. */
 export function legacyControllerClaim(runtimeMode: string) {
@@ -70,7 +85,9 @@ export function watchLegacyControllerLease(db: Db, run: Run, controller: AbortCo
   }
   let stopped = false;
   let pending = false;
-  const lost = () => { if (!stopped) controller.abort(new Error("Legacy controller lease lost")); };
+  const lost = () => {
+    if (!stopped) controller.abort(new LegacyControllerLeaseLostError());
+  };
   let deadline = setTimeout(lost, Math.max(0,
     (run.controllerLeaseExpiresAt?.getTime() ?? 0) - Date.now()));
   deadline.unref();
@@ -104,7 +121,19 @@ export function watchLegacyControllerLease(db: Db, run: Run, controller: AbortCo
   const timer = setInterval(() => {
     if (pending || stopped) return;
     pending = true;
-    void assertOwned().catch(lost).finally(() => { pending = false; });
+    // A failed renewal is not proof that the lease was lost: the database may
+    // simply be unreachable for a moment. The lease deadline stays the hard
+    // bound and the next tick retries the renewal. Aborting here would turn a
+    // transient database fault into a cancelled run.
+    void assertOwned()
+      .catch((error) => {
+        if (stopped || controller.signal.aborted) return;
+        logger.warn(
+          { err: error, runId: run.id },
+          "Legacy controller lease renewal failed; retrying until the lease deadline",
+        );
+      })
+      .finally(() => { pending = false; });
   }, LEGACY_CONTROLLER_RENEW_MS);
   timer.unref();
   return { assertOwned, stop() { stopped = true; clearInterval(timer); clearTimeout(deadline); } };
