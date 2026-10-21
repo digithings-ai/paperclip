@@ -65,6 +65,14 @@ describe("redactPersistedRunOutput", () => {
     const redacted = JSON.stringify(redactPersistedRunOutput(deep));
     expect(redacted).not.toContain("PAPERCLIP_API_KEY");
   });
+
+  it("keeps the secret registry of the run context", () => {
+    const registry = { fingerprintSha256: "abc123", material: "encrypted-material" };
+    const redacted = redactPersistedRunOutput({
+      paperclipSecretRedactions: [registry],
+    }) as { paperclipSecretRedactions: unknown[] };
+    expect(redacted.paperclipSecretRedactions).toEqual([registry]);
+  });
 });
 
 describe("redactAdapterResultForPersistence", () => {

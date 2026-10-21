@@ -14,6 +14,13 @@ import { redactSensitiveText } from "../redaction.js";
 /** A value below this depth is dropped. A deep value can hide a credential. */
 const MAX_REDACTED_RUN_OUTPUT_DEPTH = 24;
 
+/**
+ * The run context holds a registry of the secret material that the run used.
+ * The registry keeps the encrypted material. The run must read it later. The
+ * redaction must not touch it.
+ */
+const RUN_SECRET_REDACTION_REGISTRY_KEY = "paperclipSecretRedactions";
+
 /** Redact a text value that Paperclip stores in the board database. */
 export function redactPersistedRunText(value: string): string {
   return redactSensitiveText(value);
@@ -45,7 +52,9 @@ export function redactPersistedRunOutput(value: unknown, depth = 0): unknown {
   return Object.fromEntries(
     Object.entries(record).map(([key, item]) => [
       key,
-      redactPersistedRunOutput(item, depth + 1),
+      key === RUN_SECRET_REDACTION_REGISTRY_KEY
+        ? item
+        : redactPersistedRunOutput(item, depth + 1),
     ]),
   );
 }
