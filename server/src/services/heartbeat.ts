@@ -297,6 +297,10 @@ import {
   redactPersistedRunTextOrNull,
 } from "./run-output-redaction.js";
 import {
+  scrubSeatStoreInPlace,
+  seatSessionStorePathForAgent,
+} from "./seat-store-redaction.js";
+import {
   providerTraceStore,
   PROVIDER_TRACE_MAX_BYTES,
 } from "./provider-trace-store.js";
@@ -25785,6 +25789,57 @@ export function heartbeatService(
               persistedRun,
               persistedResultJson,
             )) ?? persistedRun;
+        }
+
+        // The seat keeps its own copy of the run in the session store of the
+        // seat. A seat that printed its environment wrote the raw token into
+        // that store. The copy of the board is redacted above. This removes
+        // the copy that the seat keeps, so a backup of the seat home holds no
+        // raw value either.
+        try {
+          const seatStore = seatSessionStorePathForAgent(agent.adapterConfig);
+          if (seatStore) {
+            // A seat that runs writes to that store while it runs. The scrub
+            // waits until no run of the seat is writing, so it never writes
+            // under a seat that is writing.
+            const busy = await db
+              .select({ id: heartbeatRuns.id })
+              .from(heartbeatRuns)
+              .where(
+                and(
+                  eq(heartbeatRuns.agentId, agent.id),
+                  eq(heartbeatRuns.status, "running"),
+                  ne(heartbeatRuns.id, run.id),
+                ),
+              );
+            if (busy.length > 0) {
+              logger.info(
+                { runId: run.id, agentId: agent.id, store: seatStore },
+                "the seat of the run is busy, the session store is left alone",
+              );
+            } else {
+              const seatCounts = scrubSeatStoreInPlace(seatStore);
+              if (seatCounts.fieldsChanged > 0 || seatCounts.skipped) {
+                logger.info(
+                  {
+                    runId: run.id,
+                    agentId: agent.id,
+                    store: seatStore,
+                    valuesScanned: seatCounts.valuesScanned,
+                    fieldsChanged: seatCounts.fieldsChanged,
+                    rowsChanged: seatCounts.rowsChanged,
+                    skipped: seatCounts.skipped,
+                  },
+                  "redacted credential values from the session store of the seat",
+                );
+              }
+            }
+          }
+        } catch (err) {
+          logger.warn(
+            { err, runId: run.id, agentId: agent.id },
+            "failed to redact the session store of the seat",
+          );
         }
 
         await setWakeupStatus(

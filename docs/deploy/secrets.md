@@ -516,6 +516,49 @@ The script works in place. It does not copy the database. It prints counts
 only. Take a backup of the database before you run the script, because a backup
 of the database holds the old value.
 
+## Redacted Seat Session Stores
+
+A seat keeps its own copy of the run in the session store of the seat, an
+OpenCode database under the data home of the seat. A seat that printed its
+environment wrote the raw value into that copy. The board does not read that
+copy, and a backup of the seat home copies it. The server redacts it at the end
+of the run of the seat, and the script below does the same for a seat that
+never runs again.
+
+The rules of the scrub keep it from breaking a store that a seat reads:
+
+- A column that holds a JSON document is never changed by a substitution in the
+  raw text. The document is read, the values inside it are redacted, and the
+  document is written back. A substitution can take the escape of the next
+  quote with it, and the document would stop being a document.
+- A write lands only when the row still holds the value that the scrub read. A
+  seat that writes the same row at the same time keeps its value.
+- The store of a seat that is running is left alone. The seat writes to that
+  store while it runs.
+- A row that an earlier redaction broke is repaired, and a row that the repair
+  cannot fix is counted.
+
+```sh
+# dry run: prints counts only
+DATABASE_URL=postgres://... pnpm --filter @paperclipai/server exec tsx \
+  scripts/redact-seat-store-secrets.ts --dry-run
+
+# apply: repairs the broken rows and redacts the values in place
+DATABASE_URL=postgres://... pnpm --filter @paperclipai/server exec tsx \
+  scripts/redact-seat-store-secrets.ts --repair
+
+# also remove the rows that the repair could not fix, so that the seat reads
+# the session again
+DATABASE_URL=postgres://... pnpm --filter @paperclipai/server exec tsx \
+  scripts/redact-seat-store-secrets.ts --repair --drop-unrepairable
+```
+
+The script reads the seat homes from the board database, works in place, and
+prints counts only. It never copies a store, so a backup of the seat home
+before the run holds the old value. The script keeps the state of its last
+pass next to each store, so a later pass reads only the rows that changed
+since then. The option `--full` reads every row again.
+
 ## Portable Declarations
 
 Company exports include only environment declarations. They do not include

@@ -22,7 +22,7 @@ const MAX_REDACTED_RUN_OUTPUT_DEPTH = 24;
 const RUN_SECRET_REDACTION_REGISTRY_KEY = "paperclipSecretRedactions";
 
 /** The redaction marker of the server redactor. */
-const REDACTED_RUN_OUTPUT_VALUE = "***REDACTED***";
+export const REDACTED_RUN_OUTPUT_VALUE = "***REDACTED***";
 
 /** A character of a credential token. The runner uses the same set. */
 function isTokenByte(char: string): boolean {
