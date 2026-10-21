@@ -292,6 +292,11 @@ import { createNativeSessionHandoffLoader } from "./native-runtime/native-sessio
 import { normalizeResponsibleUserDenialCode } from "./responsible-user-denial-run-outcomes.js";
 import { getRunLogStore, type RunLogHandle } from "./run-log-store.js";
 import {
+  redactAdapterResultForPersistence,
+  redactPersistedRunOutput,
+  redactPersistedRunTextOrNull,
+} from "./run-output-redaction.js";
+import {
   providerTraceStore,
   PROVIDER_TRACE_MAX_BYTES,
 } from "./provider-trace-store.js";
@@ -25178,6 +25183,11 @@ export function heartbeatService(
           }
           if (instructionSave) adapterResult.resultJson = { ...adapterResult.resultJson, instructionSave };
           adapterResult = applyWorkspaceRestoreFailure(adapterResult);
+          // The adapter returns the raw output of the provider process. A seat
+          // that prints its own environment puts raw credentials in that
+          // output. Redact the secret-shaped values before the result reaches
+          // the board database and every backup of it.
+          adapterResult = redactAdapterResultForPersistence(adapterResult);
           // A returned result can include a failed restore. Keep the workspace
           // barrier closed until required files have been restored.
           // If recording the barrier itself fails, propagate as a run failure
@@ -25554,7 +25564,7 @@ export function heartbeatService(
           usageBasis: adapterResult.usageBasis ?? null,
         });
         const normalizedUsage = sessionUsageResolution.normalizedUsage;
-        const runErrorMessage =
+        const runErrorMessage = redactPersistedRunTextOrNull(
           outcome === "cancelled"
             ? redactCurrentUserText(latestRun?.error ?? adapterResult.errorMessage ?? "Cancelled", currentUserRedactionOptions)
             : outcome === "succeeded"
@@ -25563,7 +25573,8 @@ export function heartbeatService(
                   adapterResult.errorMessage ??
                     (outcome === "timed_out" ? "Timed out" : "Adapter failed"),
                   currentUserRedactionOptions,
-                );
+                ),
+        );
         const recordedResponsibleUserDenialCode =
           normalizeResponsibleUserDenialCode(latestRun?.errorCode);
         const runErrorCode =
@@ -25671,7 +25682,7 @@ export function heartbeatService(
               } as Record<string, unknown>)
             : null;
 
-        const persistedResultJson = cancellationResultJson(latestRun ?? run, outcome, mergeHeartbeatRunResultJson(
+        const mergedResultJson = cancellationResultJson(latestRun ?? run, outcome, mergeHeartbeatRunResultJson(
           mergeRunStopMetadataForAgent(agent, outcome, {
             resultJson: mergeAdapterRecoveryMetadata({
               resultJson: {
@@ -25692,6 +25703,12 @@ export function heartbeatService(
           }),
           adapterResult.summary ?? null,
         ), runErrorCode, runErrorMessage);
+        // Redact at the persistence boundary. The merged result can still hold
+        // output that was stored before this run started, and the run row is
+        // what the database backups copy.
+        const persistedResultJson = redactPersistedRunOutput(
+          mergedResultJson,
+        ) as Record<string, unknown> | null;
 
         const finalRunPatch: Partial<typeof heartbeatRuns.$inferInsert> = {
           finishedAt: new Date(),
