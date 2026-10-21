@@ -487,6 +487,30 @@ Use the CLI command for normal operations because it goes through the Paperclip
 API, creates or rotates secret records, and updates agent env bindings with
 audit logging.
 
+## Redacted Run Output
+
+The board stores the output of every run. Paperclip removes a credential-shaped
+value from that output before it stores the output. The name of the secret and
+the text around it stay. The run log, the stdout excerpt, and the stderr
+excerpt use the same rule.
+
+If a board already stored run output that holds a credential value, redact the
+stored rows in place:
+
+```sh
+# dry run: prints counts only
+DATABASE_URL=postgres://... pnpm --filter @paperclipai/server exec tsx \
+  scripts/redact-persisted-run-secrets.ts --dry-run
+
+# apply: updates the rows in place
+DATABASE_URL=postgres://... pnpm --filter @paperclipai/server exec tsx \
+  scripts/redact-persisted-run-secrets.ts
+```
+
+The script works in place. It does not copy the database. It prints counts
+only. Take a backup of the database before you run the script, because a backup
+of the database holds the old value.
+
 ## Portable Declarations
 
 Company exports include only environment declarations. They do not include
