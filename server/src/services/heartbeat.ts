@@ -519,17 +519,25 @@ import {
   FINISH_SUCCESSFUL_RUN_HANDOFF_REASON,
   SUCCESSFUL_RUN_MISSING_STATE_REASON,
   RUN_LIVENESS_CONTINUATION_REASON,
+  ORPHANED_RUN_CONTINUATION_ERROR_CODE,
   buildRunLivenessContinuationIdempotencyKey,
   buildFinishSuccessfulRunHandoffIdempotencyKey,
+  buildOrphanedRunContinuationIdempotencyKey,
   buildSuccessfulRunHandoffRequiredNotice,
   decideRunLivenessContinuation,
   decideSuccessfulRunHandoff,
+  evaluateOrphanedRunContinuationPreflight,
   findExistingFinishSuccessfulRunHandoffWake,
   findExistingRunLivenessContinuationWake,
+  findLaterRunOnIssue,
+  findPendingOrphanedRunContinuationWake,
   isSuccessfulRunHandoffValidPathSkip,
   SUCCESSFUL_RUN_HANDOFF_REQUIRED_NOTICE_BODY,
   readContinuationAttempt,
+  readOrphanedRunContinuationGraceMs,
 } from "./recovery/index.js";
+import type { RunContinuationSource } from "./recovery/index.js";
+import { readHostHealth, type HostHealth } from "./host-health.js";
 import {
   buildConfigurationIncompleteRecoveryNoticeSeed,
   buildExecutionReviewParticipantRecoveryNoticeSeed,
@@ -13317,21 +13325,48 @@ export function heartbeatService(
 
   async function handleRunLivenessContinuation(
     run: typeof heartbeatRuns.$inferSelect,
-  ) {
+    source: RunContinuationSource = { kind: "liveness" },
+  ): Promise<{ enqueued: boolean; reason: string }> {
     const context = parseObject(run.contextSnapshot);
     if (
       readNonEmptyString(context.goalControlRequestId) ||
       context.resumeSessionGoalHeartbeat === true
     )
-      return;
+      return {
+        enqueued: false,
+        reason: "run carries a goal control request",
+      };
     const livenessState = run.livenessState as RunLivenessState | null;
-    if (livenessState !== "plan_only" && livenessState !== "empty_response")
-      return;
+    // The liveness path only continues the two actionable liveness states.
+    // The orphaned-run path is gated on the error code the recovery backstop
+    // wrote, because the backstop never writes a liveness state and
+    // "needs_followup" is also produced by two cases that are not safe to
+    // auto-continue.
+    const actionableLivenessState =
+      livenessState === "plan_only" || livenessState === "empty_response"
+        ? livenessState
+        : null;
+    if (source.kind === "liveness" && !actionableLivenessState) {
+      return {
+        enqueued: false,
+        reason: "liveness state is not actionable for continuation",
+      };
+    }
+    if (
+      source.kind === "orphaned_run" &&
+      run.errorCode !== ORPHANED_RUN_CONTINUATION_ERROR_CODE
+    ) {
+      return {
+        enqueued: false,
+        reason: "run error code is not eligible for continuation",
+      };
+    }
 
     const issueId = readNonEmptyString(context.issueId);
-    if (!issueId) return;
+    if (!issueId) return { enqueued: false, reason: "run context has no issue id" };
     const waitingContext = await getIssueExecutionContext(run.companyId, issueId);
-    if (isWaitingConversation(waitingContext) || waitingContext?.externalConversationState === "waiting") return;
+    if (isWaitingConversation(waitingContext) || waitingContext?.externalConversationState === "waiting")
+      return { enqueued: false, reason: "issue is waiting on a conversation" };
 
     const [issue, agent] = await Promise.all([
       db
@@ -13369,12 +13404,20 @@ export function heartbeatService(
 
     const nextAttempt = readContinuationAttempt(run.continuationAttempt) + 1;
     const idempotencyKey = issue
-      ? buildRunLivenessContinuationIdempotencyKey({
-          issueId: issue.id,
-          sourceRunId: run.id,
-          livenessState,
-          nextAttempt,
-        })
+      ? source.kind === "orphaned_run"
+        ? buildOrphanedRunContinuationIdempotencyKey({
+            issueId: issue.id,
+            sourceRunId: run.id,
+            errorCode: source.errorCode,
+            nextAttempt,
+          })
+        : buildRunLivenessContinuationIdempotencyKey({
+            issueId: issue.id,
+            sourceRunId: run.id,
+            // The liveness path only reaches here with an actionable state.
+            livenessState: actionableLivenessState as RunLivenessState,
+            nextAttempt,
+          })
       : null;
     const existingWake = idempotencyKey
       ? await findExistingRunLivenessContinuationWake(db, {
@@ -13392,6 +13435,7 @@ export function heartbeatService(
       nextAction: run.nextAction,
       budgetBlocked: Boolean(budgetBlock),
       idempotentWakeExists: Boolean(existingWake),
+      source,
     });
 
     if (decision.kind === "exhausted") {
@@ -13403,10 +13447,12 @@ export function heartbeatService(
         issueId,
         comment: decision.comment,
       });
-      return;
+      return { enqueued: false, reason: "continuation attempts exhausted" };
     }
 
-    if (decision.kind !== "enqueue") return;
+    if (decision.kind !== "enqueue") {
+      return { enqueued: false, reason: decision.reason };
+    }
 
     const continuationRun = await enqueueWakeup(run.agentId, {
       source: "automation",
@@ -13432,6 +13478,8 @@ export function heartbeatService(
         })
         .where(eq(heartbeatRuns.id, run.id));
     }
+
+    return { enqueued: Boolean(continuationRun), reason: "continuation enqueued" };
   }
 
   function issueUiLink(
@@ -19960,6 +20008,131 @@ export function heartbeatService(
 
   async function sweepStaleIssueLocks() {
     return recovery.sweepStaleIssueLocks();
+  }
+
+  // Bounded continuation for the runs the recovery backstop terminalized.
+  //
+  // The backstop terminalizes a run whose process and sandbox are gone and
+  // never re-dispatches it, so the work of that run is lost unless the seat
+  // is dispatched again. The backstop keeps terminalizing; this sweep is the
+  // separate, bounded path that continues such a run, and only when every
+  // gate is open:
+  //
+  //  - the run carries the process-death error code (never the issue-terminal
+  //    one, which means the issue already finished),
+  //  - the grace period after the work stopped has passed, so a seat that
+  //    was picked up again by hand or by the wake queue is left alone,
+  //  - the host is not saturated, so the continuation does not land on the
+  //    same saturated host that killed the run,
+  //  - the issue has no later run on it, and no continuation of this run is
+  //    still in flight.
+  async function sweepOrphanedRunContinuations(opts?: {
+    now?: Date;
+    companyId?: string;
+    graceMs?: number;
+    hostHealth?: HostHealth;
+    limit?: number;
+  }) {
+    const now = opts?.now ?? new Date();
+    const graceMs = opts?.graceMs ?? readOrphanedRunContinuationGraceMs();
+    const hostHealth = opts?.hostHealth ?? readHostHealth();
+    const limit = opts?.limit ?? 200;
+
+    const candidates = await db
+      .select({
+        id: heartbeatRuns.id,
+        companyId: heartbeatRuns.companyId,
+        status: heartbeatRuns.status,
+        errorCode: heartbeatRuns.errorCode,
+        lastOutputAt: heartbeatRuns.lastOutputAt,
+        finishedAt: heartbeatRuns.finishedAt,
+        startedAt: heartbeatRuns.startedAt,
+        createdAt: heartbeatRuns.createdAt,
+        contextSnapshot: heartbeatRuns.contextSnapshot,
+      })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.status, "interrupted"),
+          eq(heartbeatRuns.errorCode, ORPHANED_RUN_CONTINUATION_ERROR_CODE),
+          opts?.companyId
+            ? eq(heartbeatRuns.companyId, opts.companyId)
+            : undefined,
+        ),
+      )
+      .orderBy(asc(heartbeatRuns.updatedAt))
+      .limit(limit);
+
+    const skipped: string[] = [];
+    let continued = 0;
+    let eligible = 0;
+
+    for (const candidate of candidates) {
+      const preflight = evaluateOrphanedRunContinuationPreflight({
+        run: candidate,
+        now,
+        graceMs,
+        hostSaturated: hostHealth.saturated,
+      });
+      if (!preflight.eligible) {
+        skipped.push(`${candidate.id}: ${preflight.reason}`);
+        continue;
+      }
+
+      const issueId = issueIdFromRunContext(candidate.contextSnapshot);
+      if (!issueId) {
+        skipped.push(`${candidate.id}: run context has no issue id`);
+        continue;
+      }
+
+      const pendingWake = await findPendingOrphanedRunContinuationWake(db, {
+        companyId: candidate.companyId,
+        issueId,
+        sourceRunId: candidate.id,
+      });
+      if (pendingWake) {
+        skipped.push(`${candidate.id}: a continuation of this run is already in flight`);
+        continue;
+      }
+
+      const laterRun = await findLaterRunOnIssue(db, {
+        companyId: candidate.companyId,
+        issueId,
+        sourceRunId: candidate.id,
+        after: preflight.workStoppedAt,
+      });
+      if (laterRun) {
+        skipped.push(`${candidate.id}: the issue was dispatched again after the run stopped`);
+        continue;
+      }
+
+      eligible += 1;
+      const run = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, candidate.id))
+        .then((rows) => rows[0] ?? null);
+      if (!run) {
+        skipped.push(`${candidate.id}: run row disappeared during the sweep`);
+        continue;
+      }
+      const outcome = await handleRunLivenessContinuation(run, {
+        kind: "orphaned_run",
+        errorCode: ORPHANED_RUN_CONTINUATION_ERROR_CODE,
+      });
+      if (outcome.enqueued) continued += 1;
+      else skipped.push(`${candidate.id}: ${outcome.reason}`);
+    }
+
+    return {
+      scanned: candidates.length,
+      eligible,
+      continued,
+      skipped: skipped.length,
+      skippedReasons: skipped,
+      hostSaturated: hostHealth.saturated,
+      graceMs,
+    };
   }
 
   function issueIdFromRunContext(contextSnapshot: unknown) {
@@ -30565,6 +30738,8 @@ export function heartbeatService(
     resumeExecutionWaitComments,
 
     sweepStaleIssueLocks,
+
+    sweepOrphanedRunContinuations,
 
     reconcileResolvedDependencyWakes,
 
