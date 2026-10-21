@@ -12281,7 +12281,20 @@ export function issueService(db: Db) {
         const [run] = await dbOrTx.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, actor.runId));
         const [current] = await dbOrTx.select().from(issues).where(eq(issues.id, issueId));
         if (run?.status === "cancelled") throw conflict("This conversation turn was cancelled; it cannot post a reply");
-        if (run?.contextSnapshot?.conversationSessionGeneration !== current.conversationSessionGeneration) {
+        // Only a turn of THIS conversation carries a session generation, so only
+        // that turn must match the current generation. A comment from another
+        // task (for example a notice that hands a packet to the conversation
+        // agent) is not a reply in this session: it is attributed to the
+        // posting agent, it does not settle the turn, and it does not speak as
+        // the conversation agent. Refusing it would block the notice.
+        const runIsTurnOfThisConversation =
+          run?.contextSnapshot?.issueId === issueId &&
+          (run?.contextSnapshot?.conversationMode === true ||
+            typeof run?.contextSnapshot?.conversationSessionGeneration === "number");
+        if (
+          runIsTurnOfThisConversation &&
+          run?.contextSnapshot?.conversationSessionGeneration !== current.conversationSessionGeneration
+        ) {
           throw conflict("Conversation session changed; this reply belongs to an earlier session");
         }
       }
