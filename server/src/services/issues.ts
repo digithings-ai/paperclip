@@ -1701,6 +1701,129 @@ async function listSelectedChatPresentationAttachments(
  *  2. `run_log_comment_post` — an overlapping run log contains the explicit
  *     `comment id: {id}` post marker (lossless: the run recorded posting it).
  */
+export type IssueCommentRunAttributionQueryInput = {
+  companyId: string;
+  issueId: string;
+  minCommentCreatedAt: string;
+  maxCommentCreatedAt: string;
+  ownRunIds: readonly string[];
+};
+
+/**
+ * Build the query that finds the heartbeat runs which may have authored the
+ * comments of one issue.
+ *
+ * The match tests are a union of three branches:
+ *
+ *   1. the run carries the issue in its context snapshot,
+ *   2. the run wrote an activity log row for the issue,
+ *   3. a comment names the run directly.
+ *
+ * The first two branches use the `heartbeat_runs_company_ctx_issue_created_idx`
+ * and `activity_log_entity_type_id_idx` indexes. The old form combined the
+ * tests with `OR`, which no index could serve, so the query scanned every run
+ * row. On a busy board that scan held a connection for minutes and starved the
+ * pool.
+ */
+export function buildIssueCommentRunAttributionQuery(
+  input: IssueCommentRunAttributionQueryInput,
+): SQL {
+  const {
+    companyId,
+    issueId,
+    minCommentCreatedAt,
+    maxCommentCreatedAt,
+    ownRunIds,
+  } = input;
+
+  const contextSnapshotBranch = sql`
+    SELECT ctx."id" AS "id"
+    FROM "heartbeat_runs" ctx
+    WHERE ctx."company_id" = ${companyId}
+      AND (ctx."context_snapshot" ->> 'issueId') = ${issueId}
+      AND coalesce(ctx."finished_at", ctx."created_at") >= ${minCommentCreatedAt}::timestamptz
+      AND coalesce(ctx."started_at", ctx."created_at") <= ${maxCommentCreatedAt}::timestamptz
+  `;
+
+  const activityLogBranch = sql`
+    SELECT act."run_id" AS "id"
+    FROM "activity_log" act
+    JOIN "heartbeat_runs" linked ON linked."id" = act."run_id"
+    WHERE act."company_id" = ${companyId}
+      AND act."entity_type" = 'issue'
+      AND act."entity_id" = ${issueId}
+      AND linked."company_id" = ${companyId}
+      AND coalesce(linked."finished_at", linked."created_at") >= ${minCommentCreatedAt}::timestamptz
+      AND coalesce(linked."started_at", linked."created_at") <= ${maxCommentCreatedAt}::timestamptz
+  `;
+
+  const ownRunBranch =
+    ownRunIds.length > 0
+      ? sql`
+          SELECT own."id" AS "id"
+          FROM "heartbeat_runs" own
+          WHERE own."company_id" = ${companyId}
+            AND own."id" IN (${sql.join(
+              ownRunIds.map((runId) => sql`${runId}`),
+              sql`, `,
+            )})
+        `
+      : null;
+
+  const branches = [contextSnapshotBranch, activityLogBranch, ownRunBranch].filter(
+    (branch): branch is SQL => branch !== null,
+  );
+
+  return sql`
+    SELECT
+      run."id",
+      run."agent_id",
+      run."created_at",
+      run."started_at",
+      run."finished_at",
+      run."log_store",
+      run."log_ref",
+      run."log_bytes"
+    FROM "heartbeat_runs" run
+    WHERE run."company_id" = ${companyId}
+      AND run."id" IN (
+        SELECT matched."id"
+        FROM (
+          ${sql.join(branches, sql` UNION `)}
+        ) AS matched
+      )
+    ORDER BY run."created_at" DESC
+  `;
+}
+
+/**
+ * The raw row shape of `buildIssueCommentRunAttributionQuery`. A `bigint`
+ * column arrives as text, so `log_bytes` needs a conversion.
+ */
+export type IssueCommentRunAttributionRow = {
+  id: string;
+  agent_id: string;
+  created_at: Date | string;
+  started_at: Date | string | null;
+  finished_at: Date | string | null;
+  log_store: string | null;
+  log_ref: string | null;
+  log_bytes: string | number | null;
+};
+
+export function mapIssueCommentRunAttributionRow(row: IssueCommentRunAttributionRow) {
+  return {
+    runId: row.id,
+    agentId: row.agent_id,
+    createdAt: row.created_at,
+    startedAt: row.started_at,
+    finishedAt: row.finished_at,
+    logStore: row.log_store,
+    logRef: row.log_ref,
+    logBytes: row.log_bytes === null ? null : Number(row.log_bytes),
+  };
+}
+
 export function deriveIssueCommentRunLogAttribution(
   comments: readonly IssueCommentRunLogAttributionCandidate[],
   runs: readonly IssueCommentRunLogAttributionRun[],
@@ -7003,44 +7126,23 @@ export function issueService(db: Db) {
       ),
     ];
 
-    const runs = await db
-      .select({
-        runId: heartbeatRuns.id,
-        agentId: heartbeatRuns.agentId,
-        createdAt: heartbeatRuns.createdAt,
-        startedAt: heartbeatRuns.startedAt,
-        finishedAt: heartbeatRuns.finishedAt,
-        logStore: heartbeatRuns.logStore,
-        logRef: heartbeatRuns.logRef,
-        logBytes: heartbeatRuns.logBytes,
-      })
-      .from(heartbeatRuns)
-      .where(
-        and(
-          eq(heartbeatRuns.companyId, companyId),
-          or(
-            and(
-              or(
-                sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
-                sql`exists (
-                  select 1
-                  from ${activityLog}
-                  where ${activityLog.companyId} = ${companyId}
-                    and ${activityLog.entityType} = 'issue'
-                    and ${activityLog.entityId} = ${issueId}
-                    and ${activityLog.runId} = ${heartbeatRuns.id}
-                )`,
-              ),
-              sql`coalesce(${heartbeatRuns.finishedAt}, ${heartbeatRuns.createdAt}) >= ${minCommentCreatedAt}::timestamptz`,
-              sql`coalesce(${heartbeatRuns.startedAt}, ${heartbeatRuns.createdAt}) <= ${maxCommentCreatedAt}::timestamptz`,
-            ),
-            ownRunIds.length > 0
-              ? inArray(heartbeatRuns.id, ownRunIds)
-              : sql`false`,
-          ),
-        ),
-      )
-      .orderBy(desc(heartbeatRuns.createdAt));
+    // The match tests used to be one `OR` predicate. That form could not use an
+    // index, so every issue in a board listing scanned the whole
+    // `heartbeat_runs` table. The scan held a database connection for minutes
+    // and the connection pool ran dry, so clients waited for an answer that
+    // never came. The branches are now a union of index-backed lookups.
+    const rawRuns = Array.from(
+      await db.execute(
+        buildIssueCommentRunAttributionQuery({
+          companyId,
+          issueId,
+          minCommentCreatedAt,
+          maxCommentCreatedAt,
+          ownRunIds,
+        }),
+      ),
+    ) as IssueCommentRunAttributionRow[];
+    const runs = rawRuns.map(mapIssueCommentRunAttributionRow);
 
     if (runs.length === 0) return comments;
 
