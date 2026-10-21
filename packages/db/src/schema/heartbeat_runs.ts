@@ -94,6 +94,12 @@ export const heartbeatRuns = pgTable(
     lastUsefulActionAt: timestamp("last_useful_action_at", { withTimezone: true }),
     nextAction: text("next_action"),
     contextSnapshot: jsonb("context_snapshot").$type<Record<string, unknown>>(),
+    // Real columns mirror the issue and task ids that live inside
+    // context_snapshot. The snapshot is a TOASTed jsonb document, so reading
+    // the ids from it detoasts the whole document for every candidate row.
+    // These columns keep the scheduler and liveness reads index-only.
+    contextIssueId: text("context_issue_id"),
+    contextTaskId: text("context_task_id"),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
@@ -145,6 +151,22 @@ export const heartbeatRuns = pgTable(
     ),
     companyCreatedAtDescIdx: index("heartbeat_runs_company_created_at_desc_idx").on(
       table.companyId,
+      table.createdAt.desc(),
+    ),
+    // The scheduler reads the issue and task ids of the runs of a company and
+    // a set of agents. The ids are real columns now, so the read is an
+    // index-only scan instead of a heap walk that detoasts every snapshot.
+    companyAgentCreatedCtxIdx: index("dt_perf_hr_company_agent_created_ctx_idx").on(
+      table.companyId,
+      table.agentId,
+      table.createdAt.desc(),
+      table.contextIssueId,
+      table.contextTaskId,
+    ),
+    // The liveness read looks up the runs of one issue by issue id.
+    companyContextIssueCreatedIdx: index("heartbeat_runs_company_context_issue_created_idx").on(
+      table.companyId,
+      table.contextIssueId,
       table.createdAt.desc(),
     ),
     companyCtxIssueCreatedIdx: index("heartbeat_runs_company_ctx_issue_created_idx").on(

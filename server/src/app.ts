@@ -50,6 +50,7 @@ import { companyTransferRunService } from "./services/company-transfer-runs.js";
 import { healthRoutes } from "./routes/health.js";
 import { cloudRuntimeIdentityMiddleware } from "./middleware/cloud-runtime-identity.js";
 import { cloudControlMiddleware } from "./middleware/cloud-control.js";
+import { dbPoolSaturationMiddleware } from "./middleware/db-pool-saturation.js";
 import { cloudRoutes } from "./routes/cloud.js";
 import { companyRoutes } from "./routes/companies.js";
 import { companySkillRoutes } from "./routes/company-skills.js";
@@ -575,6 +576,12 @@ export async function createApp(
       bindHost: opts.bindHost,
     }),
   );
+  // A saturated pool used to leave the API hanging: the request was accepted
+  // and the answer came only after the queued query finished. The guard answers
+  // with a 503 before any middleware touches the database. The health route
+  // stays reachable, because it is the diagnostic of a saturated pool.
+  const dbPoolSaturation = dbPoolSaturationMiddleware({ db });
+  app.use(dbPoolSaturation.middleware);
   let mcpConfig: ReturnType<typeof publicMcpConfig> = null;
   try { mcpConfig = publicMcpConfig(process.env, opts.authPublicBaseUrl); }
   catch { logger.warn("Assistant connections require an HTTPS public URL (HTTP loopback is allowed for development)."); }
@@ -1380,6 +1387,9 @@ export async function createApp(
       viteHtmlRenderer?.dispose();
       void viteDevServer?.close().catch(() => undefined);
       viteHmrServer?.close();
+      // The pool monitor owns a connection of its own. End it with the other
+      // services, so it never outlives the pool it watches.
+      await dbPoolSaturation.stop();
       hostServiceCleanup.disposeAll();
       hostServiceCleanup.teardown();
       await emailChannels.shutdown();

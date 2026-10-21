@@ -79,6 +79,18 @@ The server opens one postgres.js pool for its own queries (and a second one when
 
 The server ends its pools during shutdown (SIGINT/SIGTERM) and when startup fails after the pool was opened, so a restarting server does not leave idle backends behind. Size `max_connections` on the PostgreSQL side for at least `DATABASE_POOL_MAX` per server process plus your other clients.
 
+### Failing fast when the pool is full
+
+When every connection of the application pool is busy, the API answers with `503` and the body `{"error":"database_pool_saturated"}` instead of waiting for a free connection. The answer also carries a `Retry-After` header. The `/api/health` route stays reachable, because it is the diagnostic of a saturated pool.
+
+The guard opens after the pool stayed full for a grace period, so a short burst does not fail requests. A probe that fails leaves the guard closed, so a monitoring problem never takes the API down.
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `DATABASE_POOL_SATURATION_GRACE_MS` | `10000` | How long the pool must stay full before the API answers with 503. |
+| `DATABASE_POOL_SATURATION_SAMPLE_INTERVAL_MS` | `1000` | How often the guard reads the state of the pool. |
+| `DATABASE_POOL_SATURATION_RETRY_AFTER_SECONDS` | `5` | The `Retry-After` value of the 503 answer. |
+
 ## Switching Between Modes
 
 | `DATABASE_URL` | Mode |

@@ -513,7 +513,10 @@ describeEmbeddedPostgres("shared-workspace run serialization", () => {
     const finishedRun = await waitForRunToLeaveActiveStates(run!.id);
     expect(finishedRun?.errorCode).not.toBe(WORKSPACE_BUSY_ERROR_CODE);
     expect(executedRunIds).toContain(run!.id);
-    expect((finishedRun?.contextSnapshot as Record<string, unknown>)?.paperclipTaskMarkdown).toContain(
+    // The coordination note is part of the rendered task markdown. The
+    // rendered markdown is not stored in the run snapshot, so the note is
+    // read from the context that the adapter received.
+    expect(executedInputs.get(run!.id)?.context.paperclipTaskMarkdown).toContain(
       `shared workspace is concurrently held by run ${fixture.holderRunId}`,
     );
     const retryRuns = await db

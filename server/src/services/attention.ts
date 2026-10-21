@@ -1066,6 +1066,53 @@ function readRunIssueId(contextSnapshot: Record<string, unknown> | null) {
   return typeof issueId === "string" && issueId.length > 0 ? issueId : null;
 }
 
+/**
+ * The scheduler reads the runs of every agent that has an exhausted run. One
+ * statement with every agent id makes the planner build one index scan per id,
+ * so the read is split into batches of a fixed size.
+ */
+const SCHEDULER_AGENT_BATCH_SIZE = 20;
+
+type NewerRunRow = {
+  agentId: string;
+  createdAt: Date;
+  runIssueId: string | null;
+  runTaskId: string | null;
+};
+
+async function readNewerRunsPerAgent(
+  db: Db,
+  companyId: string,
+  agentIds: string[],
+  since: Date,
+): Promise<NewerRunRow[]> {
+  const batches: string[][] = [];
+  for (let index = 0; index < agentIds.length; index += SCHEDULER_AGENT_BATCH_SIZE) {
+    batches.push(agentIds.slice(index, index + SCHEDULER_AGENT_BATCH_SIZE));
+  }
+
+  const results = await Promise.all(batches.map((batch) =>
+    db
+      .select({
+        agentId: heartbeatRuns.agentId,
+        createdAt: heartbeatRuns.createdAt,
+        // The ids are real columns, so the read is an index-only scan.
+        // Reading them out of the jsonb snapshot detoasted the whole document
+        // for every candidate row.
+        runIssueId: heartbeatRuns.contextIssueId,
+        runTaskId: heartbeatRuns.contextTaskId,
+      })
+      .from(heartbeatRuns)
+      .where(and(
+        eq(heartbeatRuns.companyId, companyId),
+        inArray(heartbeatRuns.agentId, batch),
+        gt(heartbeatRuns.createdAt, since),
+      )),
+  ));
+
+  return results.flat();
+}
+
 export function attentionService(db: Db, serviceOptions: AttentionServiceOptions = {}) {
   const openDecisionLimit = Math.min(
     Math.max(Math.trunc(serviceOptions.openDecisionLimit ?? OPEN_DECISION_DEFAULT_LIMIT), 1),
@@ -1676,21 +1723,12 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
         ),
         issueImageMap(db, companyId, failedIssueIds),
         oldestFailedRunCreatedAt && failedAgentIds.length > 0
-          ? db
-            .select({
-              agentId: heartbeatRuns.agentId,
-              createdAt: heartbeatRuns.createdAt,
-              // Project just the ids readRunIssueId needs; pulling the whole
-              // context_snapshot detoasts megabytes per feed build.
-              runIssueId: sql<string | null>`${heartbeatRuns.contextSnapshot} ->> 'issueId'`,
-              runTaskId: sql<string | null>`${heartbeatRuns.contextSnapshot} ->> 'taskId'`,
-            })
-            .from(heartbeatRuns)
-            .where(and(
-              eq(heartbeatRuns.companyId, companyId),
-              inArray(heartbeatRuns.agentId, failedAgentIds),
-              gt(heartbeatRuns.createdAt, oldestFailedRunCreatedAt),
-            ))
+          ? readNewerRunsPerAgent(
+              db,
+              companyId,
+              failedAgentIds,
+              oldestFailedRunCreatedAt,
+            )
           : Promise.resolve([]),
       ]);
       const latestRunCreatedAtByKey = new Map<string, Date>();

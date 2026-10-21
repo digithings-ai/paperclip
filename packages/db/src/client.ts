@@ -1,6 +1,5 @@
 import { createHash } from "node:crypto";
 import { drizzle as drizzlePg } from "drizzle-orm/postgres-js";
-import { migrate as migratePg } from "drizzle-orm/postgres-js/migrator";
 import { readFile, readdir } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import postgres from "postgres";
@@ -9,6 +8,13 @@ import * as schema from "./schema/index.js";
 const MIGRATIONS_FOLDER = fileURLToPath(new URL("./migrations", import.meta.url));
 const DRIZZLE_MIGRATIONS_TABLE = "__drizzle_migrations";
 const MIGRATIONS_JOURNAL_JSON = fileURLToPath(new URL("./migrations/meta/_journal.json", import.meta.url));
+
+/**
+ * A migration that carries this directive in a leading comment runs outside a
+ * transaction block. PostgreSQL refuses `CREATE INDEX CONCURRENTLY` inside a
+ * transaction, so a concurrent index build can only happen here.
+ */
+const MIGRATION_NO_TRANSACTION_DIRECTIVE = "paperclip:migration-no-transaction";
 
 function createUtilitySql(url: string) {
   return postgres(url, { max: 1, onnotice: () => {} });
@@ -107,6 +113,21 @@ function splitMigrationStatements(content: string): string[] {
     .split("--> statement-breakpoint")
     .map((statement) => statement.trim())
     .filter((statement) => statement.length > 0);
+}
+
+/**
+ * A migration that asks for no transaction runs its statements one by one in
+ * auto-commit mode. The statements are then not atomic: a failure leaves the
+ * earlier ones applied. The migration must therefore be written so that every
+ * statement is idempotent.
+ */
+export function migrationRunsOutsideTransaction(content: string): boolean {
+  return content
+    .split("\n")
+    .some((line) => {
+      const trimmed = line.trim();
+      return trimmed.startsWith("--") && trimmed.includes(MIGRATION_NO_TRANSACTION_DIRECTIVE);
+    });
 }
 
 export type MigrationState =
@@ -267,6 +288,11 @@ export async function withDedicatedDbConnection<T>(db: Db, action: (dedicated: D
   finally { await dedicated.$client.end({ timeout: 1 }); }
 }
 
+// Tracks the URL of every client `createDb` hands out, so a monitor can open
+// its own connection without the caller having to carry the URL around. The
+// URL carries credentials, so it is never logged or returned to a caller.
+const databaseUrlsByDb = new WeakMap<object, string>();
+
 export function createDb(url: string, options?: DatabaseClientOptions) {
   const resolved = resolveDatabaseClientOptions(options ?? databaseClientOptionsFromEnv());
   const sql = postgres(url, postgresJsOptions(resolved));
@@ -277,10 +303,53 @@ export function createDb(url: string, options?: DatabaseClientOptions) {
   // message cannot establish that replay is safe. Leave retries to callers
   // that know the complete operation is idempotent.
   const db = drizzlePg(sql, { schema });
+  databaseUrlsByDb.set(db, url);
   dedicatedDbFactories.set(db, () => createDb(url, {
     ...resolved, maxConnections: 1, applicationName: "paperclip-workspace-finalization-lock",
   }));
   return db;
+}
+
+/** The application name a monitoring connection uses, so it is not counted as application traffic. */
+export const DB_MONITORING_APPLICATION_NAME = "paperclip-db-monitor";
+
+/**
+ * A client that owns one connection of its own. A monitor uses it to read the
+ * state of the database while the application pool is saturated. The caller
+ * must end the client when it is done with it.
+ */
+export function createDbMonitoringClient(db: Db): ReturnType<typeof postgres> | null {
+  const url = databaseUrlsByDb.get(db);
+  if (!url) return null;
+  const monitor = postgres(url, {
+    max: 1,
+    connect_timeout: 5,
+    idle_timeout: 0,
+    // postgres.js reads the application name from the connection options.
+    connection: { application_name: DB_MONITORING_APPLICATION_NAME },
+    onnotice: () => {},
+  });
+  // The monitor shares the lifetime of the pool it watches. The shared
+  // teardown ends it with the other clients of the same database.
+  const key = hostPortKeyOrNull(url);
+  if (key) registerClient(key, monitor);
+  return monitor;
+}
+
+/** The number of connections the application pool of this database can hold. */
+export function databasePoolMax(db: Db): number {
+  const client = (db as { $client?: { options?: { max?: number } } }).$client;
+  const max = client?.options?.max;
+  return typeof max === "number" && Number.isFinite(max) && max > 0 ? max : 10;
+}
+
+/** The application name the connections of this database report to PostgreSQL. */
+export function databaseApplicationName(db: Db): string {
+  const client = (db as {
+    $client?: { options?: { application_name?: string; connection?: { application_name?: string } } };
+  }).$client;
+  const name = client?.options?.connection?.application_name ?? client?.options?.application_name;
+  return typeof name === "string" && name.length > 0 ? name : "postgres.js";
 }
 
 export async function getPostgresDataDirectory(url: string): Promise<string | null> {
@@ -492,7 +561,7 @@ async function applyPendingMigrationsManually(
       );
       if (existingEntry) continue;
 
-      await runInTransaction(sql, async () => {
+      const applyMigration = async () => {
         for (const statement of splitMigrationStatements(migrationContent)) {
           await sql.unsafe(statement);
         }
@@ -505,7 +574,15 @@ async function applyPendingMigrationsManually(
           hash,
           folderMillisByFileName.get(migrationFile) ?? Date.now(),
         );
-      });
+      };
+
+      if (migrationRunsOutsideTransaction(migrationContent)) {
+        // A concurrent index build cannot run inside a transaction block.
+        await applyMigration();
+        continue;
+      }
+
+      await runInTransaction(sql, applyMigration);
     }
   } finally {
     await sql.end();
@@ -1033,13 +1110,11 @@ export async function applyPendingMigrations(url: string): Promise<void> {
   if (initialState.status === "upToDate") return;
 
   if (initialState.reason === "no-migration-journal-empty-db") {
-    const sql = createUtilitySql(url);
-    try {
-      const db = drizzlePg(sql);
-      await migratePg(db, { migrationsFolder: MIGRATIONS_FOLDER });
-    } finally {
-      await sql.end();
-    }
+    // The manual runner applies the same files in the same order, but it
+    // honours the per-migration transaction directive. Drizzle's own migrator
+    // runs every migration inside a transaction, so it cannot build a
+    // concurrent index.
+    await applyPendingMigrationsManually(url, await listMigrationFiles());
 
     let bootstrappedState = await inspectMigrations(url);
     if (bootstrappedState.status === "upToDate") return;
@@ -1095,6 +1170,8 @@ export type MigrationBootstrapResult =
 
 export async function migratePostgresIfEmpty(url: string): Promise<MigrationBootstrapResult> {
   const sql = createUtilitySql(url);
+  let tableCount = 0;
+  let alreadyMigrated = false;
 
   try {
     const migrationTableSchema = await discoverMigrationTableSchema(sql);
@@ -1106,23 +1183,25 @@ export async function migratePostgresIfEmpty(url: string): Promise<MigrationBoot
         and table_type = 'BASE TABLE'
     `;
 
-    const tableCount = tableCountResult[0]?.count ?? 0;
-
-    if (migrationTableSchema) {
-      return { migrated: false, reason: "already-migrated", tableCount };
-    }
-
-    if (tableCount > 0) {
-      return { migrated: false, reason: "not-empty-no-migration-journal", tableCount };
-    }
-
-    const db = drizzlePg(sql);
-    await migratePg(db, { migrationsFolder: MIGRATIONS_FOLDER });
-
-    return { migrated: true, reason: "migrated-empty-db", tableCount: 0 };
+    tableCount = tableCountResult[0]?.count ?? 0;
+    alreadyMigrated = Boolean(migrationTableSchema);
   } finally {
     await sql.end();
   }
+
+  if (alreadyMigrated) {
+    return { migrated: false, reason: "already-migrated", tableCount };
+  }
+
+  if (tableCount > 0) {
+    return { migrated: false, reason: "not-empty-no-migration-journal", tableCount };
+  }
+
+  // The manual runner honours the per-migration transaction directive, so a
+  // migration that builds a concurrent index works on a fresh database.
+  await applyPendingMigrationsManually(url, await listMigrationFiles());
+
+  return { migrated: true, reason: "migrated-empty-db", tableCount: 0 };
 }
 
 export async function ensurePostgresDatabase(
