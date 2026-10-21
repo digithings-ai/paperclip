@@ -53,7 +53,11 @@ import {
   readPaperclipIssueWorkModeFromContext,
   resolveLegacyPaperclipDesiredSkillNames,
 } from "@paperclipai/adapter-utils/server-utils";
-import { isOpenCodeUnknownSessionError, parseOpenCodeJsonl } from "./parse.js";
+import {
+  isOpenCodeSessionReadError,
+  isOpenCodeUnknownSessionError,
+  parseOpenCodeJsonl,
+} from "./parse.js";
 import {
   ensureOpenCodeModelConfiguredAndAvailable,
   isTruthyEnvFlag,
@@ -765,6 +769,48 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         );
         const retry = await runAttempt(null);
         return toResult(retry, true);
+      }
+
+      // The stored session exists, but OpenCode cannot read it back: one message row
+      // holds content that does not decode, so the read of `session_message` fails and
+      // the client reports `UnsupportedContentType`. The session id stays valid, so
+      // every attempt that resumes that session fails in the same way. The run must
+      // not carry that session id forward.
+      if (
+        initialFailed &&
+        isOpenCodeSessionReadError(initial.proc.stdout, initial.rawStderr, initial.parsed.errorMessage)
+      ) {
+        if (sessionId) {
+          await onLog(
+            "stdout",
+            `[paperclip] OpenCode session "${sessionId}" could not be read; retrying with a fresh session.\n`,
+          );
+          const retry = await runAttempt(null);
+          const result = toResult(retry, true);
+          if (
+            !retry.proc.timedOut &&
+            ((retry.proc.exitCode ?? 0) !== 0 || Boolean(retry.parsed.errorMessage)) &&
+            isOpenCodeSessionReadError(retry.proc.stdout, retry.rawStderr, retry.parsed.errorMessage)
+          ) {
+            // The fresh session failed in the same way. Drop the session id so no
+            // later attempt resumes a session that cannot be read.
+            result.clearSession = true;
+            result.sessionId = null;
+            result.sessionParams = null;
+            result.sessionDisplayId = null;
+          }
+          return result;
+        }
+
+        // The attempt was already fresh, so the session it created is the one that
+        // cannot be read. Drop it: the next attempt has to start a new session
+        // instead of resuming this one.
+        const result = toResult(initial, true);
+        result.clearSession = true;
+        result.sessionId = null;
+        result.sessionParams = null;
+        result.sessionDisplayId = null;
+        return result;
       }
 
       return toResult(initial);
