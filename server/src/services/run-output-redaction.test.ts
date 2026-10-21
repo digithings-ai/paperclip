@@ -38,6 +38,52 @@ describe("redactPersistedRunText", () => {
       expect(redacted, shape).not.toContain("sk-synthetic-not-a-real-key-0123456789");
     }
   });
+
+  it("removes a token that follows a JSON escape sequence", () => {
+    const shapes = [
+      `{"output":"PAPERCLIP_API_KEY set: yes\\n${JWT}"}`,
+      `{"output":"key\\t${JWT}"}`,
+      `{"output":"key\\"${JWT}"}`,
+      `{"output":"key\\u0009${JWT}"}`,
+    ];
+    for (const shape of shapes) {
+      const redacted = redactPersistedRunText(shape);
+      expect(redacted, shape).not.toContain(JWT);
+    }
+  });
+
+  it("removes a token that stands at the start of a line", () => {
+    const redacted = redactPersistedRunText(`set: yes\n${JWT}\ndone`);
+    expect(redacted).not.toContain(JWT);
+  });
+
+  it("removes a token with five segments", () => {
+    const five = `${JWT}.${JWT}`;
+    const redacted = redactPersistedRunText(`key: ${five}`);
+    expect(redacted).not.toContain(five);
+  });
+
+  it("keeps a dotted identifier that is not a token", () => {
+    const text = "session_v2.part.0123456789abcdef";
+    expect(redactPersistedRunText(text)).toBe(text);
+  });
+
+  it("removes a token that a seat glues to a word", () => {
+    const redacted = redactPersistedRunText(`KEYSET=yes${JWT}`);
+    expect(redacted).not.toContain(JWT);
+    expect(redacted).toContain("KEYSET=yes");
+  });
+
+  it("removes a token that touches a letter", () => {
+    const redacted = redactPersistedRunText(`key\\u0041${JWT}`);
+    expect(redacted).not.toContain(JWT);
+  });
+
+  it("keeps the sentence period after a token", () => {
+    const redacted = redactPersistedRunText(`The value is ${JWT}.`);
+    expect(redacted).not.toContain(JWT);
+    expect(redacted.endsWith(".")).toBe(true);
+  });
 });
 
 describe("redactPersistedRunOutput", () => {
