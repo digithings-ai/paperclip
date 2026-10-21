@@ -45,7 +45,7 @@ function buildSnapshot(issueId: string) {
     issueId,
     taskId: null,
     paperclipWake: {
-      issue: { id: issueId, title: noise(3300) },
+      issue: { id: issueId, title: noise(3300), workMode: "standard" },
       comments: Array.from({ length: 12 }, (_, i) => ({ id: `comment-${i}`, body: noise(2500) })),
       executionContinuation: {
         messages: continuationMessages,
@@ -144,9 +144,9 @@ try {
     `select
        context_issue_id,
        context_snapshot->'paperclipWake'->'comments' is not null as keeps_comments,
-       context_snapshot->'paperclipWake'->'issue'->>'workMode' is null as keeps_wake_issue,
+       context_snapshot->'paperclipWake'->'issue'->>'workMode' is not null as keeps_wake_issue,
        context_snapshot->'paperclipWake'->'continuationSummary' is not null as keeps_continuation_summary,
-       context_snapshot->'paperclipTaskMarkdown' is null as drops_task_markdown,
+       context_snapshot->'paperclipTaskMarkdown' is not null as keeps_task_markdown,
        context_snapshot->'executionContinuation' is not null as keeps_top_level_continuation,
        context_snapshot->'executionContinuation'->'messages'->0->>'body' is null as drops_comment_body,
        context_snapshot->'executionContinuation'->'messages'->0->>'bodyDigest' is not null as keeps_comment_body_digest,
@@ -187,6 +187,21 @@ try {
     `explain (analyze, buffers)
      select id from heartbeat_runs where company_id = $1 and context_issue_id = $2`,
     [companyId, issueId],
+  )));
+
+  // The liveness read of the code. The run ids of the activity arm are read
+  // first, and the two arms are read with one statement over the run table.
+  const activityRunIds = (await run(
+    "select id from heartbeat_runs where company_id = $1 and context_issue_id = $2 limit 50",
+    [companyId, issueId],
+  )).map((row) => (row as unknown as { id: string }).id);
+  const activityPlaceholders = activityRunIds.map((_, i) => `$${i + 3}`).join(", ");
+  console.log("\n=== liveness query, both arms ===");
+  console.log(planText(await run(
+    `explain (analyze, buffers)
+     select id from heartbeat_runs
+     where company_id = $1 and (context_issue_id = $2 or id in (${activityPlaceholders}))`,
+    [companyId, issueId, ...activityRunIds],
   )));
 
   console.log("\n=== exhaustion query ===");

@@ -101,7 +101,11 @@ export function dbPoolSaturationMiddleware(options: DbPoolSaturationOptions): Db
     }
     const rows = await monitorClient.unsafe<{ busy: number }[]>(
       "select count(*)::int as busy from pg_stat_activity "
-        + "where application_name = $1 and state = 'active' and pid <> pg_backend_pid()",
+        + "where application_name = $1 and datname = current_database() "
+        // A connection that waits inside a transaction holds a slot of the
+        // pool without running a query. It counts as busy.
+        + "and (state = 'active' or state like 'idle in transaction%') "
+        + "and pid <> pg_backend_pid()",
       [databaseApplicationName(options.db)],
     );
     return rows[0]?.busy ?? 0;
@@ -115,8 +119,12 @@ export function dbPoolSaturationMiddleware(options: DbPoolSaturationOptions): Db
       busy = await takeSample();
     } catch (error) {
       // A probe that cannot run says nothing about the pool. The guard stays
-      // open, so a failure of the monitor never takes the API down.
+      // open, so a failure of the monitor never takes the API down. The last
+      // state is dropped, because a state of an old sample must not keep the
+      // API closed after the pool recovered.
       logger.warn({ err: error }, "database pool saturation probe failed");
+      busy = 0;
+      saturatedSince = null;
       return;
     }
     if (busy >= poolMax) {

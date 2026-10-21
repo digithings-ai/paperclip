@@ -1091,8 +1091,12 @@ async function readNewerRunsPerAgent(
     batches.push(agentIds.slice(index, index + SCHEDULER_AGENT_BATCH_SIZE));
   }
 
-  const results = await Promise.all(batches.map((batch) =>
-    db
+  const rows: NewerRunRow[] = [];
+  // The batches run one after the other. A parallel run would hold one
+  // connection of the pool per batch, and the pool is the resource that this
+  // read must not use up.
+  for (const batch of batches) {
+    rows.push(...await db
       .select({
         agentId: heartbeatRuns.agentId,
         createdAt: heartbeatRuns.createdAt,
@@ -1107,10 +1111,10 @@ async function readNewerRunsPerAgent(
         eq(heartbeatRuns.companyId, companyId),
         inArray(heartbeatRuns.agentId, batch),
         gt(heartbeatRuns.createdAt, since),
-      )),
-  ));
+      )));
+  }
 
-  return results.flat();
+  return rows;
 }
 
 export function attentionService(db: Db, serviceOptions: AttentionServiceOptions = {}) {

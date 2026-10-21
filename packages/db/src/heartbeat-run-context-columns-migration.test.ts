@@ -69,19 +69,23 @@ async function insertRun(sql: ReturnType<typeof postgres>, contextSnapshot: unkn
   return rows[0]!.id;
 }
 
+async function startDatabase(prefix: string) {
+  const database = await startEmbeddedPostgresTestDatabase(prefix);
+  cleanups.push(database.cleanup);
+  const sql = postgres(database.connectionString, { max: 1 });
+  cleanups.push(async () => sql.end());
+  await sql`insert into companies (id, name) values (${COMPANY_ID}, 'context columns')`;
+  await sql`insert into agents (id, company_id, name, status) values (${AGENT_ID}, ${COMPANY_ID}, 'agent', 'active')`;
+  return sql;
+}
+
 describeEmbeddedPostgres("heartbeat run context columns", () => {
   afterEach(async () => {
     await Promise.all(cleanups.splice(0).map((cleanup) => cleanup()));
   });
 
   it("mirrors the issue and task ids into the new columns", async () => {
-    const database = await startEmbeddedPostgresTestDatabase("paperclip-heartbeat-context-columns-");
-    cleanups.push(database.cleanup);
-    const sql = postgres(database.connectionString, { max: 1 });
-    cleanups.push(async () => sql.end());
-
-    await sql`insert into companies (id, name) values (${COMPANY_ID}, 'context columns')`;
-    await sql`insert into agents (id, company_id, name, status) values (${AGENT_ID}, ${COMPANY_ID}, 'agent', 'active')`;
+    const sql = await startDatabase("paperclip-heartbeat-context-columns-");
 
     const runId = await insertRun(sql, fatSnapshot());
     const rows = await sql<
@@ -91,14 +95,8 @@ describeEmbeddedPostgres("heartbeat run context columns", () => {
     expect(rows[0]!.context_task_id).toBe(TASK_ID);
   }, 60_000);
 
-  it("slims the stored snapshot and keeps the proof fields of the wake payload", async () => {
-    const database = await startEmbeddedPostgresTestDatabase("paperclip-heartbeat-context-columns-");
-    cleanups.push(database.cleanup);
-    const sql = postgres(database.connectionString, { max: 1 });
-    cleanups.push(async () => sql.end());
-
-    await sql`insert into companies (id, name) values (${COMPANY_ID}, 'context columns')`;
-    await sql`insert into agents (id, company_id, name, status) values (${AGENT_ID}, ${COMPANY_ID}, 'agent', 'active')`;
+  it("keeps the stored snapshot and stores a digest of the body of a comment", async () => {
+    const sql = await startDatabase("paperclip-heartbeat-context-columns-");
 
     const runId = await insertRun(sql, fatSnapshot());
     const rows = await sql<{ context_snapshot: Record<string, any> }[]>`
@@ -106,13 +104,14 @@ describeEmbeddedPostgres("heartbeat run context columns", () => {
     `;
     const snapshot = rows[0]!.context_snapshot;
 
-    // The rendered text must not be stored a second time.
-    expect(snapshot.paperclipTaskMarkdown).toBeUndefined();
-    expect(snapshot.paperclipTaskMarkdownCompact).toBeUndefined();
-    expect(snapshot.paperclipTaskMarkdownAssignment).toBeUndefined();
-    expect(snapshot.paperclipTaskMarkdownAssignmentCompact).toBeUndefined();
-    expect(snapshot.paperclipWakeComment).toBeUndefined();
-    expect(snapshot.paperclipFreshSessionHandoffMarkdown).toBeUndefined();
+    // The stored snapshot keeps every key. The rendered text is read back by
+    // the code that reads a stored run.
+    expect(snapshot.paperclipTaskMarkdown).toBe("a long task markdown");
+    expect(snapshot.paperclipTaskMarkdownCompact).toBe("a long task markdown");
+    expect(snapshot.paperclipTaskMarkdownAssignment).toBe("a long task markdown");
+    expect(snapshot.paperclipTaskMarkdownAssignmentCompact).toBe("a long task markdown");
+    expect(snapshot.paperclipWakeComment).toBe("a long wake comment");
+    expect(snapshot.paperclipFreshSessionHandoffMarkdown).toBe("a long handoff");
 
     // The wake payload stays as it is. The external chat contract reads the
     // work mode and the summary from the stored wake payload.
@@ -152,14 +151,8 @@ describeEmbeddedPostgres("heartbeat run context columns", () => {
     );
   }, 60_000);
 
-  it("slims an updated snapshot and refreshes the mirrored ids", async () => {
-    const database = await startEmbeddedPostgresTestDatabase("paperclip-heartbeat-context-columns-");
-    cleanups.push(database.cleanup);
-    const sql = postgres(database.connectionString, { max: 1 });
-    cleanups.push(async () => sql.end());
-
-    await sql`insert into companies (id, name) values (${COMPANY_ID}, 'context columns')`;
-    await sql`insert into agents (id, company_id, name, status) values (${AGENT_ID}, ${COMPANY_ID}, 'agent', 'active')`;
+  it("refreshes the mirrored ids when the snapshot changes", async () => {
+    const sql = await startDatabase("paperclip-heartbeat-context-columns-");
 
     const runId = await insertRun(sql, fatSnapshot());
     const nextIssueId = "66666666-6666-6666-6666-666666666666";
@@ -169,30 +162,83 @@ describeEmbeddedPostgres("heartbeat run context columns", () => {
       where id = ${runId}
     `;
     const rows = await sql<
-      { context_issue_id: string | null; context_snapshot: Record<string, any> }[]
-    >`select context_issue_id, context_snapshot from heartbeat_runs where id = ${runId}`;
+      { context_issue_id: string | null; context_task_id: string | null; context_snapshot: Record<string, any> }[]
+    >`select context_issue_id, context_task_id, context_snapshot from heartbeat_runs where id = ${runId}`;
     expect(rows[0]!.context_issue_id).toBe(nextIssueId);
-    expect(rows[0]!.context_snapshot.paperclipTaskMarkdown).toBeUndefined();
+    // The new snapshot names no task. The old task id must not stay.
+    expect(rows[0]!.context_task_id).toBeNull();
+    expect(rows[0]!.context_snapshot.paperclipTaskMarkdown).toBe("a long task markdown");
+  }, 60_000);
+
+  it("keeps an empty issue id, so the read paths see the same value", async () => {
+    const sql = await startDatabase("paperclip-heartbeat-context-columns-");
+
+    const runId = await insertRun(sql, { issueId: "", taskId: TASK_ID });
+    const rows = await sql<
+      { context_issue_id: string | null; context_task_id: string | null }[]
+    >`select context_issue_id, context_task_id from heartbeat_runs where id = ${runId}`;
+    // The old read of the snapshot returned an empty string. The read paths
+    // use the value as it is, so the mirrored value must be the same.
+    expect(rows[0]!.context_issue_id).toBe("");
+    expect(rows[0]!.context_task_id).toBe(TASK_ID);
+  }, 60_000);
+
+  it("clears the mirrored ids when the snapshot is not a JSON object", async () => {
+    const sql = await startDatabase("paperclip-heartbeat-context-columns-");
+
+    const runId = await insertRun(sql, fatSnapshot());
+    // A JSON null, an array, and a scalar are valid jsonb values. The write
+    // must not fail and the mirrored ids must be empty.
+    for (const value of [null, [1, 2, 3], "a string"]) {
+      await sql`
+        update heartbeat_runs
+        set context_snapshot = ${sql.json(value as never)}
+        where id = ${runId}
+      `;
+      const rows = await sql<
+        { context_issue_id: string | null; context_task_id: string | null }[]
+      >`select context_issue_id, context_task_id from heartbeat_runs where id = ${runId}`;
+      expect(rows[0]!.context_issue_id).toBeNull();
+      expect(rows[0]!.context_task_id).toBeNull();
+    }
   }, 60_000);
 
   it("creates the indexes of the scheduler and of the liveness read", async () => {
-    const database = await startEmbeddedPostgresTestDatabase("paperclip-heartbeat-context-columns-");
-    cleanups.push(database.cleanup);
-    const sql = postgres(database.connectionString, { max: 1 });
-    cleanups.push(async () => sql.end());
+    const sql = await startDatabase("paperclip-heartbeat-context-columns-");
 
-    const rows = await sql<{ indexname: string }[]>`
-      select indexname from pg_indexes
-      where indexname in (
+    const rows = await sql<{ name: string; definition: string }[]>`
+      select c.relname as name, pg_get_indexdef(i.indexrelid) as definition
+      from pg_index i
+      join pg_class c on c.oid = i.indexrelid
+      where c.relname in (
         'dt_perf_hr_company_agent_created_ctx_idx',
         'heartbeat_runs_company_context_issue_created_idx',
         'dt_perf_hre_company_type_run_msg_idx'
       )
     `;
-    expect(rows.map((row) => row.indexname).sort()).toEqual([
+    const definitions = new Map(rows.map((row) => [row.name, row.definition]));
+    expect([...definitions.keys()].sort()).toEqual([
       "dt_perf_hr_company_agent_created_ctx_idx",
       "dt_perf_hre_company_type_run_msg_idx",
       "heartbeat_runs_company_context_issue_created_idx",
     ]);
+
+    // The scheduler index reads the real columns. It must not read the
+    // snapshot, because the snapshot is a large toasted document.
+    const schedulerIndex = definitions.get("dt_perf_hr_company_agent_created_ctx_idx")!;
+    expect(schedulerIndex).toContain("context_issue_id");
+    expect(schedulerIndex).toContain("context_task_id");
+    expect(schedulerIndex).toContain("created_at DESC");
+    expect(schedulerIndex).not.toContain("context_snapshot");
+
+    const livenessIndex = definitions.get("heartbeat_runs_company_context_issue_created_idx")!;
+    expect(livenessIndex).toContain("context_issue_id");
+    expect(livenessIndex).toContain("created_at DESC");
+    expect(livenessIndex).not.toContain("context_snapshot");
+
+    const exhaustionIndex = definitions.get("dt_perf_hre_company_type_run_msg_idx")!;
+    expect(exhaustionIndex).toContain("event_type");
+    expect(exhaustionIndex).toContain("id DESC");
+    expect(exhaustionIndex).toContain("Bounded retry exhausted%");
   }, 60_000);
 });

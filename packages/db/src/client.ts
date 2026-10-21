@@ -325,6 +325,9 @@ export function createDbMonitoringClient(db: Db): ReturnType<typeof postgres> | 
     max: 1,
     connect_timeout: 5,
     idle_timeout: 0,
+    // A prepared statement does not work on every pooler. The probe must
+    // work everywhere, so it never prepares a statement.
+    prepare: false,
     // postgres.js reads the application name from the connection options.
     connection: { application_name: DB_MONITORING_APPLICATION_NAME },
     onnotice: () => {},
@@ -686,6 +689,26 @@ async function indexExists(
   return rows[0]?.exists ?? false;
 }
 
+/**
+ * True when every run that has a snapshot also has the mirrored issue and
+ * task ids. The backfill of the mirrored columns is done when this is true.
+ */
+async function heartbeatContextIdsAreMirrored(
+  sql: ReturnType<typeof postgres>,
+): Promise<boolean> {
+  const rows = await sql<{ mismatched: string }[]>`
+    SELECT count(*)::text AS "mismatched"
+    FROM "heartbeat_runs"
+    WHERE "context_snapshot" IS NOT NULL
+      AND jsonb_typeof("context_snapshot") = 'object'
+      AND (
+        "context_issue_id" IS DISTINCT FROM "context_snapshot" ->> 'issueId'
+        OR "context_task_id" IS DISTINCT FROM "context_snapshot" ->> 'taskId'
+      )
+  `;
+  return Number(rows[0]?.mismatched ?? "1") === 0;
+}
+
 async function constraintExists(
   sql: ReturnType<typeof postgres>,
   constraintName: string,
@@ -770,6 +793,7 @@ async function heartbeatNextEventSequencesAreCurrent(
 async function migrationStatementAlreadyApplied(
   sql: ReturnType<typeof postgres>,
   statement: string,
+  recreatedIndexNames: Set<string>,
 ): Promise<boolean> {
   const normalized = statement
     .replace(/^\s*--.*$/gm, "")
@@ -800,9 +824,30 @@ async function migrationStatementAlreadyApplied(
     );
   }
 
-  const createIndexMatch = normalized.match(/^CREATE (?:UNIQUE )?INDEX(?: IF NOT EXISTS)? "([^"]+)"/i);
+  const createIndexMatch = normalized.match(
+    /^CREATE (?:UNIQUE )?INDEX(?: CONCURRENTLY)?(?: IF NOT EXISTS)? "([^"]+)"/i,
+  );
   if (createIndexMatch) {
     return indexExists(sql, createIndexMatch[1]);
+  }
+
+  const dropIndexMatch = normalized.match(/^DROP INDEX(?: IF EXISTS)? "([^"]+)"/i);
+  if (dropIndexMatch) {
+    const indexName = dropIndexMatch[1];
+    // The drop of a concurrent build belongs to a pair. The pair is done
+    // when the index of the migration is there again. Without the pair the
+    // drop is done when the index is gone.
+    if (recreatedIndexNames.has(indexName)) {
+      return indexExists(sql, indexName);
+    }
+    return !(await indexExists(sql, indexName));
+  }
+
+  if (
+    normalized.startsWith('UPDATE "heartbeat_runs" SET "context_issue_id" = "context_snapshot"')
+    && normalized.includes('"context_task_id" = "context_snapshot"')
+  ) {
+    return heartbeatContextIdsAreMirrored(sql);
   }
 
   const addConstraintMatch = normalized.match(/^ALTER TABLE "([^"]+)" ADD CONSTRAINT "([^"]+)"/i);
@@ -851,8 +896,22 @@ async function migrationContentAlreadyApplied(
   const statements = splitMigrationStatements(migrationContent);
   if (statements.length === 0) return false;
 
+  // The index names that the migration builds again. A drop of one of them
+  // belongs to a drop and build pair.
+  const recreatedIndexNames = new Set<string>();
   for (const statement of statements) {
-    const applied = await migrationStatementAlreadyApplied(sql, statement);
+    const normalized = statement
+      .replace(/^\s*--.*$/gm, "")
+      .replace(/\s+/g, " ")
+      .trim();
+    const createIndexMatch = normalized.match(
+      /^CREATE (?:UNIQUE )?INDEX(?: CONCURRENTLY)?(?: IF NOT EXISTS)? "([^"]+)"/i,
+    );
+    if (createIndexMatch) recreatedIndexNames.add(createIndexMatch[1]);
+  }
+
+  for (const statement of statements) {
+    const applied = await migrationStatementAlreadyApplied(sql, statement, recreatedIndexNames);
     if (!applied) return false;
   }
 

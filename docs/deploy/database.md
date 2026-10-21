@@ -83,7 +83,7 @@ The server ends its pools during shutdown (SIGINT/SIGTERM) and when startup fail
 
 When every connection of the application pool is busy, the API answers with `503` and the body `{"error":"database_pool_saturated"}` instead of waiting for a free connection. The answer also carries a `Retry-After` header. The `/api/health` route stays reachable, because it is the diagnostic of a saturated pool.
 
-The guard opens after the pool stayed full for a grace period, so a short burst does not fail requests. A probe that fails leaves the guard closed, so a monitoring problem never takes the API down.
+The guard opens after the pool stayed full for a grace period, so a short burst does not fail requests. The guard reads the state of the pool with its own connection, and it counts the busy backends of this database only. A probe that fails opens the guard and drops the last state, so a monitoring problem never takes the API down and a broken monitor cannot keep the API closed.
 
 | Variable | Default | Effect |
 |----------|---------|--------|

@@ -430,8 +430,9 @@ export function activityService(db: Db) {
       );
       // Two indexed arms. One statement with an OR over the jsonb snapshot
       // and a correlated subquery made the planner scan the whole run table
-      // for every issue.
-      const activityRunIds = db
+      // for every issue. The run ids of the activity arm are read first, and
+      // the two arms are read with one statement over the run table.
+      const activityRunIdRows = await db
         .select({ runId: activityLog.runId })
         .from(activityLog)
         .where(and(
@@ -439,31 +440,21 @@ export function activityService(db: Db) {
           eq(activityLog.entityType, "issue"),
           eq(activityLog.entityId, issueId),
         ));
-      const [contextRuns, activityRuns] = await Promise.all([
-        db
-          .select(runColumns)
-          .from(heartbeatRuns)
-          .innerJoin(agents, joinAgents)
-          .where(and(
-            eq(heartbeatRuns.companyId, companyId),
+      const activityRunIds = activityRunIdRows
+        .map((row) => row.runId)
+        .filter((runId): runId is string => typeof runId === "string" && runId.length > 0);
+      const runs = (await db
+        .select(runColumns)
+        .from(heartbeatRuns)
+        .innerJoin(agents, joinAgents)
+        .where(and(
+          eq(heartbeatRuns.companyId, companyId),
+          or(
             eq(heartbeatRuns.contextIssueId, issueId),
-          )),
-        db
-          .select(runColumns)
-          .from(heartbeatRuns)
-          .innerJoin(agents, joinAgents)
-          .where(and(
-            eq(heartbeatRuns.companyId, companyId),
             inArray(heartbeatRuns.id, activityRunIds),
-          )),
-      ]);
-      const seenRunIds = new Set<string>();
-      const runs = [...contextRuns, ...activityRuns]
-        .filter((run) => {
-          if (seenRunIds.has(run.runId)) return false;
-          seenRunIds.add(run.runId);
-          return true;
-        })
+          ),
+        ))
+        .orderBy(desc(heartbeatRuns.createdAt)))
         .sort((left, right) =>
           right.createdAt.getTime() - left.createdAt.getTime()
           || right.runId.localeCompare(left.runId));
