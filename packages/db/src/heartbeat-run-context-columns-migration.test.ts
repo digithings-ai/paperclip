@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { afterEach, describe, expect, it } from "vitest";
 import postgres from "postgres";
 import {
@@ -19,11 +20,11 @@ function fatSnapshot() {
     issueId: ISSUE_ID,
     taskId: TASK_ID,
     paperclipWake: {
-      issue: { id: ISSUE_ID, title: "a long issue title" },
+      issue: { id: ISSUE_ID, title: "a long issue title", workMode: "standard" },
       comments: [{ id: "comment-1", body: "a comment body" }],
       commentIds: ["comment-1"],
       executionContinuation: { messages: [{ role: "user", content: "a long message" }] },
-      continuationSummary: { body: "a long continuation summary" },
+      continuationSummary: { body: "a long continuation summary", bodyTruncated: false },
       externalChatProvider: "chat-provider",
       checkedOutByHarness: true,
       externalChatExecutionBound: false,
@@ -32,7 +33,23 @@ function fatSnapshot() {
       recovery: { cause: "timeout" },
       truncated: false,
     },
-    executionContinuation: { messages: [{ role: "user", content: "a long message" }] },
+    executionContinuation: {
+      issueId: ISSUE_ID,
+      objective: "a long objective",
+      messages: [
+        {
+          id: "comment-1",
+          authorId: "author-1",
+          authorType: "user",
+          body: "a long comment body",
+          createdAt: "2026-10-21T00:00:00.000Z",
+          updatedAt: "2026-10-21T00:00:00.000Z",
+          deleted: false,
+          createdByRunId: null,
+          sourceTrust: null,
+        },
+      ],
+    },
     paperclipTaskMarkdown: "a long task markdown",
     paperclipTaskMarkdownCompact: "a long task markdown",
     paperclipTaskMarkdownAssignment: "a long task markdown",
@@ -97,10 +114,18 @@ describeEmbeddedPostgres("heartbeat run context columns", () => {
     expect(snapshot.paperclipWakeComment).toBeUndefined();
     expect(snapshot.paperclipFreshSessionHandoffMarkdown).toBeUndefined();
 
-    // The copies of the issue, of the continuation and of the summary are gone.
-    expect(snapshot.paperclipWake.executionContinuation).toBeUndefined();
-    expect(snapshot.paperclipWake.continuationSummary).toBeUndefined();
-    expect(snapshot.paperclipWake.issue).toEqual({ id: ISSUE_ID });
+    // The wake payload stays as it is. The external chat contract reads the
+    // work mode and the summary from the stored wake payload.
+    expect(snapshot.paperclipWake.issue).toEqual({
+      id: ISSUE_ID,
+      title: "a long issue title",
+      workMode: "standard",
+    });
+    expect(snapshot.paperclipWake.continuationSummary).toEqual({
+      body: "a long continuation summary",
+      bodyTruncated: false,
+    });
+    expect(snapshot.paperclipWake.executionContinuation).toBeDefined();
 
     // The proof fields of the wake payload stay.
     expect(snapshot.paperclipWake.comments).toHaveLength(1);
@@ -114,6 +139,17 @@ describeEmbeddedPostgres("heartbeat run context columns", () => {
 
     // The continuation of the run itself stays. The next run reads it.
     expect(snapshot.executionContinuation).toBeDefined();
+    expect(snapshot.executionContinuation.objective).toBe("a long objective");
+
+    // The body of a comment is stored as a digest. The next run compares the
+    // digest with the body of the comment.
+    const message = snapshot.executionContinuation.messages[0];
+    expect(message.body).toBeUndefined();
+    expect(message.id).toBe("comment-1");
+    expect(message.updatedAt).toBe("2026-10-21T00:00:00.000Z");
+    expect(message.bodyDigest).toBe(
+      createHash("sha256").update("a long comment body", "utf8").digest("hex"),
+    );
   }, 60_000);
 
   it("slims an updated snapshot and refreshes the mirrored ids", async () => {

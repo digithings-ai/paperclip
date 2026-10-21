@@ -30,6 +30,17 @@ function noise(size: number): string {
 }
 
 function buildSnapshot(issueId: string) {
+  const continuationMessages = Array.from({ length: 20 }, (_, i) => ({
+    id: `comment-${i}`,
+    authorId: `author-${i}`,
+    authorType: "user",
+    body: noise(950),
+    createdAt: "2026-10-21T00:00:00.000Z",
+    updatedAt: "2026-10-21T00:00:00.000Z",
+    deleted: false,
+    createdByRunId: null,
+    sourceTrust: null,
+  }));
   return {
     issueId,
     taskId: null,
@@ -37,7 +48,7 @@ function buildSnapshot(issueId: string) {
       issue: { id: issueId, title: noise(3300) },
       comments: Array.from({ length: 12 }, (_, i) => ({ id: `comment-${i}`, body: noise(2500) })),
       executionContinuation: {
-        messages: Array.from({ length: 20 }, (_, i) => ({ role: "user", content: noise(950) })),
+        messages: continuationMessages,
         objective: noise(2000),
         completedWork: [noise(2300)],
       },
@@ -51,7 +62,8 @@ function buildSnapshot(issueId: string) {
       truncated: false,
     },
     executionContinuation: {
-      messages: Array.from({ length: 20 }, (_, i) => ({ role: "user", content: noise(950) })),
+      issueId,
+      messages: continuationMessages,
       objective: noise(2000),
     },
     paperclipTaskMarkdown: noise(6000),
@@ -132,11 +144,12 @@ try {
     `select
        context_issue_id,
        context_snapshot->'paperclipWake'->'comments' is not null as keeps_comments,
-       context_snapshot->'paperclipWake'->'executionContinuation' is null as drops_execution_continuation,
-       context_snapshot->'paperclipWake'->'continuationSummary' is null as drops_continuation_summary,
-       context_snapshot->'paperclipWake'->'issue' = jsonb_build_object('id', context_snapshot->'paperclipWake'->'issue'->'id') as keeps_only_issue_id,
+       context_snapshot->'paperclipWake'->'issue'->>'workMode' is null as keeps_wake_issue,
+       context_snapshot->'paperclipWake'->'continuationSummary' is not null as keeps_continuation_summary,
        context_snapshot->'paperclipTaskMarkdown' is null as drops_task_markdown,
        context_snapshot->'executionContinuation' is not null as keeps_top_level_continuation,
+       context_snapshot->'executionContinuation'->'messages'->0->>'body' is null as drops_comment_body,
+       context_snapshot->'executionContinuation'->'messages'->0->>'bodyDigest' is not null as keeps_comment_body_digest,
        context_snapshot->'paperclipWake'->>'reason' as keeps_reason,
        context_snapshot->'paperclipWake'->'recovery'->>'cause' as keeps_recovery_cause
      from heartbeat_runs where agent_id = $1 limit 1`,

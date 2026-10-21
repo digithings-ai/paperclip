@@ -23,7 +23,8 @@ CREATE INDEX CONCURRENTLY "dt_perf_hre_company_type_run_msg_idx" ON "heartbeat_r
 CREATE OR REPLACE FUNCTION "paperclip_slim_heartbeat_run_context_snapshot"() RETURNS trigger LANGUAGE plpgsql AS $paperclip$
 DECLARE
   slim_snapshot jsonb;
-  slim_wake jsonb;
+  slim_continuation jsonb;
+  slim_messages jsonb;
 BEGIN
   -- A run without a snapshot has no ids to mirror.
   IF NEW.context_snapshot IS NULL THEN
@@ -46,23 +47,34 @@ BEGIN
     - 'paperclipWakeComment'::text
     - 'paperclipFreshSessionHandoffMarkdown'::text;
 
-  -- The wake payload keeps the small proof fields that the merge and the
-  -- external chat presentation read. It drops the copy of the continuation and
-  -- of the continuation summary, because the snapshot already holds them, and
-  -- it reduces the copy of the issue to its id. The comments stay, because
-  -- the continuation code reads them to find out whether a human comment was
-  -- delivered.
-  IF jsonb_typeof(slim_snapshot -> 'paperclipWake') = 'object' THEN
-    -- The parentheses matter. In PL/pgSQL the arrow binds weaker than the
-    -- minus sign, so an unparenthesized arrow would swallow the keys.
-    slim_wake := (slim_snapshot -> 'paperclipWake')
-      - 'executionContinuation'::text
-      - 'continuationSummary'::text;
-    IF jsonb_typeof(slim_wake -> 'issue') = 'object'
-      AND jsonb_typeof(slim_wake -> 'issue' -> 'id') = 'string' THEN
-      slim_wake := jsonb_set(slim_wake, '{issue}', jsonb_build_object('id', slim_wake -> 'issue' -> 'id'));
+  -- The wake payload is not touched. Production code reads the issue work
+  -- mode and the continuation summary from the stored wake payload.
+
+  -- The continuation envelope repeats the body of every comment of the issue.
+  -- The bodies live in the comment table, and the envelope needs them only to
+  -- find out whether a comment changed. A digest of the body answers that
+  -- question and keeps the stored snapshot small.
+  IF jsonb_typeof(slim_snapshot -> 'executionContinuation') = 'object' THEN
+    slim_continuation := slim_snapshot -> 'executionContinuation';
+    IF jsonb_typeof(slim_continuation -> 'messages') = 'array' THEN
+      SELECT coalesce(jsonb_agg(
+        CASE
+          WHEN jsonb_typeof(element.message) = 'object' AND element.message ? 'body' THEN
+            (element.message - 'body'::text)
+            || jsonb_build_object(
+              'bodyDigest',
+              encode(sha256(convert_to(coalesce(element.message ->> 'body', ''), 'UTF8')), 'hex')
+            )
+          ELSE element.message
+        END
+      ), '[]'::jsonb)
+      INTO slim_messages
+      FROM jsonb_array_elements(slim_continuation -> 'messages') AS element(message);
+      slim_continuation := (slim_continuation - 'messages'::text)
+        || jsonb_build_object('messages', slim_messages);
+      slim_snapshot := (slim_snapshot - 'executionContinuation'::text)
+        || jsonb_build_object('executionContinuation', slim_continuation);
     END IF;
-    slim_snapshot := jsonb_set(slim_snapshot, '{paperclipWake}', slim_wake);
   END IF;
 
   NEW.context_snapshot := slim_snapshot;
