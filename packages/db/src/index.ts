@@ -15,6 +15,12 @@ export {
   type Db,
 } from "./client.js";
 export {
+  createDbMonitoringClient,
+  databaseApplicationName,
+  databasePoolMax,
+  DB_MONITORING_APPLICATION_NAME,
+} from "./client.js";
+export {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
   EMBEDDED_POSTGRES_TEST_TIMEOUT_MS,

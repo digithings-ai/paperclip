@@ -132,7 +132,9 @@ export async function readExecutionLivenessSignals(
           and(
             eq(heartbeatRuns.companyId, args.companyId),
             inArray(heartbeatRuns.status, [...LIVE_RUN_STATUSES]),
-            sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${args.issueId}`,
+            // The issue id is a real column, so the read does not detoast the
+            // snapshot of every run of the company.
+            eq(heartbeatRuns.contextIssueId, args.issueId),
             agentFilter,
           ),
         )

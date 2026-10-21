@@ -390,64 +390,74 @@ export function activityService(db: Db) {
 
     runsForIssue: async (companyId: string, issueId: string) => {
       scheduleRunLivenessBackfill(companyId, issueId);
-      const runs = await db
-        .select({
-          runId: heartbeatRuns.id,
-          runtimeMode: heartbeatRuns.runtimeMode,
-          status: heartbeatRuns.status,
-          agentId: heartbeatRuns.agentId,
-          adapterType: agents.adapterType,
-          startedAt: heartbeatRuns.startedAt,
-          finishedAt: heartbeatRuns.finishedAt,
-          createdAt: heartbeatRuns.createdAt,
-          invocationSource: heartbeatRuns.invocationSource,
-          responsibleUserId: heartbeatRuns.responsibleUserId,
-          errorCode: heartbeatRuns.errorCode,
-          error: sql<string | null>`case when ${heartbeatRuns.status} = 'failed'
-            and ${heartbeatRuns.errorCode} = 'native_provider_model_rejected'
-            then left(${heartbeatRuns.error}, 2000) else null end`,
-          usageJson: summarizedUsageJson,
-          resultJson: summarizedResultJson,
-          logBytes: heartbeatRuns.logBytes,
-          retryOfRunId: heartbeatRuns.retryOfRunId,
-          scheduledRetryAt: heartbeatRuns.scheduledRetryAt,
-          scheduledRetryAttempt: heartbeatRuns.scheduledRetryAttempt,
-          scheduledRetryReason: heartbeatRuns.scheduledRetryReason,
-          livenessState: heartbeatRuns.livenessState,
-          livenessReason: heartbeatRuns.livenessReason,
-          continuationAttempt: heartbeatRuns.continuationAttempt,
-          lastUsefulActionAt: heartbeatRuns.lastUsefulActionAt,
-          nextAction: heartbeatRuns.nextAction,
-          wakeCommentIds: sql<string[] | null>`${heartbeatRuns.contextSnapshot} -> 'wakeCommentIds'`,
-          wakeCommentId: sql<string | null>`${heartbeatRuns.contextSnapshot} ->> 'wakeCommentId'`,
-          contextCommentId: sql<string | null>`${heartbeatRuns.contextSnapshot} ->> 'commentId'`,
-          contextIssueId: sql<string | null>`${heartbeatRuns.contextSnapshot} ->> 'issueId'`,
-        })
+      const runColumns = {
+        runId: heartbeatRuns.id,
+        runtimeMode: heartbeatRuns.runtimeMode,
+        status: heartbeatRuns.status,
+        agentId: heartbeatRuns.agentId,
+        adapterType: agents.adapterType,
+        startedAt: heartbeatRuns.startedAt,
+        finishedAt: heartbeatRuns.finishedAt,
+        createdAt: heartbeatRuns.createdAt,
+        invocationSource: heartbeatRuns.invocationSource,
+        responsibleUserId: heartbeatRuns.responsibleUserId,
+        errorCode: heartbeatRuns.errorCode,
+        error: sql<string | null>`case when ${heartbeatRuns.status} = 'failed'
+          and ${heartbeatRuns.errorCode} = 'native_provider_model_rejected'
+          then left(${heartbeatRuns.error}, 2000) else null end`,
+        usageJson: summarizedUsageJson,
+        resultJson: summarizedResultJson,
+        logBytes: heartbeatRuns.logBytes,
+        retryOfRunId: heartbeatRuns.retryOfRunId,
+        scheduledRetryAt: heartbeatRuns.scheduledRetryAt,
+        scheduledRetryAttempt: heartbeatRuns.scheduledRetryAttempt,
+        scheduledRetryReason: heartbeatRuns.scheduledRetryReason,
+        livenessState: heartbeatRuns.livenessState,
+        livenessReason: heartbeatRuns.livenessReason,
+        continuationAttempt: heartbeatRuns.continuationAttempt,
+        lastUsefulActionAt: heartbeatRuns.lastUsefulActionAt,
+        nextAction: heartbeatRuns.nextAction,
+        wakeCommentIds: sql<string[] | null>`${heartbeatRuns.contextSnapshot} -> 'wakeCommentIds'`,
+        wakeCommentId: sql<string | null>`${heartbeatRuns.contextSnapshot} ->> 'wakeCommentId'`,
+        contextCommentId: sql<string | null>`${heartbeatRuns.contextSnapshot} ->> 'commentId'`,
+        // The issue id is a real column, so the read does not detoast the
+        // snapshot of every run of the company.
+        contextIssueId: heartbeatRuns.contextIssueId,
+      };
+      const joinAgents = and(
+        eq(agents.id, heartbeatRuns.agentId),
+        eq(agents.companyId, heartbeatRuns.companyId),
+      );
+      // Two indexed arms. One statement with an OR over the jsonb snapshot
+      // and a correlated subquery made the planner scan the whole run table
+      // for every issue. The run ids of the activity arm are read first, and
+      // the two arms are read with one statement over the run table.
+      const activityRunIdRows = await db
+        .select({ runId: activityLog.runId })
+        .from(activityLog)
+        .where(and(
+          eq(activityLog.companyId, companyId),
+          eq(activityLog.entityType, "issue"),
+          eq(activityLog.entityId, issueId),
+        ));
+      const activityRunIds = activityRunIdRows
+        .map((row) => row.runId)
+        .filter((runId): runId is string => typeof runId === "string" && runId.length > 0);
+      const runs = (await db
+        .select(runColumns)
         .from(heartbeatRuns)
-        .innerJoin(
-          agents,
-          and(
-            eq(agents.id, heartbeatRuns.agentId),
-            eq(agents.companyId, heartbeatRuns.companyId),
+        .innerJoin(agents, joinAgents)
+        .where(and(
+          eq(heartbeatRuns.companyId, companyId),
+          or(
+            eq(heartbeatRuns.contextIssueId, issueId),
+            inArray(heartbeatRuns.id, activityRunIds),
           ),
-        )
-        .where(
-          and(
-            eq(heartbeatRuns.companyId, companyId),
-            or(
-              sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
-              sql`exists (
-                select 1
-                from ${activityLog}
-                where ${activityLog.companyId} = ${companyId}
-                  and ${activityLog.entityType} = 'issue'
-                  and ${activityLog.entityId} = ${issueId}
-                  and ${activityLog.runId} = ${heartbeatRuns.id}
-              )`,
-            ),
-          ),
-        )
-        .orderBy(desc(heartbeatRuns.createdAt));
+        ))
+        .orderBy(desc(heartbeatRuns.createdAt)))
+        .sort((left, right) =>
+          right.createdAt.getTime() - left.createdAt.getTime()
+          || right.runId.localeCompare(left.runId));
 
       if (runs.length === 0) return runs;
       const runIds = runs.map((run) => run.runId);

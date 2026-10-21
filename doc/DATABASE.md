@@ -226,6 +226,25 @@ When authoring migrations or one-time backfills:
 - Split schema changes, index creation, and data backfill into separate phases so each step has clear locking and rollback behavior.
 - Treat the `check:migrations` CI gate as the enforcement backstop for these rules. If it flags a migration, rewrite the migration or add a suppression comment with the indexed predicate, batch bound, and reason the remaining scan is safe.
 
+### Migrations that run outside a transaction
+
+The migration runner applies every migration inside one transaction. PostgreSQL does not allow `CREATE INDEX CONCURRENTLY` inside a transaction block, so a migration that needs a concurrent index build must ask the runner for a different path.
+
+Put this directive in the first comment line of the migration file:
+
+```sql
+-- paperclip:migration-no-transaction
+```
+
+The runner then applies the statements of that migration one by one, in auto-commit mode, and records the migration history entry afterwards. The empty database bootstrap uses the same runner, so a fresh install applies a concurrent index build the same way as an existing install.
+
+Rules for a migration that runs outside a transaction:
+
+- Make every statement idempotent. A failure in the middle leaves the earlier statements applied, and the next run must repair the state. Use `IF NOT EXISTS` and `IF EXISTS` for this reason.
+- Do not rely on a rollback. There is none.
+- Keep the number of statements small. Each one runs as its own transaction and commits on its own.
+- Write a comment that says why the migration cannot run inside a transaction.
+
 ## Migration snapshots
 
 `drizzle-kit generate` diffs `packages/db/src/schema/` against the newest snapshot in `packages/db/src/migrations/meta/`. That snapshot must describe the schema that every migration produces when they run in order. A snapshot that drifts from the schema makes the *next* migration wrong, because `generate` folds the drift into it. The drift can add a column that an earlier migration already created, which makes that migration fail on a fresh database. It can also drop a column that the schema still uses.

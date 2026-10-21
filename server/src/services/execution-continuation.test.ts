@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
@@ -358,6 +358,62 @@ const support = await getEmbeddedPostgresTestSupport();
       );
       expect(freshPrompt).toContain("Read my Notion launch notes.");
       expect(freshPrompt).not.toContain('"resumeDelta"');
+    });
+    it("finds the same changed comments when the stored envelope keeps a digest of the body", async () => {
+      const delivered = await build();
+      await db
+        .update(heartbeatRuns)
+        .set({
+          contextSnapshot: {
+            issueId,
+            executionContinuation: JSON.parse(JSON.stringify(delivered)),
+          },
+        })
+        .where(eq(heartbeatRuns.id, runId));
+      const withBody = await buildExecutionContinuation({
+        db,
+        companyId,
+        issueId,
+        agentId,
+        previousContextRunId: runId,
+        context: { interactionId },
+        summary: null,
+        exposeLowTrustRaw: false,
+      });
+
+      // The database stores a digest of the body of every comment.
+      const stored = await db
+        .select({ context: heartbeatRuns.contextSnapshot })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId));
+      const storedEnvelope = (stored[0]!.context as Record<string, any>)
+        .executionContinuation;
+      const storedMessage = storedEnvelope.messages.find(
+        (message: Record<string, any>) => message.id === notionId,
+      );
+      const comment = await db
+        .select({ body: issueComments.body })
+        .from(issueComments)
+        .where(eq(issueComments.id, notionId));
+      expect(storedMessage.body).toBeUndefined();
+      expect(storedMessage.bodyDigest).toBe(
+        createHash("sha256").update(comment[0]!.body, "utf8").digest("hex"),
+      );
+
+      // The digest finds the same changed comments as the body did.
+      const withDigest = await buildExecutionContinuation({
+        db,
+        companyId,
+        issueId,
+        agentId,
+        previousContextRunId: runId,
+        context: { interactionId },
+        summary: null,
+        exposeLowTrustRaw: false,
+      });
+      expect(withDigest.resumeDelta?.messages.map((row) => row.id)).toEqual(
+        withBody.resumeDelta?.messages.map((row) => row.id),
+      );
     });
     it("fails closed when required originating context is missing", async () => {
       await expectMissingContinuationContext(

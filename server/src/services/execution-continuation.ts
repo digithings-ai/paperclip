@@ -30,6 +30,19 @@ const object = (v: unknown): Record<string, unknown> =>
     : {};
 const string = (v: unknown) =>
   typeof v === "string" && v.length > 0 ? v : null;
+/**
+ * The stored envelope keeps a digest of the body of a comment instead of the
+ * body. An envelope that was stored before that change keeps the body. Both
+ * are compared in the same way.
+ */
+function priorBodyMatches(prior: Record<string, unknown>, body: string): boolean {
+  if (typeof prior.bodyDigest === "string") {
+    return (
+      prior.bodyDigest === createHash("sha256").update(body, "utf8").digest("hex")
+    );
+  }
+  return prior.body === body;
+}
 export function continuationOriginCommentIds(context: unknown): string[] {
   const c = object(context);
   const prior = object(c.executionContinuation);
@@ -274,7 +287,7 @@ export async function buildExecutionContinuation(input: {
               eq(heartbeatRuns.companyId, companyId),
               eq(heartbeatRuns.agentId, input.agentId),
               eq(heartbeatRuns.id, input.previousContextRunId),
-              sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+              eq(heartbeatRuns.contextIssueId, issueId),
             ),
           )
       )[0]
@@ -294,7 +307,7 @@ export async function buildExecutionContinuation(input: {
                 (prior) =>
                   prior.id === message.id &&
                   prior.updatedAt === message.updatedAt &&
-                  prior.body === message.body &&
+                  priorBodyMatches(prior, message.body) &&
                   prior.deleted === message.deleted &&
                   prior.authorId === message.authorId &&
                   (prior.createdByRunId ?? null) === message.createdByRunId &&
@@ -322,7 +335,7 @@ export async function buildExecutionContinuation(input: {
         eq(heartbeatRuns.companyId, companyId),
         or(eq(heartbeatRuns.agentId, input.agentId),
           sourceRunId ? eq(heartbeatRuns.id, sourceRunId) : undefined),
-        sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+        eq(heartbeatRuns.contextIssueId, issueId),
       ),
     )
     .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id));

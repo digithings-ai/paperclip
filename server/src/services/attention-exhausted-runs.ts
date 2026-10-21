@@ -30,9 +30,10 @@ export function listAttentionExhaustedRuns(db: Db, companyId: string) {
       errorCode: heartbeatRuns.errorCode,
       // Preserve JSON types and issueId/taskId fallback semantics without
       // transferring prompts, transcripts, or the rest of the run context.
+      // The ids are real columns, so the read does not detoast the snapshot.
       contextSnapshot: sql<Record<string, unknown>>`jsonb_build_object(
-        'issueId', ${heartbeatRuns.contextSnapshot} -> 'issueId',
-        'taskId', ${heartbeatRuns.contextSnapshot} -> 'taskId'
+        'issueId', ${heartbeatRuns.contextIssueId},
+        'taskId', ${heartbeatRuns.contextTaskId}
       )`,
       createdAt: heartbeatRuns.createdAt,
       updatedAt: heartbeatRuns.updatedAt,
