@@ -8,6 +8,7 @@ import {
   updateDecisionQueueSchema,
   updateDecisionRetentionSchema,
   updateDecisionTriageSchema,
+  type AttentionSourceKind,
 } from "@paperclipai/shared";
 import { forbidden } from "../errors.js";
 import { validate } from "../middleware/validate.js";
@@ -55,12 +56,32 @@ async function assertDecisionAccess(
   }
 }
 
-function sourceParams(req: Parameters<typeof getActorInfo>[0]) {
+/**
+ * Every attention source kind points at a row with a uuid primary key, so a
+ * source id must look like one. This check keeps a malformed id out of the
+ * database instead of letting the query fail with a 500.
+ */
+const UUID_SHAPE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+type SourceParamsResult =
+  | { ok: true; source: { sourceKind: AttentionSourceKind; sourceId: string } }
+  | { ok: false; error: string };
+
+function sourceParams(req: Parameters<typeof getActorInfo>[0]): SourceParamsResult {
   const parsed = decisionAttentionSourceKindSchema.safeParse(req.params.sourceKind);
-  if (!parsed.success) return null;
+  if (!parsed.success) return { ok: false, error: "Invalid attention source kind" };
   const sourceId = (req.params.sourceId as string | undefined)?.trim();
-  if (!sourceId || sourceId.length > 500) return null;
-  return { sourceKind: parsed.data, sourceId };
+  if (!sourceId || sourceId.length > 500) return { ok: false, error: "Invalid attention source identity" };
+  // Every attention source is a row with a uuid primary key. A short or
+  // malformed id can never match one, and it used to reach the database and
+  // fail there with a 500. Reject it here with the shape the caller needs.
+  if (!UUID_SHAPE.test(sourceId)) {
+    return {
+      ok: false,
+      error: "Invalid attention source identity: sourceId must be a full uuid",
+    };
+  }
+  return { ok: true, source: { sourceKind: parsed.data, sourceId } };
 }
 
 export function decisionQueueRoutes(db: Db) {
@@ -134,11 +155,12 @@ export function decisionQueueRoutes(db: Db) {
     async (req, res) => {
       const companyId = req.params.companyId as string;
       await assertDecisionAccess(db, req, companyId, "decision_queue:manage");
-      const source = sourceParams(req);
-      if (!source) {
-        res.status(400).json({ error: "Invalid attention source identity" });
+      const params = sourceParams(req);
+      if (!params.ok) {
+        res.status(400).json({ error: params.error });
         return;
       }
+      const source = params.source;
       res.json(await svc.removeItem({
         companyId,
         key: req.params.key as string,
@@ -153,12 +175,12 @@ export function decisionQueueRoutes(db: Db) {
   router.get("/companies/:companyId/decision-triage/:sourceKind/:sourceId", async (req, res) => {
     const companyId = req.params.companyId as string;
     await assertDecisionAccess(db, req, companyId, "decision_queue:read");
-    const source = sourceParams(req);
-    if (!source) {
-      res.status(400).json({ error: "Invalid attention source identity" });
+    const params = sourceParams(req);
+    if (!params.ok) {
+      res.status(400).json({ error: params.error });
       return;
     }
-    res.json(await svc.getTriage(companyId, source.sourceKind, source.sourceId, req.actor));
+    res.json(await svc.getTriage(companyId, params.source.sourceKind, params.source.sourceId, req.actor));
   });
 
   router.put(
@@ -167,14 +189,14 @@ export function decisionQueueRoutes(db: Db) {
     async (req, res) => {
       const companyId = req.params.companyId as string;
       await assertDecisionAccess(db, req, companyId, "decision_triage:manage");
-      const source = sourceParams(req);
-      if (!source) {
-        res.status(400).json({ error: "Invalid attention source identity" });
+      const params = sourceParams(req);
+      if (!params.ok) {
+        res.status(400).json({ error: params.error });
         return;
       }
       res.json(await svc.updateTriage({
         companyId,
-        ...source,
+        ...params.source,
         ...req.body,
         authActor: req.actor,
         actor: mutationActor(req),
@@ -188,14 +210,14 @@ export function decisionQueueRoutes(db: Db) {
     async (req, res) => {
       const companyId = req.params.companyId as string;
       await assertDecisionAccess(db, req, companyId, "decision_triage:manage");
-      const source = sourceParams(req);
-      if (!source) {
-        res.status(400).json({ error: "Invalid attention source identity" });
+      const params = sourceParams(req);
+      if (!params.ok) {
+        res.status(400).json({ error: params.error });
         return;
       }
       res.json(await retention.setKeep({
         companyId,
-        ...source,
+        ...params.source,
         keep: req.body.keep,
         authActor: req.actor,
         actor: mutationActor(req),
@@ -206,23 +228,23 @@ export function decisionQueueRoutes(db: Db) {
   router.post("/companies/:companyId/decision-retention/:sourceKind/:sourceId/archive", async (req, res) => {
     const companyId = req.params.companyId as string;
     await assertDecisionAccess(db, req, companyId, "decision_triage:manage");
-    const source = sourceParams(req);
-    if (!source) {
-      res.status(400).json({ error: "Invalid attention source identity" });
+    const params = sourceParams(req);
+    if (!params.ok) {
+      res.status(400).json({ error: params.error });
       return;
     }
-    res.json(await retention.archive({ companyId, ...source, authActor: req.actor, actor: mutationActor(req) }));
+    res.json(await retention.archive({ companyId, ...params.source, authActor: req.actor, actor: mutationActor(req) }));
   });
 
   router.post("/companies/:companyId/decision-retention/:sourceKind/:sourceId/revive", async (req, res) => {
     const companyId = req.params.companyId as string;
     await assertDecisionAccess(db, req, companyId, "decision_triage:manage");
-    const source = sourceParams(req);
-    if (!source) {
-      res.status(400).json({ error: "Invalid attention source identity" });
+    const params = sourceParams(req);
+    if (!params.ok) {
+      res.status(400).json({ error: params.error });
       return;
     }
-    res.json(await retention.revive({ companyId, ...source, authActor: req.actor, actor: mutationActor(req) }));
+    res.json(await retention.revive({ companyId, ...params.source, authActor: req.actor, actor: mutationActor(req) }));
   });
 
   return router;

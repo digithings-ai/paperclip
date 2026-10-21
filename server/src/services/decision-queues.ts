@@ -25,7 +25,7 @@ import type {
   DecisionQueueSeedRule,
   DecisionTriage,
 } from "@paperclipai/shared";
-import { notFound, unprocessable } from "../errors.js";
+import { badRequest, notFound, unprocessable } from "../errors.js";
 import { logActivity } from "./activity-log.js";
 import {
   authorizationService,
@@ -197,12 +197,21 @@ async function loadIssueResource(db: Db, companyId: string, issueId: string): Pr
     .then((rows) => rows[0] ? ({ type: "issue", ...rows[0] } as const) : null);
 }
 
+/** Every attention source kind points at a row with a uuid primary key. */
+const UUID_SHAPE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 async function sourceIssueId(
   db: Db,
   companyId: string,
   sourceKind: AttentionSourceKind,
   sourceId: string,
 ): Promise<{ exists: boolean; issueId: string | null; ownerAgentId?: string | null; agentId?: string | null }> {
+  // A short or malformed id can never match a source row. Refuse it here so
+  // the caller gets a 400 with the shape it needs instead of a database
+  // failure with a 500.
+  if (!UUID_SHAPE.test(sourceId)) {
+    throw badRequest("Invalid attention source identity: sourceId must be a full uuid");
+  }
   switch (sourceKind) {
     case "approval": {
       const row = await db.select({ id: approvals.id, issueId: issueApprovals.issueId })

@@ -667,6 +667,52 @@ describeEmbeddedPostgres("decision queue routes", () => {
     expect(current[0]?.setByUserId).toBe("override-user");
   });
 
+  it("creates a triage row for a card that has none yet", async () => {
+    const { companyId, agentId, interactionId } = await seed();
+    const agent = agentActor(companyId, agentId);
+
+    const created = await request(app(agent))
+      .put(`/api/companies/${companyId}/decision-triage/issue_thread_interaction/${interactionId}`)
+      .send({ decideBy: "today" })
+      .expect(200);
+    expect(created.body).toMatchObject({
+      decideBy: "today",
+      setByType: "agent",
+      setByAgentId: agentId,
+      version: 1,
+    });
+
+    const read = await request(app(agent))
+      .get(`/api/companies/${companyId}/decision-triage/issue_thread_interaction/${interactionId}`)
+      .expect(200);
+    expect(read.body).toMatchObject({ decideBy: "today", version: 1 });
+  });
+
+  it("rejects a short or malformed source id with a 400 instead of a 500", async () => {
+    const { companyId, agentId, interactionId } = await seed();
+    const agent = agentActor(companyId, agentId);
+    const shortId = interactionId.slice(0, 8);
+
+    const put = await request(app(agent))
+      .put(`/api/companies/${companyId}/decision-triage/issue_thread_interaction/${shortId}`)
+      .send({ decideBy: "today" });
+    expect(put.status).toBe(400);
+    expect(put.body.error).toMatch(/full uuid/i);
+
+    const get = await request(app(agent))
+      .get(`/api/companies/${companyId}/decision-triage/issue_thread_interaction/${shortId}`);
+    expect(get.status).toBe(400);
+    expect(get.body.error).toMatch(/full uuid/i);
+
+    // The card itself stays untouched, and its full id still works.
+    const rows = await db.select().from(decisionTriage);
+    expect(rows).toHaveLength(0);
+    await request(app(agent))
+      .put(`/api/companies/${companyId}/decision-triage/issue_thread_interaction/${interactionId}`)
+      .send({ decideBy: "today" })
+      .expect(200);
+  });
+
   it("serializes concurrent partial triage updates without losing state or reusing a version", async () => {
     const { companyId, issueId } = await seed();
     const board = boardActor(companyId);
