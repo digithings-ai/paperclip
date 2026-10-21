@@ -122,6 +122,7 @@ import {
   parseIssueExecutionWorkspaceSettings,
   parseProjectExecutionWorkspacePolicy,
   resolvePinnedIssueWorkspaceStrategyType,
+  resolveIssueExecutionWorkspacePreferenceForCreate,
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_CODE,
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_MESSAGE,
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_REMEDIATION,
@@ -10092,6 +10093,16 @@ export function issueService(db: Db) {
               ),
             ) as Record<string, unknown> | null;
         }
+        executionWorkspacePreference =
+          resolveIssueExecutionWorkspacePreferenceForCreate({
+            effectivePreference: executionWorkspacePreference,
+            requestNamedPreference:
+              issueData.executionWorkspacePreference !== undefined,
+            hasBoundWorkspace: executionWorkspaceId != null,
+            resolvedMode: (
+              executionWorkspaceSettings as Record<string, unknown> | null
+            )?.mode,
+          }) ?? executionWorkspacePreference;
         if (!projectWorkspaceId && issueData.projectId) {
           const project = await tx
             .select({

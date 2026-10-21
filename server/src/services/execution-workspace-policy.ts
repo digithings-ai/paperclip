@@ -88,6 +88,64 @@ export function hasReusableExecutionWorkspaceBinding(issue: UnrunnableWorktreeIs
   return Boolean(issue.executionWorkspaceId && issue.executionWorkspacePreference === "reuse_existing");
 }
 
+/**
+ * The preference an issue keeps after the runtime binds it to a persisted
+ * workspace.
+ *
+ * An issue that owns its own isolated workspace keeps the isolated preference
+ * it was created with. `reuse_existing` next to `settings.mode:
+ * isolated_workspace` is the pair that reads as "this work belongs to another
+ * issue's worktree" (DIG-1636), and the runtime wrote that pair on every
+ * issue it bound to its own worktree.
+ *
+ * A workspace owned by another issue keeps the reuse preference: that binding
+ * is the only honest description of it, and the pair stays visible so the
+ * cross-issue binding can be repaired.
+ */
+export function resolveIssueExecutionWorkspacePreferenceWriteBack(input: {
+  nextIssueWorkspaceMode: string;
+  boundWorkspaceOwnedByThisIssue: boolean;
+}): "isolated_workspace" | "reuse_existing" {
+  if (
+    input.boundWorkspaceOwnedByThisIssue &&
+    input.nextIssueWorkspaceMode === "isolated_workspace"
+  ) {
+    return "isolated_workspace";
+  }
+  return "reuse_existing";
+}
+
+/**
+ * The preference a new issue gets when the platform resolved an isolation
+ * mode for it.
+ *
+ * The request's own preference always wins, and a workspace the issue is
+ * bound to keeps the binding's own preference. When the request named no
+ * preference and the issue has no workspace of its own, the mode the platform
+ * resolved becomes the preference: an issue that carries a concrete mode next
+ * to a null preference cannot be told apart from a request that asked for
+ * nothing (DIG-1636).
+ */
+export function resolveIssueExecutionWorkspacePreferenceForCreate(input: {
+  effectivePreference?: string | null;
+  requestNamedPreference: boolean;
+  hasBoundWorkspace: boolean;
+  resolvedMode?: unknown;
+}): string | null {
+  if (input.effectivePreference != null) return input.effectivePreference;
+  if (input.requestNamedPreference) return null;
+  if (input.hasBoundWorkspace) return null;
+  const mode = input.resolvedMode;
+  if (
+    mode === "isolated_workspace" ||
+    mode === "operator_branch" ||
+    mode === "shared_workspace"
+  ) {
+    return mode;
+  }
+  return null;
+}
+
 export function isUnrunnableWorktreeCombo(input: {
   issue: UnrunnableWorktreeIssueRef;
   resolvedMode: ParsedExecutionWorkspaceMode;

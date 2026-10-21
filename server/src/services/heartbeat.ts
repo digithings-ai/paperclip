@@ -500,6 +500,7 @@ import {
   resolveEffectiveWorkspaceStrategyType,
   resolveExecutionWorkspaceEnvironmentId,
   resolveExecutionWorkspaceMode,
+  resolveIssueExecutionWorkspacePreferenceWriteBack,
   resolveSharedWorkspaceConcurrency,
   selectEnvironmentExecutionWorkspaceSettings,
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_CODE,
@@ -6039,6 +6040,8 @@ export function resolveExecutionWorkspaceReuseRequestForIssue(input: {
   issueExecutionWorkspaceId?: string | null;
   issueExecutionWorkspacePreference?: string | null;
   existingExecutionWorkspaceStatus?: string | null;
+  existingExecutionWorkspaceSourceIssueId?: string | null;
+  issueId?: string | null;
   requestedExistingBranch?: string | null;
   existingExecutionWorkspaceBranchName?: string | null;
 }): ExecutionWorkspaceReuseRequestForIssue {
@@ -6055,8 +6058,17 @@ export function resolveExecutionWorkspaceReuseRequestForIssue(input: {
     requestedExistingBranch === null ||
     readNonEmptyString(input.existingExecutionWorkspaceBranchName) ===
       requestedExistingBranch;
+  // A workspace the issue itself owns is the issue's own checkout, whatever
+  // the stored preference says. Restoring it is the only way to keep one
+  // workspace row per worktree: realizing it again mints a second row for the
+  // same path. A workspace owned by another issue never counts as reuse here.
+  const boundWorkspaceIsOwnedByThisIssue =
+    readNonEmptyString(input.issueId) !== null &&
+    readNonEmptyString(input.existingExecutionWorkspaceSourceIssueId) ===
+      readNonEmptyString(input.issueId);
   const requestedShouldReuseExisting =
-    input.issueExecutionWorkspacePreference === "reuse_existing" &&
+    (input.issueExecutionWorkspacePreference === "reuse_existing" ||
+      boundWorkspaceIsOwnedByThisIssue) &&
     requestedExecutionWorkspaceId !== null &&
     existingWorkspaceMatchesRequestedBranch;
 
@@ -21469,6 +21481,9 @@ export function heartbeatService(
             : (issueRef?.executionWorkspacePreference ?? null),
           existingExecutionWorkspaceStatus:
             existingExecutionWorkspace?.status ?? null,
+          existingExecutionWorkspaceSourceIssueId:
+            existingExecutionWorkspace?.sourceIssueId ?? null,
+          issueId: issueRef?.id ?? null,
         });
       const requestedShouldReuseExisting =
         workspaceReuseRequest.requestedShouldReuseExisting;
@@ -22425,6 +22440,19 @@ export function heartbeatService(
         const nextIssueWorkspaceMode =
           issueExecutionWorkspaceModeForPersistedWorkspace(workspace.mode) ??
           "agent_default";
+        // The workspace the issue owns is the issue's own checkout. Keeping the
+        // isolated preference on it keeps the preference and the settings
+        // telling the same story, instead of writing the pair that reads as
+        // "this work belongs to another issue's worktree".
+        const boundWorkspaceOwnedByThisIssue =
+          readNonEmptyString(workspace.sourceIssueId) !== null &&
+          readNonEmptyString(workspace.sourceIssueId) ===
+            readNonEmptyString(issueId);
+        const nextIssueWorkspacePreference =
+          resolveIssueExecutionWorkspacePreferenceWriteBack({
+            nextIssueWorkspaceMode,
+            boundWorkspaceOwnedByThisIssue,
+          });
         const shouldSwitchIssueToExistingWorkspace =
           issueRef?.executionWorkspacePreference === "reuse_existing" ||
           requestedExecutionWorkspaceMode === "isolated_workspace" ||
@@ -22442,10 +22470,12 @@ export function heartbeatService(
         }
         if (
           shouldSwitchIssueToExistingWorkspace &&
-          (issueExecutionWorkspacePreferenceForRun !== "reuse_existing" ||
+          (issueExecutionWorkspacePreferenceForRun !==
+            nextIssueWorkspacePreference ||
             issueExecutionWorkspaceModeForRun !== nextIssueWorkspaceMode)
         ) {
-          nextIssuePatch.executionWorkspacePreference = "reuse_existing";
+          nextIssuePatch.executionWorkspacePreference =
+            nextIssueWorkspacePreference;
           nextIssuePatch.executionWorkspaceSettings = {
             ...(issueExecutionWorkspaceSettings ?? {}),
             mode: nextIssueWorkspaceMode,
@@ -22464,7 +22494,8 @@ export function heartbeatService(
           issueProjectWorkspaceIdForRun =
             resolvedProjectWorkspaceId ?? issueProjectWorkspaceIdForRun;
           if (shouldSwitchIssueToExistingWorkspace) {
-            issueExecutionWorkspacePreferenceForRun = "reuse_existing";
+            issueExecutionWorkspacePreferenceForRun =
+              nextIssueWorkspacePreference;
             issueExecutionWorkspaceModeForRun = nextIssueWorkspaceMode;
           }
         }
@@ -28464,9 +28495,12 @@ export function heartbeatService(
               resolvedMode,
               workspaceManagedConfig,
             );
-            const existingExecutionWorkspaceStatus = issue.executionWorkspaceId
+            const existingExecutionWorkspaceRow = issue.executionWorkspaceId
               ? await tx
-                  .select({ status: executionWorkspaces.status })
+                  .select({
+                    status: executionWorkspaces.status,
+                    sourceIssueId: executionWorkspaces.sourceIssueId,
+                  })
                   .from(executionWorkspaces)
                   .where(
                     and(
@@ -28474,13 +28508,18 @@ export function heartbeatService(
                       eq(executionWorkspaces.companyId, issue.companyId),
                     ),
                   )
-                  .then((rows) => rows[0]?.status ?? null)
+                  .then((rows) => rows[0] ?? null)
               : null;
+            const existingExecutionWorkspaceStatus =
+              existingExecutionWorkspaceRow?.status ?? null;
             const reuseRequest = resolveExecutionWorkspaceReuseRequestForIssue({
               issueExecutionWorkspaceId: issue.executionWorkspaceId,
               issueExecutionWorkspacePreference:
                 issue.executionWorkspacePreference,
               existingExecutionWorkspaceStatus,
+              existingExecutionWorkspaceSourceIssueId:
+                existingExecutionWorkspaceRow?.sourceIssueId ?? null,
+              issueId: issue.id,
             });
             const hasResolvablePriorSessionWorkspace =
               await resolveHasResolvablePriorSessionWorkspace();
