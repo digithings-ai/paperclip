@@ -1,10 +1,12 @@
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   repairDamagedJsonDocument,
+  resolveSeatSessionStorePath,
+  scrubSeatSessionStoreForAgent,
   seatDataHome,
   seatSessionStorePath,
   scrubSeatStoreInPlace,
@@ -404,12 +406,13 @@ describe("scrubSeatStoreInPlace", () => {
     expect(readMessage(store, "msg-broken").data).toBe(broken);
   });
 
-  it("removes a row that it cannot repair when the caller asks for it", () => {
+  it("removes a row that it cannot repair when a manual repair run asks for it", () => {
     const broken = `{"text":"broken ${String.fromCharCode(1)} value"}`;
     const store = createSeatStoreWithBrokenRow(broken);
     const counts = scrubSeatStoreInPlace(store, {
       repair: true,
       dropUnrepairable: true,
+      allowRowDeletion: true,
     });
 
     expect(counts.unrepairable).toBe(1);
@@ -420,6 +423,24 @@ describe("scrubSeatStoreInPlace", () => {
       .all() as Array<{ id: string }>;
     db.close();
     expect(rows).toHaveLength(0);
+  });
+
+  it("never removes a row when the caller does not allow the removal", () => {
+    const broken = `{"text":"broken ${String.fromCharCode(1)} value"}`;
+    const store = createSeatStoreWithBrokenRow(broken);
+    const counts = scrubSeatStoreInPlace(store, {
+      repair: true,
+      dropUnrepairable: true,
+    });
+
+    expect(counts.unrepairable).toBe(1);
+    expect(counts.dropped).toBe(0);
+    const db = new DatabaseSync(store, { readOnly: true });
+    const rows = db
+      .prepare("SELECT id FROM session_message")
+      .all() as Array<{ id: string }>;
+    db.close();
+    expect(rows).toHaveLength(1);
   });
 
   it("leaves the store of a seat that is running alone", () => {
@@ -536,5 +557,82 @@ describe("seatDataHome", () => {
     ).toBe("/home/seats/cto/data");
     expect(seatDataHome({})).toBe("");
     expect(seatDataHome(null)).toBe("");
+  });
+});
+
+describe("resolveSeatSessionStorePath", () => {
+  it("builds the path of the store from the adapter configuration", () => {
+    const resolved = resolveSeatSessionStorePath({
+      env: { XDG_DATA_HOME: "/home/seats/cto/data" },
+    });
+    expect(resolved.store).toBe("/home/seats/cto/data/opencode/opencode.db");
+    expect(resolved.reason).toBeNull();
+  });
+
+  it("says why the path is unknown", () => {
+    expect(resolveSeatSessionStorePath(null).reason).toBe(
+      "the agent has no adapter configuration",
+    );
+    expect(resolveSeatSessionStorePath({}).reason).toBe(
+      "the adapter configuration of the agent has no environment",
+    );
+    expect(resolveSeatSessionStorePath({ env: {} }).reason).toBe(
+      "the environment of the agent has no data home",
+    );
+  });
+});
+
+describe("scrubSeatSessionStoreForAgent", () => {
+  it("reports a seat that it could not scrub", () => {
+    const outcome = scrubSeatSessionStoreForAgent({ env: {} });
+    expect(outcome.scrubbed).toBe(false);
+    expect(outcome.notScrubbed).toBe(true);
+    expect(outcome.store).toBeNull();
+    expect(outcome.counts).toBeNull();
+    expect(outcome.reason).toBe("the environment of the agent has no data home");
+  });
+
+  it("never removes a row", () => {
+    const directory = mkdtempSync(path.join(tmpdir(), "paperclip-seat-store-"));
+    temporaryDirectories.push(directory);
+    mkdirSync(path.join(directory, "opencode"), { recursive: true });
+    const store = path.join(directory, "opencode", "opencode.db");
+    const db = new DatabaseSync(store);
+    db.exec(`
+      CREATE TABLE session_message (
+        id text PRIMARY KEY,
+        session_id text NOT NULL,
+        type text NOT NULL,
+        seq integer NOT NULL,
+        data text NOT NULL,
+        created_at integer NOT NULL
+      );
+    `);
+    db.prepare(
+      "INSERT INTO session_message (id, session_id, type, seq, data, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+    ).run(
+      "msg-1",
+      "session-1",
+      "text",
+      1,
+      `{"text":"broken ${String.fromCharCode(1)} value"}`,
+      now(),
+    );
+    db.close();
+
+    const outcome = scrubSeatSessionStoreForAgent(
+      { env: { XDG_DATA_HOME: directory } },
+      { repair: true, dropUnrepairable: true },
+    );
+    expect(outcome.scrubbed).toBe(true);
+    expect(outcome.counts?.dropped).toBe(0);
+    expect(outcome.counts?.unrepairable).toBe(1);
+
+    const reader = new DatabaseSync(store, { readOnly: true });
+    const rows = reader
+      .prepare("SELECT id FROM session_message")
+      .all() as Array<{ id: string }>;
+    reader.close();
+    expect(rows).toHaveLength(1);
   });
 });

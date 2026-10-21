@@ -24,6 +24,15 @@ const RUN_SECRET_REDACTION_REGISTRY_KEY = "paperclipSecretRedactions";
 /** The redaction marker of the server redactor. */
 export const REDACTED_RUN_OUTPUT_VALUE = "***REDACTED***";
 
+/**
+ * The marker of a value that the redaction kept but did not inspect. The value
+ * is a class instance, a typed array or a document that sits below the depth
+ * limit. The redaction keeps it, because dropping it would lose data. It
+ * marks it, because the reader of the stored value has to know that the
+ * structure below it was not walked.
+ */
+export const NOT_INSPECTED_RUN_OUTPUT_VALUE = "***NOT_INSPECTED***";
+
 /** A character of a credential token. The runner uses the same set. */
 function isTokenByte(char: string): boolean {
   if (char === ".") return true;
@@ -199,31 +208,138 @@ export function redactPersistedRunTextOrNull(value: string | null): string | nul
 }
 
 /**
+ * Mark a value that the redaction keeps but does not inspect. The marker tells
+ * the reader of the stored value that the structure was not walked.
+ */
+function markNotInspected(value: unknown): Record<string, unknown> {
+  return { [NOT_INSPECTED_RUN_OUTPUT_VALUE]: true, value };
+}
+
+/**
+ * A plain record is an object with the prototype of an object literal, or an
+ * object without a prototype. A class instance, a typed array, a map and a set
+ * are not plain records. The redaction keeps those values as they are, because
+ * rebuilding them would lose their prototype or their data.
+ */
+function isPlainRecord(value: object): boolean {
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+/**
+ * The registry of the run context is a list of entries. Every entry carries a
+ * fingerprint and the encrypted material of a registered secret. The redaction
+ * keeps the registry, because the run reads it later. It keeps the registry
+ * only in that shape, so that a map that hides under the same key is redacted
+ * like any other value.
+ */
+function looksLikeSecretRedactionRegistry(value: unknown): boolean {
+  if (!Array.isArray(value)) return false;
+  return value.every((entry) => {
+    if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
+      return false;
+    }
+    const record = entry as Record<string, unknown>;
+    return (
+      typeof record.fingerprintSha256 === "string" &&
+      typeof record.material === "object" &&
+      record.material !== null
+    );
+  });
+}
+
+/**
+ * The registry of the run context is exempt from the redaction, at the top
+ * level of the value only. A key of that name below the top level is data, and
+ * the redaction walks it.
+ */
+function isSecretRedactionRegistry(
+  key: string,
+  depth: number,
+  value: unknown,
+): boolean {
+  if (depth !== 0) return false;
+  if (key !== RUN_SECRET_REDACTION_REGISTRY_KEY) return false;
+  return looksLikeSecretRedactionRegistry(value);
+}
+
+/**
+ * Redact a value that sits below the depth limit. The value is kept, because
+ * dropping it would lose data. The text of the value is checked with the same
+ * rule, so a credential that hides below the depth limit is still removed.
+ * The value is marked as not inspected, because its structure was not walked.
+ */
+function redactBelowDepthLimit(value: unknown): unknown {
+  if (typeof value === "string") return redactPersistedRunText(value);
+  if (value === null || value === undefined || typeof value !== "object") {
+    return value;
+  }
+  let text: string | null = null;
+  try {
+    text = JSON.stringify(value);
+  } catch {
+    text = null;
+  }
+  if (typeof text !== "string") return markNotInspected(value);
+  const redactedText = redactPersistedRunText(text);
+  if (redactedText === text) return markNotInspected(value);
+  try {
+    return markNotInspected(JSON.parse(redactedText));
+  } catch {
+    return markNotInspected(value);
+  }
+}
+
+/**
  * Redact every string inside a value that Paperclip stores in the board
  * database. The function walks objects and arrays. It keeps numbers, booleans
  * and null values. It stops at a fixed depth. A value below that depth is
- * dropped.
+ * kept, and it is marked as not inspected.
  */
 export function redactPersistedRunOutput(value: unknown, depth = 0): unknown {
   if (typeof value === "string") return redactPersistedRunText(value);
   if (value === null || value === undefined) return value;
   if (typeof value !== "object") return value;
-  if (depth >= MAX_REDACTED_RUN_OUTPUT_DEPTH) return null;
   // A date carries no redactable text. Rebuilding it with object entries
   // would turn it into an empty object.
   if (value instanceof Date) return value;
+  if (depth >= MAX_REDACTED_RUN_OUTPUT_DEPTH) {
+    return redactBelowDepthLimit(value);
+  }
   if (Array.isArray(value)) {
     return value.map((item) => redactPersistedRunOutput(item, depth + 1));
   }
+  if (!isPlainRecord(value)) {
+    // A class instance, a typed array, a map or a set. The redaction keeps the
+    // value, because rebuilding it would lose its prototype or its data. It
+    // marks the value, because the structure below it was not walked.
+    return markNotInspected(value);
+  }
   const record = value as Record<string, unknown>;
-  return Object.fromEntries(
-    Object.entries(record).map(([key, item]) => [
-      key,
-      key === RUN_SECRET_REDACTION_REGISTRY_KEY
-        ? item
-        : redactPersistedRunOutput(item, depth + 1),
-    ]),
-  );
+  const entries = Object.entries(record).map(([key, item]): [string, unknown] => [
+    key,
+    isSecretRedactionRegistry(key, depth, item)
+      ? item
+      : redactPersistedRunOutput(item, depth + 1),
+  ]);
+  if (Object.getPrototypeOf(record) === null) {
+    // An object without a prototype keeps that prototype.
+    const copy: Record<string, unknown> = Object.create(null);
+    for (const [key, item] of entries) copy[key] = item;
+    return copy;
+  }
+  return Object.fromEntries(entries);
+}
+
+/**
+ * Redact the context snapshot of a run before Paperclip stores it. The
+ * snapshot carries the issue, the wake comment and the task markdown of the
+ * run. A credential pasted into any of them reaches the column as it is, so
+ * the snapshot is redacted with the same rule as the run output.
+ */
+export function redactContextSnapshotForPersistence<T>(value: T): T {
+  if (value === null || value === undefined) return value;
+  return redactPersistedRunOutput(value) as T;
 }
 
 /** Redact the result object of an adapter before Paperclip stores it. */

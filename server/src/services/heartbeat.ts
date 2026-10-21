@@ -293,12 +293,15 @@ import { normalizeResponsibleUserDenialCode } from "./responsible-user-denial-ru
 import { getRunLogStore, type RunLogHandle } from "./run-log-store.js";
 import {
   redactAdapterResultForPersistence,
+  redactContextSnapshotForPersistence,
   redactPersistedRunOutput,
+  redactPersistedRunText,
   redactPersistedRunTextOrNull,
 } from "./run-output-redaction.js";
 import {
+  resolveSeatSessionStorePath,
   scrubSeatStoreInPlace,
-  seatSessionStorePathForAgent,
+  type SeatStoreScrubOutcome,
 } from "./seat-store-redaction.js";
 import {
   providerTraceStore,
@@ -3754,7 +3757,12 @@ export function compactRunLogChunk(
   chunk: string,
   maxChars = MAX_PERSISTED_LOG_CHUNK_CHARS,
 ) {
-  const normalized = redactSensitiveText(redactInlineBase64ImageData(chunk));
+  // The run log is stored. A seat that printed its environment wrote the raw
+  // token into the log. The chunk is redacted with the rule of the runner,
+  // which finds a credential in every shape that the output can take.
+  const normalized = redactPersistedRunText(
+    redactInlineBase64ImageData(chunk),
+  );
   if (normalized.length <= maxChars) return normalized;
 
   const headChars = Math.max(0, Math.floor(maxChars * 0.6));
@@ -3762,6 +3770,123 @@ export function compactRunLogChunk(
   const omittedChars = Math.max(0, normalized.length - headChars - tailChars);
   const marker = `\n[paperclip truncated run log chunk: omitted ${omittedChars} chars]\n`;
   return `${normalized.slice(0, headChars)}${marker}${normalized.slice(normalized.length - tailChars)}`;
+}
+
+/**
+ * Redact the context snapshot of a run patch before the board database stores
+ * it. The snapshot carries the issue, the wake comment and the task markdown
+ * of the run. A credential pasted into any of them reaches the column as it
+ * is, because the registered secret keys do not hold the board credential.
+ * The run keeps its own copy in memory, so the seat still reads the text that
+ * it was given.
+ */
+function redactHeartbeatRunPatch(
+  patch: Partial<typeof heartbeatRuns.$inferInsert> | undefined,
+): Partial<typeof heartbeatRuns.$inferInsert> | undefined {
+  if (!patch) return patch;
+  const contextSnapshot = patch.contextSnapshot;
+  if (!contextSnapshot) return patch;
+  return {
+    ...patch,
+    contextSnapshot: redactContextSnapshotForPersistence(contextSnapshot),
+  };
+}
+
+/**
+ * Redact the credential values in the session store of a seat, after a run.
+ * The store is the copy of the run that the seat keeps. A seat that printed
+ * its environment wrote the raw token into that store, so the store is
+ * scrubbed here, on the success path and on the failure path.
+ *
+ * The scrub never removes a row: the value is redacted in place. A seat that
+ * runs writes to that store while it runs, so the scrub waits until no run of
+ * the seat is writing. A seat whose store path is unknown is reported, so the
+ * reader of the log knows that the seat was not scrubbed.
+ */
+async function scrubSeatSessionStoreAfterRun(
+  db: Db,
+  run: { id: string },
+  agent: { id: string; adapterConfig: unknown },
+): Promise<SeatStoreScrubOutcome> {
+  const resolved = resolveSeatSessionStorePath(agent.adapterConfig);
+  if (!resolved.store) {
+    logger.warn(
+      { runId: run.id, agentId: agent.id, reason: resolved.reason },
+      "the session store of the seat is unknown, the seat was not scrubbed",
+    );
+    return {
+      store: null,
+      scrubbed: false,
+      notScrubbed: true,
+      reason: resolved.reason,
+      counts: null,
+    };
+  }
+  const seatStore = resolved.store;
+  try {
+    const busy = await db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.agentId, agent.id),
+          eq(heartbeatRuns.status, "running"),
+          ne(heartbeatRuns.id, run.id),
+        ),
+      );
+    if (busy.length > 0) {
+      logger.info(
+        { runId: run.id, agentId: agent.id, store: seatStore },
+        "the seat of the run is busy, the session store is left alone",
+      );
+      return {
+        store: seatStore,
+        scrubbed: false,
+        notScrubbed: true,
+        reason: "the seat of the run is busy",
+        counts: null,
+      };
+    }
+    // The automatic scrub never removes a row. The brief says that the value
+    // is redacted in place.
+    const seatCounts = scrubSeatStoreInPlace(seatStore, {
+      dropUnrepairable: false,
+      allowRowDeletion: false,
+    });
+    if (seatCounts.fieldsChanged > 0 || seatCounts.skipped) {
+      logger.info(
+        {
+          runId: run.id,
+          agentId: agent.id,
+          store: seatStore,
+          valuesScanned: seatCounts.valuesScanned,
+          fieldsChanged: seatCounts.fieldsChanged,
+          rowsChanged: seatCounts.rowsChanged,
+          skipped: seatCounts.skipped,
+        },
+        "redacted credential values from the session store of the seat",
+      );
+    }
+    return {
+      store: seatStore,
+      scrubbed: seatCounts.skipped === null,
+      notScrubbed: seatCounts.skipped !== null,
+      reason: seatCounts.skipped,
+      counts: seatCounts,
+    };
+  } catch (err) {
+    logger.warn(
+      { err, runId: run.id, agentId: agent.id },
+      "failed to redact the session store of the seat",
+    );
+    return {
+      store: seatStore,
+      scrubbed: false,
+      notScrubbed: true,
+      reason: err instanceof Error ? err.message : String(err),
+      counts: null,
+    };
+  }
 }
 
 function normalizeMaxConcurrentRuns(value: unknown) {
@@ -12959,6 +13084,10 @@ export function heartbeatService(
     status: string,
     patch?: Partial<typeof heartbeatRuns.$inferInsert>,
   ) {
+    // The context snapshot of a patch is stored. It is redacted before the
+    // write, so a credential that came with the issue, the wake comment or
+    // the task markdown never reaches the column.
+    patch = redactHeartbeatRunPatch(patch);
     const previousStatus = await db
       .select()
       .from(heartbeatRuns)
@@ -13045,6 +13174,10 @@ export function heartbeatService(
     patch?: Partial<typeof heartbeatRuns.$inferInsert>,
     failureReport?: RunFailureReportOptions,
   ) {
+    // The context snapshot of a patch is stored. It is redacted before the
+    // write, so a credential that came with the issue, the wake comment or
+    // the task markdown never reaches the column.
+    patch = redactHeartbeatRunPatch(patch);
     // fromStatuses can name a terminal status as its own source (for example,
     // an idempotent "still failed" patch), so the write below is not always a
     // genuine transition. Read the pre-write status to tell the two apart.
@@ -13969,8 +14102,11 @@ export function heartbeatService(
   ) {
     const eventAt = new Date();
     const currentUserRedactionOptions = await getCurrentUserRedactionOptions();
+    // The run event is stored. A seat that printed its environment wrote the
+    // raw token into the event. The message and the payload are redacted with
+    // the rule of the runner, which finds a credential in every shape.
     const sanitizedMessage = event.message
-      ? redactSensitiveText(
+      ? redactPersistedRunText(
           redactCurrentUserText(event.message, currentUserRedactionOptions),
         )
       : event.message;
@@ -13980,12 +14116,17 @@ export function heartbeatService(
     const secretSanitizedPayload = boundedPayload
       ? redactEventPayload(boundedPayload)
       : boundedPayload;
-    const sanitizedPayload = secretSanitizedPayload
+    const currentUserSanitizedPayload = secretSanitizedPayload
       ? redactCurrentUserValue(
           secretSanitizedPayload,
           currentUserRedactionOptions,
         )
       : secretSanitizedPayload;
+    const sanitizedPayload = currentUserSanitizedPayload
+      ? (redactPersistedRunOutput(currentUserSanitizedPayload) as
+          | Record<string, unknown>
+          | undefined)
+      : currentUserSanitizedPayload;
     const issueId = readRuntimeStatusIssueIdCandidate(run) ?? null;
     const progress = buildRunEventRuntimeProgress({
       eventType: event.eventType,
@@ -14316,7 +14457,7 @@ export function heartbeatService(
           triggerDetail: "system",
           status: "queued",
           wakeupRequestId: wakeupRequest.id,
-          contextSnapshot: retryContextSnapshot,
+          contextSnapshot: redactContextSnapshotForPersistence(retryContextSnapshot),
           responsibleUserId,
           sessionIdBefore: sessionBefore,
           retryOfRunId: run.id,
@@ -16113,7 +16254,7 @@ export function heartbeatService(
             triggerDetail: "system",
             status: "scheduled_retry",
             wakeupRequestId: wakeupRequest.id,
-            contextSnapshot: retryContextSnapshot,
+            contextSnapshot: redactContextSnapshotForPersistence(retryContextSnapshot),
             ...(hasConversationContinuationPolicy(run.resultJson)
               ? { resultJson: { conversationContinuation: CONVERSATION_CONTINUATION_POLICY } } : {}),
             responsibleUserId,
@@ -16743,7 +16884,7 @@ export function heartbeatService(
         .update(heartbeatRuns)
         .set({
           scheduledRetryAt: now,
-          contextSnapshot,
+          contextSnapshot: redactContextSnapshotForPersistence(contextSnapshot),
           updatedAt: now,
         })
         .where(
@@ -17937,9 +18078,11 @@ export function heartbeatService(
                     ...legacyControllerClaim(run.runtimeMode),
                   responsibleUserId,
                   startedAt: lockedRun.startedAt ?? claimedAt,
-                  contextSnapshot: withQueuedCommentIdsInRunContext(
-                    lockedRun.contextSnapshot,
-                    liveIds,
+                  contextSnapshot: redactContextSnapshotForPersistence(
+                    withQueuedCommentIdsInRunContext(
+                      lockedRun.contextSnapshot,
+                      liveIds,
+                    ),
                   ),
                   updatedAt: claimedAt,
                 })
@@ -21051,7 +21194,7 @@ export function heartbeatService(
           // A retry must retain the original run-key affinity even if the host
           // crashes after committing a pin but before recording its selection.
           if (routerTaskKey !== run.contextSnapshot?.aiRouterTaskKey) {
-            await db.update(heartbeatRuns).set({ contextSnapshot: sql`coalesce(${heartbeatRuns.contextSnapshot}, '{}'::jsonb) || ${JSON.stringify({ aiRouterTaskKey: routerTaskKey })}::jsonb` }).where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, agent.companyId)));
+            await db.update(heartbeatRuns).set({ contextSnapshot: sql`coalesce(${heartbeatRuns.contextSnapshot}, '{}'::jsonb) || ${redactPersistedRunText(JSON.stringify({ aiRouterTaskKey: routerTaskKey }))}::jsonb` }).where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, agent.companyId)));
           }
           context.aiRouterTaskKey = routerTaskKey;
           const savedIdentity = taskSession?.sessionParamsJson?.paperclipAiCredentialIdentity;
@@ -21069,7 +21212,7 @@ export function heartbeatService(
           if (issueAssigneeOverrides) issueAssigneeOverrides = { ...issueAssigneeOverrides, adapterConfig: applyAiConnectionRouterTaskSettings(issueAssigneeOverrides.adapterConfig ?? {}, selection) };
           agent = { ...agent, adapterConfig: config };
           context.aiRouterSelection = selection;
-          await db.update(heartbeatRuns).set({ contextSnapshot: sql`coalesce(${heartbeatRuns.contextSnapshot}, '{}'::jsonb) || ${JSON.stringify({ aiRouterTaskKey: context.aiRouterTaskKey, aiRouterSelection: selection })}::jsonb` }).where(eq(heartbeatRuns.id, run.id));
+          await db.update(heartbeatRuns).set({ contextSnapshot: sql`coalesce(${heartbeatRuns.contextSnapshot}, '{}'::jsonb) || ${redactPersistedRunText(JSON.stringify({ aiRouterTaskKey: context.aiRouterTaskKey, aiRouterSelection: selection }))}::jsonb` }).where(eq(heartbeatRuns.id, run.id));
           await appendRunEvent(run, { eventType: "lifecycle", stream: "system", level: "info", message: "Using task-pinned pool account", payload: { poolId: selection.poolId, memberId: selection.memberId, provider: aiBinding.provider, model: config.model, notes: selection.notes } });
         } catch (error) {
           if (error instanceof AiConnectionPoolExhausted && !routerHasPersistedInput) {
@@ -21850,7 +21993,7 @@ export function heartbeatService(
         Object.assign(resolvedConfig, managedAiRuntime.config);
         for (const key of AI_AUTH_ENV_KEYS) secretKeys.add(key);
         context.aiConnection = { ...managedAiRuntime.attribution, accountName: managedAiRuntime.accountName, identity: managedAiRuntime.identity, sessionIdentity: managedAiRuntime.sessionIdentity };
-        await db.update(heartbeatRuns).set({ contextSnapshot: sql`coalesce(${heartbeatRuns.contextSnapshot}, '{}'::jsonb) || ${JSON.stringify({ aiConnection: context.aiConnection, ...(context.aiRouterTaskKey ? { aiRouterTaskKey: context.aiRouterTaskKey } : {}), ...(context.aiRouterSelection ? { aiRouterSelection: context.aiRouterSelection } : {}) })}::jsonb` }).where(eq(heartbeatRuns.id, run.id));
+        await db.update(heartbeatRuns).set({ contextSnapshot: sql`coalesce(${heartbeatRuns.contextSnapshot}, '{}'::jsonb) || ${redactPersistedRunText(JSON.stringify({ aiConnection: context.aiConnection, ...(context.aiRouterTaskKey ? { aiRouterTaskKey: context.aiRouterTaskKey } : {}), ...(context.aiRouterSelection ? { aiRouterSelection: context.aiRouterSelection } : {}) }))}::jsonb` }).where(eq(heartbeatRuns.id, run.id));
       }
       if (secretManifest.length > 0) {
         context.paperclipSecrets = {
@@ -22720,7 +22863,7 @@ export function heartbeatService(
         await db
           .update(heartbeatRuns)
           .set({
-            contextSnapshot: context,
+            contextSnapshot: redactContextSnapshotForPersistence(context),
             updatedAt: new Date(),
           })
           .where(eq(heartbeatRuns.id, run.id));
@@ -23091,7 +23234,7 @@ export function heartbeatService(
       await db
         .update(heartbeatRuns)
         .set({
-          contextSnapshot: context,
+          contextSnapshot: redactContextSnapshotForPersistence(context),
           updatedAt: new Date(),
         })
         .where(eq(heartbeatRuns.id, run.id));
@@ -23384,7 +23527,7 @@ export function heartbeatService(
             startedAt,
             sessionIdBefore:
               runtimeForAdapter.sessionDisplayId ?? runtimeForAdapter.sessionId,
-            contextSnapshot: context,
+            contextSnapshot: redactContextSnapshotForPersistence(context),
             updatedAt: new Date(),
           })
           .where(eq(heartbeatRuns.id, run.id))
@@ -23606,7 +23749,7 @@ export function heartbeatService(
           await db
             .update(heartbeatRuns)
             .set({
-              contextSnapshot: context,
+              contextSnapshot: redactContextSnapshotForPersistence(context),
               updatedAt: new Date(),
             })
             .where(eq(heartbeatRuns.id, run.id));
@@ -25493,7 +25636,7 @@ export function heartbeatService(
           await db
             .update(heartbeatRuns)
             .set({
-              contextSnapshot: context,
+              contextSnapshot: redactContextSnapshotForPersistence(context),
               updatedAt: new Date(),
             })
             .where(eq(heartbeatRuns.id, run.id));
@@ -25796,51 +25939,7 @@ export function heartbeatService(
         // that store. The copy of the board is redacted above. This removes
         // the copy that the seat keeps, so a backup of the seat home holds no
         // raw value either.
-        try {
-          const seatStore = seatSessionStorePathForAgent(agent.adapterConfig);
-          if (seatStore) {
-            // A seat that runs writes to that store while it runs. The scrub
-            // waits until no run of the seat is writing, so it never writes
-            // under a seat that is writing.
-            const busy = await db
-              .select({ id: heartbeatRuns.id })
-              .from(heartbeatRuns)
-              .where(
-                and(
-                  eq(heartbeatRuns.agentId, agent.id),
-                  eq(heartbeatRuns.status, "running"),
-                  ne(heartbeatRuns.id, run.id),
-                ),
-              );
-            if (busy.length > 0) {
-              logger.info(
-                { runId: run.id, agentId: agent.id, store: seatStore },
-                "the seat of the run is busy, the session store is left alone",
-              );
-            } else {
-              const seatCounts = scrubSeatStoreInPlace(seatStore);
-              if (seatCounts.fieldsChanged > 0 || seatCounts.skipped) {
-                logger.info(
-                  {
-                    runId: run.id,
-                    agentId: agent.id,
-                    store: seatStore,
-                    valuesScanned: seatCounts.valuesScanned,
-                    fieldsChanged: seatCounts.fieldsChanged,
-                    rowsChanged: seatCounts.rowsChanged,
-                    skipped: seatCounts.skipped,
-                  },
-                  "redacted credential values from the session store of the seat",
-                );
-              }
-            }
-          }
-        } catch (err) {
-          logger.warn(
-            { err, runId: run.id, agentId: agent.id },
-            "failed to redact the session store of the seat",
-          );
-        }
+        await scrubSeatSessionStoreAfterRun(db, run, agent);
 
         await setWakeupStatus(
           run.wakeupRequestId,
@@ -26344,9 +26443,16 @@ export function heartbeatService(
         // A process adapter may throw while its owned Stop is joining the
         // child. Let the cancellation write settle before attempting failure.
         await processRunCancellationSettlements.get(run.id)?.settled;
-        const message = redactCurrentUserText(
-          err instanceof Error ? err.message : "Unknown adapter failure",
-          await getCurrentUserRedactionOptions(),
+        // The failure text reaches the run row, the result of the run, the
+        // wakeup request, the run event, the session and the agent status. A
+        // seat that printed its environment wrote the raw token into the
+        // error, so the failure text is redacted with the rule of the runner
+        // before it is stored.
+        const message = redactPersistedRunText(
+          redactCurrentUserText(
+            err instanceof Error ? err.message : "Unknown adapter failure",
+            await getCurrentUserRedactionOptions(),
+          ),
         );
         const workspaceValidationFailure = isWorkspaceValidationFailure(err)
           ? err
@@ -26561,6 +26667,11 @@ export function heartbeatService(
             Boolean(nonRetryablePreflightFailureCode(err)) ||
             isWorkspaceSyncConflictFailure(message),
         });
+
+        // The run failed, so the seat may hold a raw credential in its own
+        // session store. The store is scrubbed here as well, so a failed run
+        // leaves no raw value behind.
+        await scrubSeatSessionStoreAfterRun(db, run, agent);
       }
     } catch (outerErr) {
       if (
@@ -26601,11 +26712,18 @@ export function heartbeatService(
       } else {
         // Setup code before adapter.execute threw (e.g. ensureRuntimeState, resolveWorkspaceForRun).
         // The inner catch did not fire, so we must record the failure here.
-        const message = redactCurrentUserText(
-          outerErr instanceof Error
-            ? outerErr.message
-            : "Unknown setup failure",
-          await getCurrentUserRedactionOptions(),
+        // The failure text reaches the run row, the result of the run, the
+        // wakeup request, the run event and the agent status. A seat that
+        // printed its environment wrote the raw token into the error, so the
+        // failure text is redacted with the rule of the runner before it is
+        // stored.
+        const message = redactPersistedRunText(
+          redactCurrentUserText(
+            outerErr instanceof Error
+              ? outerErr.message
+              : "Unknown setup failure",
+            await getCurrentUserRedactionOptions(),
+          ),
         );
         // A missing secret/env binding is a known pre-dispatch configuration gap,
         // not an opaque setup crash. Surface it with its own errorCode so the
@@ -26814,6 +26932,14 @@ export function heartbeatService(
             keepIdleOnFailure: Boolean(nonRetryablePreflightCode),
           }).catch(() => undefined);
         }
+
+        // The run failed before the provider ran, so the seat may still hold
+        // a raw credential in its own session store. The store is scrubbed
+        // here as well, so a failed run leaves no raw value behind.
+        await scrubSeatSessionStoreAfterRun(db, run, {
+          id: run.agentId,
+          adapterConfig: setupFailureAgent?.adapterConfig ?? null,
+        });
       }
     } finally {
       await nativeInstructionReservation?.release().catch(error => logger.warn({ runId: run.id, err: error }, "Managed warm session preparation cleanup failed"));
@@ -29046,12 +29172,14 @@ export function heartbeatService(
               retryOfRunId: failedChatRetry
                 ? durableRequest!.failedRunRetry!.failedRunId
                 : opts.failedRunId ?? automaticParentRunId,
-              contextSnapshot: adoptedComments.length
-                ? withQueuedCommentIdsInRunContext(
-                    enrichedContextSnapshot,
-                    adoptedCommentIds,
-                  )
-                : enrichedContextSnapshot,
+              contextSnapshot: redactContextSnapshotForPersistence(
+                adoptedComments.length
+                  ? withQueuedCommentIdsInRunContext(
+                      enrichedContextSnapshot,
+                      adoptedCommentIds,
+                    )
+                  : enrichedContextSnapshot,
+              ),
               sessionIdBefore: explicitContinuation ? null : sessionBefore,
               continuationAttempt,
               ...(reconciledSourceRunId
@@ -29183,7 +29311,7 @@ export function heartbeatService(
       Boolean(sameScopeRunningRun) &&
       !sameScopeQueuedRun &&
       shouldQueueFollowupForRunningIssueWake({
-        contextSnapshot: enrichedContextSnapshot,
+        contextSnapshot: redactContextSnapshotForPersistence(enrichedContextSnapshot),
         wakeCommentId,
       });
     // Unscoped manual wakes need their own receipt and execution identity too.
@@ -29214,7 +29342,7 @@ export function heartbeatService(
       const mergedRun = await db
         .update(heartbeatRuns)
         .set({
-          contextSnapshot: mergedContextSnapshot,
+          contextSnapshot: redactContextSnapshotForPersistence(mergedContextSnapshot),
           updatedAt: new Date(),
         })
         .where(eq(heartbeatRuns.id, coalescedTargetRun.id))
@@ -29315,7 +29443,7 @@ export function heartbeatService(
           status: "queued",
           responsibleUserId: await resolveQueuedResponsibleUserId(),
           wakeupRequestId: wakeupRequest.id,
-          contextSnapshot: enrichedContextSnapshot,
+          contextSnapshot: redactContextSnapshotForPersistence(enrichedContextSnapshot),
           sessionIdBefore: sessionBefore,
           continuationAttempt,
         })

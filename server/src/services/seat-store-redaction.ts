@@ -124,6 +124,12 @@ export type SeatStoreScrubOptions = {
   repair?: boolean;
   /** Remove the rows that the repair could not fix. */
   dropUnrepairable?: boolean;
+  /**
+   * Allow the removal of rows. The automatic scrub never removes a row: the
+   * brief says that the value is redacted in place. Only a manual repair run
+   * sets this flag, and it reports every removed row by count.
+   */
+  allowRowDeletion?: boolean;
   /** The tables that a removal may touch. */
   dropTables?: string[];
   /** The store belongs to a seat that is running. The store is left alone. */
@@ -605,7 +611,11 @@ function repairColumn(
   counts: SeatStoreScrubCounts,
   tableCounts: SeatStoreScrubCounts["perTable"][number],
   dryRun: boolean,
-  options: { dropUnrepairable: boolean; dropAllowed: boolean },
+  options: {
+    dropUnrepairable: boolean;
+    dropAllowed: boolean;
+    allowRowDeletion: boolean;
+  },
 ): void {
   let fromRowId = 0;
   for (;;) {
@@ -654,7 +664,14 @@ function repairColumn(
 
       counts.unrepairable += 1;
       tableCounts.unrepairable += 1;
-      if (options.dropUnrepairable && options.dropAllowed) {
+      // The automatic scrub never removes a row. The brief says that the
+      // value is redacted in place. Only a manual repair run may remove a row,
+      // and it reports every removed row by count.
+      if (
+        options.dropUnrepairable &&
+        options.dropAllowed &&
+        options.allowRowDeletion
+      ) {
         removals.push({ rid, previous: row.value });
       }
     }
@@ -737,6 +754,7 @@ export function scrubSeatStoreInPlace(
   const full = options.full === true;
   const repair = options.repair === true;
   const dropUnrepairable = options.dropUnrepairable === true;
+  const allowRowDeletion = options.allowRowDeletion === true;
   const dropTables = new Set(options.dropTables ?? ["session_message"]);
   const counts: SeatStoreScrubCounts = {
     store: storePath,
@@ -819,6 +837,7 @@ export function scrubSeatStoreInPlace(
             repairColumn(db, table.name, column.name, counts, tableCounts, dryRun, {
               dropUnrepairable,
               dropAllowed: dropTables.has(table.name),
+              allowRowDeletion,
             });
           }
         }
@@ -903,10 +922,96 @@ export function seatDataHome(env: Record<string, unknown> | null | undefined): s
 export function seatSessionStorePathForAgent(
   adapterConfig: unknown,
 ): string {
-  if (!adapterConfig || typeof adapterConfig !== "object") return "";
+  return resolveSeatSessionStorePath(adapterConfig).store ?? "";
+}
+
+/**
+ * The outcome of a scrub of the session store of a seat.
+ */
+export type SeatStoreScrubOutcome = {
+  /** The path of the store, or null when the path is unknown. */
+  store: string | null;
+  /** The store was read. */
+  scrubbed: boolean;
+  /** The seat was not scrubbed. The reason says why. */
+  notScrubbed: boolean;
+  /** Why the seat was not scrubbed. */
+  reason: string | null;
+  /** The counts of the pass. Null when the pass did not run. */
+  counts: SeatStoreScrubCounts | null;
+};
+
+/**
+ * The session store of a seat, and the reason when the path is unknown. The
+ * path is unknown when the agent has no adapter configuration, or when that
+ * configuration holds no data home for the seat.
+ */
+export function resolveSeatSessionStorePath(adapterConfig: unknown): {
+  store: string | null;
+  reason: string | null;
+} {
+  if (!adapterConfig || typeof adapterConfig !== "object") {
+    return {
+      store: null,
+      reason: "the agent has no adapter configuration",
+    };
+  }
   const env = (adapterConfig as { env?: unknown }).env;
-  if (!env || typeof env !== "object") return "";
-  return seatSessionStorePath(seatDataHome(env as Record<string, unknown>));
+  if (!env || typeof env !== "object") {
+    return {
+      store: null,
+      reason: "the adapter configuration of the agent has no environment",
+    };
+  }
+  const dataHome = seatDataHome(env as Record<string, unknown>);
+  if (!dataHome) {
+    return {
+      store: null,
+      reason: "the environment of the agent has no data home",
+    };
+  }
+  const store = seatSessionStorePath(dataHome);
+  if (!store) {
+    return {
+      store: null,
+      reason: "the data home of the agent is empty",
+    };
+  }
+  return { store, reason: null };
+}
+
+/**
+ * Scrub the session store of a seat, from the adapter configuration of the
+ * agent. The function reports a seat that it could not scrub, so the caller
+ * logs it and counts it. It never removes a row: the brief says that the
+ * value is redacted in place.
+ */
+export function scrubSeatSessionStoreForAgent(
+  adapterConfig: unknown,
+  options: SeatStoreScrubOptions = {},
+): SeatStoreScrubOutcome {
+  const resolved = resolveSeatSessionStorePath(adapterConfig);
+  if (!resolved.store) {
+    return {
+      store: null,
+      scrubbed: false,
+      notScrubbed: true,
+      reason: resolved.reason,
+      counts: null,
+    };
+  }
+  const counts = scrubSeatStoreInPlace(resolved.store, {
+    ...options,
+    dropUnrepairable: false,
+    allowRowDeletion: false,
+  });
+  return {
+    store: resolved.store,
+    scrubbed: counts.skipped === null,
+    notScrubbed: counts.skipped !== null,
+    reason: counts.skipped,
+    counts,
+  };
 }
 
 /**

@@ -18,6 +18,7 @@ import { issueService } from "../issues.js";
 import { issueRecoveryActionService } from "../issue-recovery-actions.js";
 import { buildExecutionContinuation } from "../execution-continuation.js";
 import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
+import { redactContextSnapshotForPersistence } from "../run-output-redaction.js";
 
 export const NATIVE_SAFE_REPLACEMENT_REASON = "native_safe_replacement";
 const record = (v: unknown): Record<string, unknown> =>
@@ -411,7 +412,7 @@ export async function reconcileSafeNativeReplacements(
           executionStatusDeliveryId: randomUUID(),
           wakeupRequestId: wake!.id,
           responsibleUserId: run.responsibleUserId,
-          contextSnapshot: context,
+          contextSnapshot: redactContextSnapshotForPersistence(context),
           retryOfRunId: run.id,
           scheduledRetryAt: dueAt,
           scheduledRetryAttempt: current.attempt,

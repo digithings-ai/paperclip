@@ -1,11 +1,18 @@
 import { describe, expect, it } from "vitest";
 import {
+  NOT_INSPECTED_RUN_OUTPUT_VALUE,
   redactAdapterResultForPersistence,
+  redactContextSnapshotForPersistence,
   redactPersistedRunOutput,
   redactPersistedRunText,
 } from "./run-output-redaction.js";
 
 const JWT = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJhZ2VudCIsInNjb3BlIjoiYWdlbnQ6cnVuIn0.c2lnbmF0dXJlLXZhbHVl";
+const REGISTRY_KEY = "paperclipSecretRedactions";
+const REGISTRY_ENTRY = {
+  fingerprintSha256: "abc123",
+  material: { ciphertext: "encrypted-material", version: 3 },
+};
 
 describe("redactPersistedRunText", () => {
   it("removes the value of a secret assignment and keeps the name", () => {
@@ -105,19 +112,81 @@ describe("redactPersistedRunOutput", () => {
     expect(redacted).toEqual({ exitCode: 0, timedOut: false, missing: null });
   });
 
-  it("drops a value below the depth limit", () => {
-    let deep: unknown = "PAPERCLIP_API_KEY=secret";
+  it("keeps a value below the depth limit and marks it as not inspected", () => {
+    let deep: unknown = `PAPERCLIP_API_KEY=${JWT}`;
     for (let index = 0; index < 40; index += 1) deep = { deep };
-    const redacted = JSON.stringify(redactPersistedRunOutput(deep));
-    expect(redacted).not.toContain("PAPERCLIP_API_KEY");
+    const text = JSON.stringify(redactPersistedRunOutput(deep));
+    expect(text).not.toContain(JWT);
+    // The value is kept, and it is marked, because its structure was not walked.
+    expect(text).toContain(NOT_INSPECTED_RUN_OUTPUT_VALUE);
+    expect(text).toContain("deep");
   });
 
   it("keeps the secret registry of the run context", () => {
-    const registry = { fingerprintSha256: "abc123", material: "encrypted-material" };
     const redacted = redactPersistedRunOutput({
-      paperclipSecretRedactions: [registry],
-    }) as { paperclipSecretRedactions: unknown[] };
-    expect(redacted.paperclipSecretRedactions).toEqual([registry]);
+      [REGISTRY_KEY]: [REGISTRY_ENTRY],
+    }) as { [REGISTRY_KEY]: unknown[] };
+    expect(redacted[REGISTRY_KEY]).toEqual([REGISTRY_ENTRY]);
+  });
+
+  it("redacts a registry key that hides below the top level", () => {
+    const redacted = redactPersistedRunOutput({
+      nested: {
+        [REGISTRY_KEY]: [
+          { fingerprintSha256: "abc123", material: { value: JWT } },
+        ],
+      },
+    }) as { nested: Record<string, unknown> };
+    expect(JSON.stringify(redacted)).not.toContain(JWT);
+  });
+
+  it("redacts a top level registry key that does not carry the registry shape", () => {
+    const redacted = redactPersistedRunOutput({
+      [REGISTRY_KEY]: { value: JWT },
+    }) as Record<string, unknown>;
+    expect(JSON.stringify(redacted)).not.toContain(JWT);
+  });
+
+  it("keeps a value that is not a plain record", () => {
+    class Instance {
+      constructor(readonly value: string) {}
+    }
+    const instance = new Instance(`PAPERCLIP_API_KEY=${JWT}`);
+    const redacted = redactPersistedRunOutput({ instance }) as Record<string, unknown>;
+    const marked = redacted.instance as Record<string, unknown>;
+    expect(marked[NOT_INSPECTED_RUN_OUTPUT_VALUE]).toBe(true);
+    // The value keeps its prototype and its data.
+    expect(marked.value).toBeInstanceOf(Instance);
+    expect((marked.value as Instance).value).toContain("PAPERCLIP_API_KEY=");
+  });
+});
+
+describe("redactContextSnapshotForPersistence", () => {
+  it("removes a credential that an issue carried into the snapshot", () => {
+    const redacted = redactContextSnapshotForPersistence({
+      issueId: "issue-1",
+      paperclipIssue: { description: `set the key to PAPERCLIP_API_KEY=${JWT}` },
+      paperclipWakeComment: { body: `PAPERCLIP_API_KEY=${JWT}` },
+      paperclipTaskMarkdown: `PAPERCLIP_API_KEY=${JWT}`,
+    }) as Record<string, unknown>;
+    const text = JSON.stringify(redacted);
+    expect(text).not.toContain(JWT);
+    expect(redacted.issueId).toBe("issue-1");
+  });
+
+  it("keeps the registry of the run context", () => {
+    const redacted = redactContextSnapshotForPersistence({
+      [REGISTRY_KEY]: [REGISTRY_ENTRY],
+    }) as { [REGISTRY_KEY]: unknown[] };
+    expect(redacted[REGISTRY_KEY]).toEqual([REGISTRY_ENTRY]);
+  });
+
+  it("keeps a value that carries no text", () => {
+    const redacted = redactContextSnapshotForPersistence({
+      issueId: "issue-1",
+      attempt: 2,
+    });
+    expect(redacted).toEqual({ issueId: "issue-1", attempt: 2 });
   });
 });
 

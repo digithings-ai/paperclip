@@ -491,13 +491,27 @@ audit logging.
 
 The board stores the output of every run. Paperclip removes a credential-shaped
 value from that output before it stores the output. The name of the secret and
-the text around it stay. The run log, the stdout excerpt, and the stderr
-excerpt use the same rule.
+the text around it stay.
+
+One rule covers the sinks of a run:
+
+- The result JSON, the error column, and the error text of a failed run.
+- The run log, the stdout excerpt, and the stderr excerpt.
+- The message and the payload of a run event.
+- The context snapshot of the run, which carries the issue, the wake comment
+  and the task markdown of the run.
 
 The shape check is the one of the runner redactor. A value that follows a JSON
 escape sequence, or that a seat glued to a word, is removed as well. The stored
 output is the JSON event stream of the provider, so a newline in it is still
 the two characters `\` and `n`.
+
+Two sinks of the board are digest-anchored, and the rule does not reach them.
+The stored value of a native run result, and the stored payload of a run event
+that carries a source digest, are hashed, and the hash is compared with the
+stored value on every read. Redacting the stored value would break that
+check. The write path of those sinks keeps the rule; the cleanup script below
+counts the rows it leaves alone and reports them.
 
 If a board already stored run output that holds a credential value, redact the
 stored rows in place:
@@ -513,7 +527,9 @@ DATABASE_URL=postgres://... pnpm --filter @paperclipai/server exec tsx \
 ```
 
 The script works in place. It does not copy the database. It prints counts
-only. Take a backup of the database before you run the script, because a backup
+only. It walks the rows with a keyset cursor on the creation time and the id,
+so a row that is written while the script runs is picked up by a later pass.
+Take a backup of the database before you run the script, because a backup
 of the database holds the old value.
 
 ## Redacted Seat Session Stores
@@ -537,6 +553,12 @@ The rules of the scrub keep it from breaking a store that a seat reads:
   store while it runs.
 - A row that an earlier redaction broke is repaired, and a row that the repair
   cannot fix is counted.
+- The scrub that the server runs at the end of a run never removes a row. It
+  redacts in place. A row that the repair cannot fix is left in place and
+  counted, and the seat that owns the store is reported as not scrubbed.
+- The store of a seat whose store path the server cannot resolve is left
+  alone, and the seat is reported as not scrubbed. A silent pass is not a
+  scrub.
 
 ```sh
 # dry run: prints counts only
@@ -548,7 +570,8 @@ DATABASE_URL=postgres://... pnpm --filter @paperclipai/server exec tsx \
   scripts/redact-seat-store-secrets.ts --repair
 
 # also remove the rows that the repair could not fix, so that the seat reads
-# the session again
+# the session again. This is a manual repair run only. The count of the
+# removed rows is in the report.
 DATABASE_URL=postgres://... pnpm --filter @paperclipai/server exec tsx \
   scripts/redact-seat-store-secrets.ts --repair --drop-unrepairable
 ```

@@ -2,6 +2,7 @@ import { and, asc, eq, inArray, lte, sql } from "drizzle-orm";
 import { agents, agentWakeupRequests, chatCompletionDeliveries as deliveries, chatTaskHandoffs as handoffs,
   heartbeatRuns, issueComments, issueDocuments, issues, type Db } from "@paperclipai/db";
 import { instanceSettingsService } from "./instance-settings.js";
+import { redactContextSnapshotForPersistence } from "./run-output-redaction.js";
 
 export const CHAT_COMPLETION_WAKE_REASON = "chat_task_completed";
 const MAX_ATTEMPTS = 5;
@@ -92,7 +93,7 @@ export async function prepareChatCompletionTurn(db: Db, run: Run): Promise<Run> 
       const children = await tx.select().from(issues).where(and(eq(issues.companyId, run.companyId), eq(issues.parentId, source.id), eq(issues.status, "done"))).orderBy(issues.createdAt).limit(20);
       const contextSnapshot = { ...run.contextSnapshot, onboardingCompletion: true,
         chatCompletionUpdates: await Promise.all(children.map(child => taskResult(tx, child))) };
-      await tx.update(heartbeatRuns).set({ contextSnapshot }).where(eq(heartbeatRuns.id, run.id));
+      await tx.update(heartbeatRuns).set({ contextSnapshot: redactContextSnapshotForPersistence(contextSnapshot) }).where(eq(heartbeatRuns.id, run.id));
       return { ...run, contextSnapshot };
     }
     const initialIds = ids(run);
@@ -118,7 +119,7 @@ export async function prepareChatCompletionTurn(db: Db, run: Run): Promise<Run> 
     }
     if (accepted.length === 0) throw new Error("chat_completion_superseded");
     const contextSnapshot = { ...run.contextSnapshot, chatCompletionDeliveryIds: accepted, chatCompletionUpdates: updates };
-    await tx.update(heartbeatRuns).set({ contextSnapshot }).where(eq(heartbeatRuns.id, run.id));
+    await tx.update(heartbeatRuns).set({ contextSnapshot: redactContextSnapshotForPersistence(contextSnapshot) }).where(eq(heartbeatRuns.id, run.id));
     return { ...run, contextSnapshot };
   });
 }

@@ -3,6 +3,7 @@ import { and, eq, inArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { heartbeatRuns } from "@paperclipai/db";
 import { REDACTED_EVENT_VALUE } from "../redaction.js";
+import { redactContextSnapshotForPersistence } from "./run-output-redaction.js";
 import { getSecretProvider } from "../secrets/provider-registry.js";
 import type { StoredSecretVersionMaterial } from "../secrets/types.js";
 
@@ -112,7 +113,10 @@ export function createRunSecretRedactionRegistry(db: Db) {
           : [];
         await tx.update(heartbeatRuns)
           .set({
-            contextSnapshot: { ...contextSnapshot, [REGISTRY_KEY]: [...currentEntries, entry] },
+            contextSnapshot: redactContextSnapshotForPersistence({
+              ...contextSnapshot,
+              [REGISTRY_KEY]: [...currentEntries, entry],
+            }),
             updatedAt: new Date(),
           })
           .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.id, runId)));
