@@ -494,6 +494,11 @@ value from that output before it stores the output. The name of the secret and
 the text around it stay. The run log, the stdout excerpt, and the stderr
 excerpt use the same rule.
 
+The shape check is the one of the runner redactor. A value that follows a JSON
+escape sequence, or that a seat glued to a word, is removed as well. The stored
+output is the JSON event stream of the provider, so a newline in it is still
+the two characters `\` and `n`.
+
 If a board already stored run output that holds a credential value, redact the
 stored rows in place:
 
