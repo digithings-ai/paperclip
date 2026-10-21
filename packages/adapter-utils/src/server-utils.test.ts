@@ -620,6 +620,95 @@ describe("runChildProcess", () => {
     expect(finishedAt - startedAt).toBeGreaterThanOrEqual(spawnDelayMs);
   });
 
+  it("fails the run instead of throwing when the child exits before reading stdin", async () => {
+    const unhandled: unknown[] = [];
+    const onUncaught = (err: unknown) => {
+      unhandled.push(err);
+    };
+    process.on("uncaughtException", onUncaught);
+    const logged: string[] = [];
+    try {
+      const result = await runChildProcess(
+        randomUUID(),
+        process.execPath,
+        [
+          "-e",
+          "process.stderr.write('Standalone server exited before reporting readiness\\n'); process.exit(1);",
+        ],
+        {
+          cwd: process.cwd(),
+          env: {},
+          stdin: "prompt that the child never reads",
+          timeoutSec: 5,
+          graceSec: 1,
+          onLog: async () => {},
+          onLogError: (_err, _runId, message) => {
+            logged.push(message);
+          },
+          onSpawn: async () => {
+            await new Promise((resolve) => setTimeout(resolve, 100));
+          },
+        },
+      );
+      await new Promise((resolve) => setTimeout(resolve, 30));
+
+      expect(result.exitCode).not.toBe(0);
+      expect(result.stderr).toContain(
+        "Standalone server exited before reporting readiness",
+      );
+      expect(logged.some((message) => message.includes("stdin"))).toBe(true);
+    } finally {
+      process.off("uncaughtException", onUncaught);
+    }
+    expect(unhandled).toEqual([]);
+  });
+
+  it("fails the run when a live child closes stdin before the prompt is written", async () => {
+    const unhandled: unknown[] = [];
+    const onUncaught = (err: unknown) => {
+      unhandled.push(err);
+    };
+    process.on("uncaughtException", onUncaught);
+    const logged: string[] = [];
+    try {
+      const result = await runChildProcess(
+        randomUUID(),
+        process.execPath,
+        [
+          "-e",
+          "const fs = require('fs'); fs.closeSync(0); setTimeout(() => process.exit(0), 500);",
+        ],
+        {
+          cwd: process.cwd(),
+          env: {},
+          stdin: "prompt written after stdin is closed",
+          timeoutSec: 5,
+          graceSec: 1,
+          onLog: async () => {},
+          onLogError: (_err, _runId, message) => {
+            logged.push(message);
+          },
+          onSpawn: async () => {
+            await new Promise((resolve) => setTimeout(resolve, 150));
+          },
+        },
+      );
+      await new Promise((resolve) => setTimeout(resolve, 30));
+
+      expect(result.exitCode).not.toBe(0);
+      expect(result.stderr).toContain("closed before the adapter read its input");
+      expect(
+        logged.some(
+          (message) =>
+            message.includes("EPIPE") || message.includes("ERR_STREAM_DESTROYED"),
+        ),
+      ).toBe(true);
+    } finally {
+      process.off("uncaughtException", onUncaught);
+    }
+    expect(unhandled).toEqual([]);
+  });
+
   it.skipIf(process.platform === "win32")(
     "kills descendant processes on timeout via the process group",
     async () => {

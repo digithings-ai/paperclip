@@ -306,6 +306,23 @@ export function boardChatRoutes(
     // We stream from those deltas for token-by-token rendering and skip the
     // terminal full `assistant` message to avoid duplicating the text.
     let stdoutBuf = "";
+    const noteStdioError = (stream: "stdin" | "stdout" | "stderr", err: Error) => {
+      const code = (err as NodeJS.ErrnoException).code;
+      console.error(`[board/chat/stream ${stream}]`, err);
+      if (code !== "EPIPE" && code !== "ERR_STREAM_DESTROYED") return;
+      if (!res.writable || res.writableEnded) return;
+      res.write(
+        `data: ${JSON.stringify({
+          type: "error",
+          message: "The board assistant exited before reading the prompt.",
+        })}\n\n`,
+      );
+      res.end();
+    };
+    proc.stdin?.on("error", (err) => noteStdioError("stdin", err));
+    proc.stdout?.on("error", (err) => noteStdioError("stdout", err));
+    proc.stderr?.on("error", (err) => noteStdioError("stderr", err));
+
     proc.stdout.on("data", (data: Buffer) => {
       stdoutBuf += data.toString();
       const lines = stdoutBuf.split("\n");
@@ -396,9 +413,35 @@ export function boardChatRoutes(
       }
     });
 
-    // Feed the prompt to the CLI via stdin.
-    proc.stdin.write(prompt);
-    proc.stdin.end();
+    // Feed the prompt to the CLI via stdin. A child that already exited must
+    // not get a write: that emits an unhandled EPIPE and crashes the server.
+    const stdin = proc.stdin;
+    if (
+      !stdin ||
+      proc.killed ||
+      stdin.destroyed ||
+      proc.exitCode !== null ||
+      proc.signalCode !== null
+    ) {
+      console.error("[board/chat/stream] assistant exited before the prompt was written");
+      if (res.writable && !res.writableEnded) {
+        res.write(
+          `data: ${JSON.stringify({
+            type: "error",
+            message: "The board assistant exited before reading the prompt.",
+          })}\n\n`,
+        );
+        res.end();
+      }
+    } else {
+      try {
+        stdin.write(prompt);
+        stdin.end();
+      } catch (err) {
+        const error = err instanceof Error ? err : new Error(String(err));
+        noteStdioError("stdin", error);
+      }
+    }
   });
 
   return router;

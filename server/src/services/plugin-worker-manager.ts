@@ -1030,11 +1030,31 @@ export function createPluginWorkerHandle(
   // -----------------------------------------------------------------------
 
   function sendMessage(message: unknown): void {
-    if (!childProcess?.stdin?.writable) {
+    const child = childProcess;
+    const stdin = child?.stdin;
+    if (
+      !child ||
+      !stdin ||
+      !stdin.writable ||
+      stdin.destroyed ||
+      child.killed ||
+      child.exitCode !== null ||
+      child.signalCode !== null
+    ) {
       throw new Error(`Worker process for plugin "${pluginId}" is not writable`);
     }
     const serialized = serializeMessage(message as any);
-    childProcess.stdin.write(serialized);
+    try {
+      stdin.write(serialized);
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      log.warn({ err, code }, "plugin worker stdin write failed");
+      if (code === "EPIPE" || code === "ERR_STREAM_DESTROYED") {
+        rejectAllPending(new Error(`Worker stdin closed (${code})`));
+        throw new Error(`Worker process for plugin "${pluginId}" is not writable`);
+      }
+      throw err;
+    }
   }
 
   function errorCodeForWorkerHostError(err: unknown): number {
@@ -2893,16 +2913,28 @@ export function createPluginWorkerHandle(
   }
 
   function attachStdioHandlers(child: ChildProcess): void {
+    const noteStdioError = (stream: "stdin" | "stdout" | "stderr", err: unknown) => {
+      const error = err instanceof Error ? err : new Error(String(err));
+      const code = (error as NodeJS.ErrnoException).code;
+      log.warn({ err: error, stream, code }, "plugin worker stdio error");
+      if (intentionalStop) return;
+      if (code === "EPIPE" || code === "ERR_STREAM_DESTROYED") {
+        rejectAllPending(new Error(`Worker ${stream} closed (${code})`));
+      }
+    };
+
     // Read NDJSON from stdout
     if (child.stdout) {
       readline = createInterface({ input: child.stdout });
       readline.on("line", handleLine);
+      readline.on("error", (err) => noteStdioError("stdout", err));
+      child.stdout.on("error", (err) => noteStdioError("stdout", err));
     }
 
-    // The `error` listener stops an unhandled EPIPE from a child that closed its
-    // stdin.
+    // A child that exits before reading stdin emits EPIPE. Route that into the
+    // pending-request failure path and never let it escape as an uncaught error.
     if (child.stdin) {
-      child.stdin.on("error", () => {});
+      child.stdin.on("error", (err) => noteStdioError("stdin", err));
       child.stdin.on("close", () => {});
     }
 
@@ -2913,6 +2945,8 @@ export function createPluginWorkerHandle(
         stderrExcerpt = appendStderrExcerpt(stderrExcerpt, line);
         log.warn({ stream: "stderr" }, `[plugin stderr] ${line}`);
       });
+      stderrReadline.on("error", (err) => noteStdioError("stderr", err));
+      child.stderr.on("error", (err) => noteStdioError("stderr", err));
     }
 
     // Handle process exit

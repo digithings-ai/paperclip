@@ -2660,9 +2660,23 @@ export function getProcessSessionRemoteSource(input?: { outputToStdout?: boolean
 
 // The shared stdin drain. Both wrappers read newline-delimited stdin messages
 // from the stdin file queue and write them to the child, then end the child
-// stdin on `stdinEnd`. A write to a closed child stdin only emits an `error`
-// event, so the wrapper installs a no-op handler at the call site.
-const PROCESS_SESSION_STDIN_POLL_TAIL = `child.stdin.on("error", () => {});
+// stdin on `stdinEnd`. A write to a closed child stdin emits an `error` event.
+// The handlers below record that as a session error while the child is still
+// running, and they never throw: an unhandled EPIPE would kill the wrapper.
+const PROCESS_SESSION_STDIN_POLL_TAIL = `function noteChildStreamError(stream, error) {
+  const code = error && error.code;
+  const closedPipe = code === "EPIPE" || code === "ERR_STREAM_DESTROYED";
+  if (closedPipe && (terminated || shuttingDown || child.exitCode !== null || child.signalCode !== null)) return;
+  void writeEvent({
+    type: "error",
+    message: closedPipe
+      ? "child " + stream + " closed (" + code + ")"
+      : ((error && error.message) || ("child " + stream + " error")),
+  });
+}
+child.stdin.on("error", (error) => noteChildStreamError("stdin", error));
+child.stdout.on("error", (error) => noteChildStreamError("stdout", error));
+child.stderr.on("error", (error) => noteChildStreamError("stderr", error));
 
 // A stdin file can appear before the host finishes the write. An empty read is
 // the non-atomic-write window; a partial read makes JSON.parse throw. The
@@ -3090,10 +3104,20 @@ async function pollStdin() {
       if (Number.isFinite(entrySeq)) stdinExpectedSeq = entrySeq + 1;
       stdinGapRetries = 0;
       if (message.type === "stdin" && typeof message.data === "string") {
-        if (!stdinClosed) child.stdin.write(Buffer.from(message.data, "base64"));
+        if (!stdinClosed) {
+          if (child.killed || child.stdin.destroyed || child.exitCode !== null || child.signalCode !== null) {
+            if (!terminated && !shuttingDown) {
+              void writeEvent({ type: "error", message: "child exited before stdin was written" });
+            }
+          } else {
+            child.stdin.write(Buffer.from(message.data, "base64"));
+          }
+        }
       } else if (message.type === "stdinEnd") {
         stdinClosed = true;
-        child.stdin.end();
+        if (!(child.killed || child.stdin.destroyed || child.exitCode !== null || child.signalCode !== null)) {
+          child.stdin.end();
+        }
         break;
       } else if (message.type === "shutdown") {
         await terminate();
