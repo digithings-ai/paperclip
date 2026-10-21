@@ -89,6 +89,24 @@ export function hasReusableExecutionWorkspaceBinding(issue: UnrunnableWorktreeIs
 }
 
 /**
+ * A preference that names a concrete mode is the issue's own commitment to
+ * that mode.
+ *
+ * A null preference is the legacy state of an issue that was never given one,
+ * and `inherit` is unresolved: neither says anything about the workspace the
+ * issue is bound to.
+ */
+export function isCommittedExecutionWorkspacePreference(
+  preference: string | null | undefined,
+): boolean {
+  return (
+    preference === "isolated_workspace" ||
+    preference === "operator_branch" ||
+    preference === "shared_workspace"
+  );
+}
+
+/**
  * The preference an issue keeps after the runtime binds it to a persisted
  * workspace.
  *

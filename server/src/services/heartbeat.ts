@@ -494,6 +494,7 @@ import {
   buildExecutionWorkspaceAdapterConfig,
   gateProjectExecutionWorkspacePolicy,
   issueExecutionWorkspaceModeForPersistedWorkspace,
+  isCommittedExecutionWorkspacePreference,
   isUnrunnableWorktreeCombo,
   parseIssueExecutionWorkspaceSettings,
   parseProjectExecutionWorkspacePolicy,
@@ -6058,17 +6059,27 @@ export function resolveExecutionWorkspaceReuseRequestForIssue(input: {
     requestedExistingBranch === null ||
     readNonEmptyString(input.existingExecutionWorkspaceBranchName) ===
       requestedExistingBranch;
-  // A workspace the issue itself owns is the issue's own checkout, whatever
-  // the stored preference says. Restoring it is the only way to keep one
-  // workspace row per worktree: realizing it again mints a second row for the
-  // same path. A workspace owned by another issue never counts as reuse here.
+  // A workspace the issue itself owns is the issue's own checkout. Restoring
+  // it is the only way to keep one workspace row per worktree: realizing it
+  // again mints a second row for the same path. A workspace owned by another
+  // issue never counts as reuse here.
+  //
+  // The issue must also carry a preference that names a concrete mode. A null
+  // preference is the legacy state of an issue that was never given one, and
+  // `inherit` is unresolved: neither says that the issue means the workspace
+  // it is bound to, so neither may turn a fresh realization into a restore.
   const boundWorkspaceIsOwnedByThisIssue =
     readNonEmptyString(input.issueId) !== null &&
     readNonEmptyString(input.existingExecutionWorkspaceSourceIssueId) ===
       readNonEmptyString(input.issueId);
+  const boundWorkspaceIsOwnedByThisIssueWithCommittedPreference =
+    boundWorkspaceIsOwnedByThisIssue &&
+    isCommittedExecutionWorkspacePreference(
+      input.issueExecutionWorkspacePreference,
+    );
   const requestedShouldReuseExisting =
     (input.issueExecutionWorkspacePreference === "reuse_existing" ||
-      boundWorkspaceIsOwnedByThisIssue) &&
+      boundWorkspaceIsOwnedByThisIssueWithCommittedPreference) &&
     requestedExecutionWorkspaceId !== null &&
     existingWorkspaceMatchesRequestedBranch;
 

@@ -3992,7 +3992,9 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
     expect(child.projectId).toBe(projectId);
     expect(child.projectWorkspaceId).toBe(projectWorkspaceId);
     expect(child.executionWorkspaceId).toBeNull();
-    expect(child.executionWorkspacePreference).toBeNull();
+    // The child inherits the parent's workspace strategy, not a workspace: the
+    // resolved mode lands as the preference as well, so the two fields agree.
+    expect(child.executionWorkspacePreference).toBe("isolated_workspace");
     expect(child.executionWorkspaceSettings).toEqual({
       mode: "isolated_workspace",
       environmentId,

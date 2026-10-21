@@ -35,7 +35,7 @@ describe("issue execution workspace preference write-back", () => {
 });
 
 describe("execution workspace reuse request", () => {
-  it("restores a workspace the issue owns even when the preference says isolated", () => {
+  it("restores a workspace the issue owns when the preference names a mode", () => {
     expect(
       resolveExecutionWorkspaceReuseRequestForIssue({
         issueExecutionWorkspaceId: "workspace-own",
@@ -48,6 +48,38 @@ describe("execution workspace reuse request", () => {
       requestedExecutionWorkspaceId: "workspace-own",
       requestedShouldReuseExisting: true,
       existingExecutionWorkspaceAvailable: true,
+    });
+  });
+
+  it("still realizes fresh when the owned workspace carries no preference", () => {
+    expect(
+      resolveExecutionWorkspaceReuseRequestForIssue({
+        issueExecutionWorkspaceId: "workspace-own",
+        issueExecutionWorkspacePreference: null,
+        existingExecutionWorkspaceStatus: "active",
+        existingExecutionWorkspaceSourceIssueId: "issue-1",
+        issueId: "issue-1",
+      }),
+    ).toEqual({
+      requestedExecutionWorkspaceId: "workspace-own",
+      requestedShouldReuseExisting: false,
+      existingExecutionWorkspaceAvailable: false,
+    });
+  });
+
+  it("still realizes fresh when the owned workspace carries an unresolved preference", () => {
+    expect(
+      resolveExecutionWorkspaceReuseRequestForIssue({
+        issueExecutionWorkspaceId: "workspace-own",
+        issueExecutionWorkspacePreference: "inherit",
+        existingExecutionWorkspaceStatus: "active",
+        existingExecutionWorkspaceSourceIssueId: "issue-1",
+        issueId: "issue-1",
+      }),
+    ).toEqual({
+      requestedExecutionWorkspaceId: "workspace-own",
+      requestedShouldReuseExisting: false,
+      existingExecutionWorkspaceAvailable: false,
     });
   });
 
