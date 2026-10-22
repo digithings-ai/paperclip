@@ -409,6 +409,7 @@ import {
   buildWorkspaceReadyPresentation,
   cleanupExecutionWorkspaceArtifacts,
   ensureGitWorktreeBranchCoherent,
+  restoreSanctionedDetachedReviewHead,
   ensurePersistedExecutionWorkspaceAvailable,
   ensureRuntimeServicesForRun,
   formatManagedGitWorktreeBranchInspection,
@@ -24612,41 +24613,70 @@ export function heartbeatService(
                 inspection.repoRoot
               ) {
                 let repairedExpectedBranchName = inspection.expectedBranchName;
+                let sanctionedDetachedReview = false;
                 try {
-                  const coherence = await ensureGitWorktreeBranchCoherent({
-                    db,
-                    repoRoot: inspection.repoRoot,
-                    worktreePath: inspection.worktreePath,
-                    expectedBranchName: inspection.expectedBranchName,
-                    actualBranchName: inspection.actualBranchName,
-                    sourceIssue: issueRef
-                      ? {
-                          id: issueRef.id,
-                          identifier: issueRef.identifier,
-                          title: issueRef.title,
-                          workMode: issueRef.workMode,
-                        }
-                      : null,
-                    executionWorkspaceId: branchInspection.workspaceRecord.id,
-                    heartbeatRunId: run.id,
-                    enableWorkspaceBranchReconcileForward:
-                      resolvedInstanceSettings.experimental
-                        .enableWorkspaceBranchReconcileForward,
-                    enableWorkspaceDirtyQuarantineRepair:
-                      resolvedInstanceSettings.experimental
-                        .enableWorkspaceDirtyQuarantineRepair,
-                    persistForwardReconcile: false,
-                    reconcileOperationPhase: "workspace_finalize",
-                    recorder: workspaceOperationRecorder,
-                  });
                   if (
-                    coherence.branchName &&
-                    coherence.branchName !==
-                      branchInspection.workspaceRecord.branchName
+                    inspection.actualBranchName == null &&
+                    inspection.expectedBranchName
                   ) {
-                    repairedExpectedBranchName = coherence.branchName;
-                    executionWorkspace.branchName = coherence.branchName;
-                    executionWorkspace.warnings.push(...coherence.warnings);
+                    const restored = await restoreSanctionedDetachedReviewHead({
+                      repoRoot: inspection.repoRoot,
+                      worktreePath: inspection.worktreePath,
+                      expectedBranchName: inspection.expectedBranchName,
+                      issueTitle: issueRef?.title ?? null,
+                      issueDescription: issueRef?.description ?? null,
+                      executionWorkspaceId: branchInspection.workspaceRecord.id,
+                      sourceIssueId: issueRef?.id ?? null,
+                      recorder: workspaceOperationRecorder,
+                    });
+                    if (!restored.restored && restored.blocked === "dirty_detached_review") {
+                      throw new WorkspaceValidationFailure(
+                        `Execution workspace git worktree expected branch "${inspection.expectedBranchName}" but found "<detached>" at "${inspection.worktreePath}". Safe repair was not completed: worktree is not clean.`,
+                        {
+                          workspaceValidation: {
+                            reason: "git_worktree_branch_incoherence",
+                          },
+                        },
+                      );
+                    }
+                    sanctionedDetachedReview = restored.restored;
+                  }
+                  if (!sanctionedDetachedReview) {
+                    const coherence = await ensureGitWorktreeBranchCoherent({
+                      db,
+                      repoRoot: inspection.repoRoot,
+                      worktreePath: inspection.worktreePath,
+                      expectedBranchName: inspection.expectedBranchName,
+                      actualBranchName: inspection.actualBranchName,
+                      sourceIssue: issueRef
+                        ? {
+                            id: issueRef.id,
+                            identifier: issueRef.identifier,
+                            title: issueRef.title,
+                            workMode: issueRef.workMode,
+                          }
+                        : null,
+                      executionWorkspaceId: branchInspection.workspaceRecord.id,
+                      heartbeatRunId: run.id,
+                      enableWorkspaceBranchReconcileForward:
+                        resolvedInstanceSettings.experimental
+                          .enableWorkspaceBranchReconcileForward,
+                      enableWorkspaceDirtyQuarantineRepair:
+                        resolvedInstanceSettings.experimental
+                          .enableWorkspaceDirtyQuarantineRepair,
+                      persistForwardReconcile: false,
+                      reconcileOperationPhase: "workspace_finalize",
+                      recorder: workspaceOperationRecorder,
+                    });
+                    if (
+                      coherence.branchName &&
+                      coherence.branchName !==
+                        branchInspection.workspaceRecord.branchName
+                    ) {
+                      repairedExpectedBranchName = coherence.branchName;
+                      executionWorkspace.branchName = coherence.branchName;
+                      executionWorkspace.warnings.push(...coherence.warnings);
+                    }
                   }
                 } catch (repairErr) {
                   const workspaceValidationFailure =
@@ -24701,6 +24731,9 @@ export function heartbeatService(
                 finalizeBranchRepairMetadata = {
                   attempted: true,
                   succeeded: repairedInspection.valid,
+                  ...(sanctionedDetachedReview
+                    ? { reason: "detached_review_head" }
+                    : {}),
                   initial: initialManagedGitWorktreeBranch,
                   repaired:
                     formatManagedGitWorktreeBranchInspection(
