@@ -4492,14 +4492,14 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
                 agentId,
                 invocationSource: "manual",
                 status: sourceRunStatus,
-                runtimeMode: sourceRunRuntimeMode,
-                nativePhase: options?.sourceRunNativePhase ?? null,
                 // The source run of a card on this issue is a run on this issue,
                 // so it carries the issue binding. The scope check refuses a
                 // source run that is bound to no issue at all.
                 contextSnapshot: { issueId },
                 startedAt: new Date("2026-05-23T21:55:00.000Z"),
                 finishedAt: sourceRunTerminal ? new Date("2026-05-23T22:05:00.000Z") : null,
+                runtimeMode: sourceRunRuntimeMode,
+                nativePhase: options?.sourceRunNativePhase ?? null,
               },
             ]
           : []),
