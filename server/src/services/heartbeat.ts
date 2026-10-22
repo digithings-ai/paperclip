@@ -495,6 +495,7 @@ import {
   gateProjectExecutionWorkspacePolicy,
   issueExecutionWorkspaceModeForPersistedWorkspace,
   isCommittedExecutionWorkspacePreference,
+  isExecutionWorkspaceOwnedByIssue,
   isUnrunnableWorktreeCombo,
   parseIssueExecutionWorkspaceSettings,
   parseProjectExecutionWorkspacePolicy,
@@ -22456,9 +22457,10 @@ export function heartbeatService(
         // telling the same story, instead of writing the pair that reads as
         // "this work belongs to another issue's worktree".
         const boundWorkspaceOwnedByThisIssue =
-          readNonEmptyString(workspace.sourceIssueId) !== null &&
-          readNonEmptyString(workspace.sourceIssueId) ===
-            readNonEmptyString(issueId);
+          isExecutionWorkspaceOwnedByIssue({
+            workspaceSourceIssueId: workspace.sourceIssueId,
+            issueId,
+          });
         const nextIssueWorkspacePreference =
           resolveIssueExecutionWorkspacePreferenceWriteBack({
             nextIssueWorkspaceMode,

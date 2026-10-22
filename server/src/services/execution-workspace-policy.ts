@@ -114,6 +114,31 @@ export function isCommittedExecutionWorkspacePreference(
 }
 
 /**
+ * Whether a persisted workspace row is the workspace of this issue.
+ *
+ * The runtime binds an issue to a workspace the run just provisioned, and the
+ * row records the issue that owns it in `sourceIssueId`. A row without an
+ * owner belongs to no issue, and a row owned by a different issue is a
+ * cross-issue share. Both are not this issue's workspace.
+ *
+ * This comparison decides whether the write-back keeps the isolated preference
+ * or keeps `reuse_existing`. It is a pure function so the decision is pinned by
+ * a suite that runs on every host, not only by the embedded-Postgres suite
+ * that covers the whole bind.
+ */
+export function isExecutionWorkspaceOwnedByIssue(input: {
+  workspaceSourceIssueId: string | null | undefined;
+  issueId: string | null | undefined;
+}): boolean {
+  const source =
+    typeof input.workspaceSourceIssueId === "string"
+      ? input.workspaceSourceIssueId.trim()
+      : "";
+  const issue = typeof input.issueId === "string" ? input.issueId.trim() : "";
+  return source.length > 0 && source === issue;
+}
+
+/**
  * The preference an issue keeps after the runtime binds it to a persisted
  * workspace.
  *
@@ -203,11 +228,10 @@ export function shouldMergeExecutionWorkspaceConfigIntoWorkspace(input: {
   issueId: string | null | undefined;
 }): boolean {
   if (input.nextExecutionWorkspacePreference === "reuse_existing") return true;
-  const source = typeof input.workspaceSourceIssueId === "string"
-    ? input.workspaceSourceIssueId.trim()
-    : "";
-  const issue = typeof input.issueId === "string" ? input.issueId.trim() : "";
-  return source.length > 0 && source === issue;
+  return isExecutionWorkspaceOwnedByIssue({
+    workspaceSourceIssueId: input.workspaceSourceIssueId,
+    issueId: input.issueId,
+  });
 }
 
 export function isUnrunnableWorktreeCombo(input: {

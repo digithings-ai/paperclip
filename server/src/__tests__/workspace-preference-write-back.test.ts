@@ -1,11 +1,72 @@
 import { describe, expect, it } from "vitest";
 import {
   hasReusableExecutionWorkspaceBinding,
+  isExecutionWorkspaceOwnedByIssue,
   resolveIssueExecutionWorkspacePreferenceForCreate,
   resolveIssueExecutionWorkspacePreferenceWriteBack,
   shouldMergeExecutionWorkspaceConfigIntoWorkspace,
 } from "../services/execution-workspace-policy.ts";
 import { resolveExecutionWorkspaceReuseRequestForIssue } from "../services/heartbeat.ts";
+
+describe("ownership of a bound execution workspace", () => {
+  // The write-back keeps the isolated preference on a workspace the issue
+  // owns and keeps `reuse_existing` on a share. This comparison is the input
+  // that decides it, so it is pinned here in a suite that runs on every host,
+  // not only in the embedded-Postgres suite that covers the whole bind.
+  it("owns a workspace whose source issue is this issue", () => {
+    expect(
+      isExecutionWorkspaceOwnedByIssue({
+        workspaceSourceIssueId: "issue-1",
+        issueId: "issue-1",
+      }),
+    ).toBe(true);
+  });
+
+  it("does not own a workspace whose source issue is another issue", () => {
+    expect(
+      isExecutionWorkspaceOwnedByIssue({
+        workspaceSourceIssueId: "issue-2",
+        issueId: "issue-1",
+      }),
+    ).toBe(false);
+  });
+
+  it("does not own a workspace without a source issue", () => {
+    expect(
+      isExecutionWorkspaceOwnedByIssue({
+        workspaceSourceIssueId: null,
+        issueId: "issue-1",
+      }),
+    ).toBe(false);
+    expect(
+      isExecutionWorkspaceOwnedByIssue({
+        workspaceSourceIssueId: "",
+        issueId: "issue-1",
+      }),
+    ).toBe(false);
+    expect(
+      isExecutionWorkspaceOwnedByIssue({
+        workspaceSourceIssueId: "   ",
+        issueId: "issue-1",
+      }),
+    ).toBe(false);
+  });
+
+  it("does not own a workspace when the issue id is null", () => {
+    expect(
+      isExecutionWorkspaceOwnedByIssue({
+        workspaceSourceIssueId: null,
+        issueId: null,
+      }),
+    ).toBe(false);
+    expect(
+      isExecutionWorkspaceOwnedByIssue({
+        workspaceSourceIssueId: "issue-1",
+        issueId: null,
+      }),
+    ).toBe(false);
+  });
+});
 
 describe("issue execution workspace preference write-back", () => {
   it("keeps the isolated preference on a workspace the issue owns", () => {
