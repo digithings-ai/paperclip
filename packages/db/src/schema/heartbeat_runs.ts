@@ -91,6 +91,10 @@ export const heartbeatRuns = pgTable(
     livenessState: text("liveness_state"),
     livenessReason: text("liveness_reason"),
     continuationAttempt: integer("continuation_attempt").notNull().default(0),
+    // The decision the orphaned-run continuation sweep took about this run.
+    // A decided run is never a candidate again, so the sweep's candidate
+    // window stays bounded however many old orphan rows the table holds.
+    orphanedContinuationDecision: text("orphaned_continuation_decision"),
     lastUsefulActionAt: timestamp("last_useful_action_at", { withTimezone: true }),
     nextAction: text("next_action"),
     contextSnapshot: jsonb("context_snapshot").$type<Record<string, unknown>>(),

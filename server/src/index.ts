@@ -1584,6 +1584,14 @@ async function startServerWithDatabaseTeardown(
         if (swept.cleared > 0) {
           logger.warn({ ...swept }, "startup stale-lock sweeper cleared issue locks");
         }
+
+        const continued = await heartbeat.sweepOrphanedRunContinuations();
+        if (continued.continued > 0) {
+          logger.warn(
+            { ...continued },
+            "startup orphaned-run sweeper continued terminalized runs",
+          );
+        }
       })().catch((err) => {
         logger.error({ err }, "startup heartbeat recovery failed");
         throw err;
@@ -1824,6 +1832,15 @@ async function startServerWithDatabaseTeardown(
               const swept = await heartbeat.sweepStaleIssueLocks();
               if (swept.cleared > 0) {
                 logger.warn({ ...swept }, "periodic stale-lock sweeper cleared issue locks");
+              }
+            })
+            .then(async () => {
+              const continued = await heartbeat.sweepOrphanedRunContinuations();
+              if (continued.continued > 0) {
+                logger.warn(
+                  { ...continued },
+                  "periodic orphaned-run sweeper continued terminalized runs",
+                );
               }
             })
             .catch((err) => {

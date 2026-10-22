@@ -4,6 +4,11 @@ import { agentWakeupRequests, agents, heartbeatRuns, issues } from "@paperclipai
 import type { RunLivenessState } from "@paperclipai/shared";
 import { withRecoveryContext } from "./status-only-context.js";
 import { RECOVERY_REASON_KINDS } from "./origins.js";
+import {
+  ORPHANED_RUN_CONTINUATION_ERROR_CODE,
+  ORPHANED_RUN_CONTINUATION_INSTRUCTION,
+  buildOrphanedRunContinuationIdempotencyKey,
+} from "./orphaned-run-continuations.js";
 
 export const RUN_LIVENESS_CONTINUATION_REASON = RECOVERY_REASON_KINDS.runLivenessContinuation;
 export const DEFAULT_MAX_LIVENESS_CONTINUATION_ATTEMPTS = 2;
@@ -40,6 +45,20 @@ export type RunContinuationDecision =
       kind: "skip";
       reason: string;
     };
+
+// Where a continuation request came from.
+//
+// "liveness" is the original path: the run finished and the liveness
+// classifier found it actionable ("plan_only" or "empty_response").
+//
+// "orphaned_run" is the recovery backstop path: the run was terminalized
+// because its process and sandbox were gone, so the work stopped without a
+// result. That path is gated on the error code, never on the liveness state,
+// because the backstop never writes one and "needs_followup" is also produced
+// by two cases that are not safe to auto-continue.
+export type RunContinuationSource =
+  | { kind: "liveness" }
+  | { kind: "orphaned_run"; errorCode: string };
 
 export function readContinuationAttempt(value: unknown): number {
   const numeric = typeof value === "number" ? value : Number.parseInt(String(value ?? ""), 10);
@@ -92,6 +111,7 @@ export function decideRunLivenessContinuation(input: {
   budgetBlocked: boolean;
   idempotentWakeExists: boolean;
   maxAttempts?: number;
+  source?: RunContinuationSource;
 }): RunContinuationDecision {
   const {
     run,
@@ -104,8 +124,22 @@ export function decideRunLivenessContinuation(input: {
     idempotentWakeExists,
   } = input;
   const maxAttempts = input.maxAttempts ?? DEFAULT_MAX_LIVENESS_CONTINUATION_ATTEMPTS;
+  const source: RunContinuationSource = input.source ?? { kind: "liveness" };
 
-  if (!livenessState || !ACTIONABLE_LIVENESS_STATES.has(livenessState)) {
+  if (source.kind === "orphaned_run") {
+    if (source.errorCode !== ORPHANED_RUN_CONTINUATION_ERROR_CODE) {
+      return {
+        kind: "skip",
+        reason: `error code ${source.errorCode} is not eligible for continuation`,
+      };
+    }
+    if (run.errorCode !== ORPHANED_RUN_CONTINUATION_ERROR_CODE) {
+      return {
+        kind: "skip",
+        reason: `run error code ${run.errorCode ?? "none"} is not eligible for continuation`,
+      };
+    }
+  } else if (!livenessState || !ACTIONABLE_LIVENESS_STATES.has(livenessState)) {
     return { kind: "skip", reason: "liveness state is not actionable for continuation" };
   }
   if (!issue) return { kind: "skip", reason: "issue not found" };
@@ -137,7 +171,12 @@ export function decideRunLivenessContinuation(input: {
       comment: [
         "Bounded liveness continuation exhausted",
         "",
-        `- Last liveness state: \`${livenessState}\``,
+        ...(source.kind === "orphaned_run"
+          ? [
+              `- Continuation source: recovery backstop (\`${ORPHANED_RUN_CONTINUATION_ERROR_CODE}\`)`,
+            ]
+          : []),
+        `- Last liveness state: \`${livenessState ?? "none"}\``,
         `- Attempts used: ${currentAttempt}/${maxAttempts}`,
         `- Reason: ${livenessReason ?? "Run ended without concrete progress"}`,
         "- Next action: a human or manager should inspect the run and either clarify the task, mark it blocked, or assign a concrete follow-up.",
@@ -146,44 +185,69 @@ export function decideRunLivenessContinuation(input: {
   }
 
   const nextAttempt = currentAttempt + 1;
-  const idempotencyKey = buildRunLivenessContinuationIdempotencyKey({
-    issueId: issue.id,
-    sourceRunId: run.id,
-    livenessState,
-    nextAttempt,
-  });
+  const idempotencyKey =
+    source.kind === "orphaned_run"
+      ? buildOrphanedRunContinuationIdempotencyKey({
+          issueId: issue.id,
+          sourceRunId: run.id,
+          errorCode: source.errorCode,
+          nextAttempt,
+        })
+      : buildRunLivenessContinuationIdempotencyKey({
+          issueId: issue.id,
+          sourceRunId: run.id,
+          livenessState: livenessState as RunLivenessState,
+          nextAttempt,
+        });
   if (idempotentWakeExists) {
     return { kind: "skip", reason: "continuation wake already exists for this source run and attempt" };
   }
 
-  const payload = withRecoveryContext({
+  const payloadInput: Record<string, unknown> = {
     issueId: issue.id,
     sourceRunId: run.id,
     livenessState,
-    livenessReason,
+    livenessReason:
+      source.kind === "orphaned_run"
+        ? (livenessReason ??
+          "Run was terminalized by the recovery backstop: its process and sandbox were gone.")
+        : livenessReason,
     continuationAttempt: nextAttempt,
     maxContinuationAttempts: maxAttempts,
     instruction:
       nextAction ??
-      "The previous run ended without concrete progress. Take the first concrete action now or mark the issue blocked with a specific unblock request.",
-  }, "normal_model");
+      (source.kind === "orphaned_run"
+        ? ORPHANED_RUN_CONTINUATION_INSTRUCTION
+        : "The previous run ended without concrete progress. Take the first concrete action now or mark the issue blocked with a specific unblock request."),
+  };
+  if (source.kind === "orphaned_run") {
+    payloadInput.errorCode = source.errorCode;
+    payloadInput.continuationSource = "orphaned_run";
+  }
+  const payload = withRecoveryContext(payloadInput, "normal_model");
+
+  const contextSnapshotInput: Record<string, unknown> = {
+    issueId: issue.id,
+    taskId: issue.id,
+    taskKey: issue.id,
+    wakeReason: RUN_LIVENESS_CONTINUATION_REASON,
+    livenessContinuationAttempt: nextAttempt,
+    livenessContinuationMaxAttempts: maxAttempts,
+    livenessContinuationSourceRunId: run.id,
+    livenessContinuationState: livenessState,
+    livenessContinuationReason: payload.livenessReason,
+    livenessContinuationInstruction: payload.instruction,
+  };
+  if (source.kind === "orphaned_run") {
+    contextSnapshotInput.livenessContinuationSource = "orphaned_run";
+    contextSnapshotInput.livenessContinuationErrorCode = source.errorCode;
+  }
 
   return {
     kind: "enqueue",
     nextAttempt,
     idempotencyKey,
     payload,
-    contextSnapshot: withRecoveryContext({
-      issueId: issue.id,
-      taskId: issue.id,
-      taskKey: issue.id,
-      wakeReason: RUN_LIVENESS_CONTINUATION_REASON,
-      livenessContinuationAttempt: nextAttempt,
-      livenessContinuationMaxAttempts: maxAttempts,
-      livenessContinuationSourceRunId: run.id,
-      livenessContinuationState: livenessState,
-      livenessContinuationReason: livenessReason,
-      livenessContinuationInstruction: payload.instruction,
-    }, "normal_model"),
+    contextSnapshot: withRecoveryContext(contextSnapshotInput, "normal_model"),
   };
 }
