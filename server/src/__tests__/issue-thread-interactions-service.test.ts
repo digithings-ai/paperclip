@@ -4426,6 +4426,8 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       kind?: AcceptGateInteractionKind;
       sourceRunId?: string | null;
       sourceRunStatus?: string;
+      sourceRunRuntimeMode?: "legacy" | "native";
+      sourceRunNativePhase?: string | null;
     }) {
       const companyId = randomUUID();
       const projectId = randomUUID();
@@ -4473,7 +4475,14 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
         permissions: {},
       });
       const sourceRunStatus = options?.sourceRunStatus ?? "succeeded";
-      const sourceRunTerminal = sourceRunStatus !== "running";
+      const sourceRunRuntimeMode = options?.sourceRunRuntimeMode ?? "legacy";
+      const sourceRunTerminal = [
+        "succeeded",
+        "interrupted",
+        "failed",
+        "cancelled",
+        "timed_out",
+      ].includes(sourceRunStatus);
       await db.insert(heartbeatRuns).values([
         ...(sourceRunId
           ? [
@@ -4483,6 +4492,12 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
                 agentId,
                 invocationSource: "manual",
                 status: sourceRunStatus,
+                runtimeMode: sourceRunRuntimeMode,
+                nativePhase: options?.sourceRunNativePhase ?? null,
+                // The source run of a card on this issue is a run on this issue,
+                // so it carries the issue binding. The scope check refuses a
+                // source run that is bound to no issue at all.
+                contextSnapshot: { issueId },
                 startedAt: new Date("2026-05-23T21:55:00.000Z"),
                 finishedAt: sourceRunTerminal ? new Date("2026-05-23T22:05:00.000Z") : null,
               },
@@ -4692,8 +4707,11 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     });
 
     it("refuses request_confirmation accept until the source run records a successful workspace_finalize", async () => {
+      // The source run is still alive, so its sync-back can still land: the gate
+      // must wait for it. A run that already ended never gets that second chance
+      // — see the terminal-source-run case below.
       const { companyId, executionWorkspaceId, issueId, goalId, interactionId, sourceRunId } =
-        await seedAcceptGateFixture();
+        await seedAcceptGateFixture({ sourceRunStatus: "running" });
 
       await db.insert(workspaceOperations).values({
         companyId,
@@ -4817,6 +4835,202 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       });
     });
 
+    it.each(["succeeded", "failed", "cancelled", "interrupted", "timed_out"])(
+      "allows request_confirmation accept when a %s source run left no finalize row",
+      async (sourceRunStatus) => {
+        // The source run ended between the worktree prepare and the sync-back, so
+        // no `workspace_finalize` row will ever land for it. The gate must not
+        // wait on a sync that can never happen: waiting wedges the confirmation
+        // for good and the human can never accept it.
+        const { companyId, executionWorkspaceId, issueId, goalId, interactionId, sourceRunId } =
+          await seedAcceptGateFixture({ sourceRunStatus });
+
+        await db.insert(workspaceOperations).values({
+          companyId,
+          executionWorkspaceId,
+          heartbeatRunId: sourceRunId,
+          phase: "worktree_prepare",
+          status: "succeeded",
+          startedAt: new Date("2026-05-23T22:00:00.000Z"),
+        });
+
+        expect((await interactionsSvc.listForIssue(issueId))[0].acceptanceBlocker).toBeUndefined();
+
+        const accepted = await interactionsSvc.acceptInteraction(
+          { id: issueId, companyId, goalId, projectId: null },
+          interactionId,
+          {},
+          { userId: "local-board" },
+        );
+
+        expect(accepted.interaction).toMatchObject({
+          id: interactionId,
+          kind: "request_confirmation",
+          status: "accepted",
+        });
+      },
+    );
+
+    it.each(["succeeded", "failed"])(
+      "refuses request_confirmation accept when a native %s source run left no finalize row and its coordinator is alive",
+      async (sourceRunStatus) => {
+        // A native run can still owe a sync-back after it ended: the durable
+        // native coordinator owns the copy-back and can start or resume it for a
+        // run that already reached a terminal state. The gate must keep waiting
+        // for that copy-back, so the confirmation cannot be accepted on a base
+        // that does not hold the run's commits yet.
+        const { companyId, executionWorkspaceId, issueId, goalId, interactionId, sourceRunId } =
+          await seedAcceptGateFixture({
+            sourceRunStatus,
+            sourceRunRuntimeMode: "native",
+            sourceRunNativePhase: "committed",
+          });
+
+        await db.insert(workspaceOperations).values({
+          companyId,
+          executionWorkspaceId,
+          heartbeatRunId: sourceRunId,
+          phase: "worktree_prepare",
+          status: "succeeded",
+          startedAt: new Date("2026-05-23T22:00:00.000Z"),
+        });
+
+        expect((await interactionsSvc.listForIssue(issueId))[0].acceptanceBlocker).toBe(
+          "workspace_sync_pending",
+        );
+
+        await expect(
+          interactionsSvc.acceptInteraction(
+            { id: issueId, companyId, goalId, projectId: null },
+            interactionId,
+            {},
+            { userId: "local-board" },
+          ),
+        ).rejects.toMatchObject({
+          status: 409,
+          message: expect.stringContaining(
+            "the run that created this interaction has not finished syncing its workspace",
+          ),
+          details: { executionWorkspaceId, sourceRunId },
+        });
+      },
+    );
+
+    it("allows request_confirmation accept when a native source run left no finalize row and its coordinator gave up", async () => {
+      // The native coordinator gave up on the run. No copy-back comes for that
+      // run, so the gate must not wait for one. Waiting would wedge the
+      // confirmation for good.
+      const { companyId, executionWorkspaceId, issueId, goalId, interactionId, sourceRunId } =
+        await seedAcceptGateFixture({
+          sourceRunStatus: "failed",
+          sourceRunRuntimeMode: "native",
+          sourceRunNativePhase: "terminal_failure",
+        });
+
+      await db.insert(workspaceOperations).values({
+        companyId,
+        executionWorkspaceId,
+        heartbeatRunId: sourceRunId,
+        phase: "worktree_prepare",
+        status: "succeeded",
+        startedAt: new Date("2026-05-23T22:00:00.000Z"),
+      });
+
+      expect((await interactionsSvc.listForIssue(issueId))[0].acceptanceBlocker).toBeUndefined();
+
+      const accepted = await interactionsSvc.acceptInteraction(
+        { id: issueId, companyId, goalId, projectId: null },
+        interactionId,
+        {},
+        { userId: "local-board" },
+      );
+
+      expect(accepted.interaction).toMatchObject({
+        id: interactionId,
+        kind: "request_confirmation",
+        status: "accepted",
+      });
+    });
+
+    it("refuses request_confirmation accept while a native run copies back its workspace", async () => {
+      // The copy-back of a native run is in flight. The run row can already be
+      // terminal while the coordinator still owns the copy-back, so the gate must
+      // not treat the run row as proof that the sync-back is over.
+      const { companyId, executionWorkspaceId, issueId, goalId, interactionId, sourceRunId } =
+        await seedAcceptGateFixture({
+          sourceRunStatus: "failed",
+          sourceRunRuntimeMode: "native",
+          sourceRunNativePhase: "workspace_finalizing",
+        });
+
+      await db.insert(workspaceOperations).values({
+        companyId,
+        executionWorkspaceId,
+        heartbeatRunId: sourceRunId,
+        phase: "workspace_finalize",
+        status: "running",
+        startedAt: new Date("2026-05-23T22:05:00.000Z"),
+      });
+
+      expect((await interactionsSvc.listForIssue(issueId))[0].acceptanceBlocker).toBe(
+        "workspace_sync_pending",
+      );
+
+      await expect(
+        interactionsSvc.acceptInteraction(
+          { id: issueId, companyId, goalId, projectId: null },
+          interactionId,
+          {},
+          { userId: "local-board" },
+        ),
+      ).rejects.toMatchObject({
+        status: 409,
+        message: expect.stringContaining(
+          "the run that created this interaction has not finished syncing its workspace",
+        ),
+        details: { executionWorkspaceId, sourceRunId },
+      });
+    });
+
+    it.each(["queued", "scheduled_retry"])(
+      "refuses request_confirmation accept when a %s source run left no finalize row",
+      async (sourceRunStatus) => {
+        // A run that is not running but is not over either: it still owns a
+        // sync-back it has not attempted yet, so the gate must keep waiting. Only
+        // a run that reached a terminal state can no longer reach the sync-back.
+        const { companyId, executionWorkspaceId, issueId, goalId, interactionId, sourceRunId } =
+          await seedAcceptGateFixture({ sourceRunStatus });
+
+        await db.insert(workspaceOperations).values({
+          companyId,
+          executionWorkspaceId,
+          heartbeatRunId: sourceRunId,
+          phase: "worktree_prepare",
+          status: "succeeded",
+          startedAt: new Date("2026-05-23T22:00:00.000Z"),
+        });
+
+        expect((await interactionsSvc.listForIssue(issueId))[0].acceptanceBlocker).toBe(
+          "workspace_sync_pending",
+        );
+
+        await expect(
+          interactionsSvc.acceptInteraction(
+            { id: issueId, companyId, goalId, projectId: null },
+            interactionId,
+            {},
+            { userId: "local-board" },
+          ),
+        ).rejects.toMatchObject({
+          status: 409,
+          message: expect.stringContaining(
+            "the run that created this interaction has not finished syncing its workspace",
+          ),
+          details: { executionWorkspaceId, sourceRunId },
+        });
+      },
+    );
+
     it("refuses request_confirmation accept while a workspace_finalize is running on a live source run", async () => {
       // A genuinely in-flight sync-back on a still-active run must still block, so
       // the confirmation cannot race commits that are actively being synced back.
@@ -4914,8 +5128,10 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     });
 
     it("refuses request_checkbox_confirmation accept until the source run records a successful workspace_finalize", async () => {
+      // The source run is still alive, so its sync-back can still land: the gate
+      // must wait for it.
       const { companyId, executionWorkspaceId, issueId, goalId, interactionId, sourceRunId } =
-        await seedAcceptGateFixture({ kind: "request_checkbox_confirmation" });
+        await seedAcceptGateFixture({ kind: "request_checkbox_confirmation", sourceRunStatus: "running" });
 
       await db.insert(workspaceOperations).values({
         companyId,
