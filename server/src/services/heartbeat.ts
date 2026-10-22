@@ -520,12 +520,16 @@ import {
   SUCCESSFUL_RUN_MISSING_STATE_REASON,
   RUN_LIVENESS_CONTINUATION_REASON,
   ORPHANED_RUN_CONTINUATION_ERROR_CODE,
+  ORPHANED_RUN_CONTINUATION_DECISION_CONTINUED,
+  ORPHANED_RUN_CONTINUATION_DECISION_DISPATCHED_AGAIN,
+  ORPHANED_RUN_CONTINUATION_DECISION_EXHAUSTED,
   buildRunLivenessContinuationIdempotencyKey,
   buildFinishSuccessfulRunHandoffIdempotencyKey,
   buildOrphanedRunContinuationIdempotencyKey,
   buildSuccessfulRunHandoffRequiredNotice,
   decideRunLivenessContinuation,
   decideSuccessfulRunHandoff,
+  evaluateOrphanedRunContinuationEligibility,
   evaluateOrphanedRunContinuationPreflight,
   findExistingFinishSuccessfulRunHandoffWake,
   findExistingRunLivenessContinuationWake,
@@ -536,7 +540,7 @@ import {
   readContinuationAttempt,
   readOrphanedRunContinuationGraceMs,
 } from "./recovery/index.js";
-import type { RunContinuationSource } from "./recovery/index.js";
+import type { OrphanedRunContinuationDecision, RunContinuationSource } from "./recovery/index.js";
 import { readHostHealth, type HostHealth } from "./host-health.js";
 import {
   buildConfigurationIncompleteRecoveryNoticeSeed,
@@ -13326,7 +13330,14 @@ export function heartbeatService(
   async function handleRunLivenessContinuation(
     run: typeof heartbeatRuns.$inferSelect,
     source: RunContinuationSource = { kind: "liveness" },
-  ): Promise<{ enqueued: boolean; reason: string }> {
+  ): Promise<{
+    enqueued: boolean;
+    reason: string;
+    // "exhausted" and "continued" are the two terminal outcomes: the attempt
+    // cap is reached, or a continuation was enqueued. The orphaned-run sweep
+    // marks the run with them so the run is never a candidate again.
+    decision?: "continued" | "exhausted";
+  }> {
     const context = parseObject(run.contextSnapshot);
     if (
       readNonEmptyString(context.goalControlRequestId) ||
@@ -13447,7 +13458,7 @@ export function heartbeatService(
         issueId,
         comment: decision.comment,
       });
-      return { enqueued: false, reason: "continuation attempts exhausted" };
+      return { enqueued: false, reason: "continuation attempts exhausted", decision: "exhausted" };
     }
 
     if (decision.kind !== "enqueue") {
@@ -13479,7 +13490,11 @@ export function heartbeatService(
         .where(eq(heartbeatRuns.id, run.id));
     }
 
-    return { enqueued: Boolean(continuationRun), reason: "continuation enqueued" };
+    return {
+      enqueued: Boolean(continuationRun),
+      reason: continuationRun ? "continuation enqueued" : "continuation wake was not created",
+      ...(continuationRun ? { decision: "continued" as const } : {}),
+    };
   }
 
   function issueUiLink(
@@ -20055,6 +20070,11 @@ export function heartbeatService(
         and(
           eq(heartbeatRuns.status, "interrupted"),
           eq(heartbeatRuns.errorCode, ORPHANED_RUN_CONTINUATION_ERROR_CODE),
+          // A run the sweep already decided about is never a candidate again.
+          // Without this filter a decided row keeps its old timestamp forever,
+          // the candidate window fills with decided rows, and a fresh orphan is
+          // never reached: the feature stops working silently and permanently.
+          isNull(heartbeatRuns.orphanedContinuationDecision),
           opts?.companyId
             ? eq(heartbeatRuns.companyId, opts.companyId)
             : undefined,
@@ -20090,19 +20110,34 @@ export function heartbeatService(
         issueId,
         sourceRunId: candidate.id,
       });
-      if (pendingWake) {
-        skipped.push(`${candidate.id}: a continuation of this run is already in flight`);
-        continue;
-      }
-
       const laterRun = await findLaterRunOnIssue(db, {
         companyId: candidate.companyId,
         issueId,
         sourceRunId: candidate.id,
         after: preflight.workStoppedAt,
       });
-      if (laterRun) {
-        skipped.push(`${candidate.id}: the issue was dispatched again after the run stopped`);
+
+      // The shared helper is the gate production acts on: both "at most one"
+      // gates live in it, so the helper and the sweep cannot drift apart.
+      const eligibility = evaluateOrphanedRunContinuationEligibility({
+        run: candidate,
+        now,
+        graceMs,
+        hostSaturated: hostHealth.saturated,
+        laterRunOnIssue: Boolean(laterRun),
+        continuationInFlight: Boolean(pendingWake),
+      });
+      if (!eligibility.eligible) {
+        skipped.push(`${candidate.id}: ${eligibility.reason}`);
+        if (laterRun) {
+          // The issue was dispatched again, so this orphan is never continued.
+          // Mark it: an unmarked row keeps its old timestamp and fills the
+          // candidate window until a fresh orphan is unreachable.
+          await markOrphanedRunContinuationDecision(
+            candidate.id,
+            ORPHANED_RUN_CONTINUATION_DECISION_DISPATCHED_AGAIN,
+          );
+        }
         continue;
       }
 
@@ -20120,8 +20155,21 @@ export function heartbeatService(
         kind: "orphaned_run",
         errorCode: ORPHANED_RUN_CONTINUATION_ERROR_CODE,
       });
-      if (outcome.enqueued) continued += 1;
-      else skipped.push(`${candidate.id}: ${outcome.reason}`);
+      if (outcome.enqueued) {
+        continued += 1;
+        await markOrphanedRunContinuationDecision(
+          candidate.id,
+          ORPHANED_RUN_CONTINUATION_DECISION_CONTINUED,
+        );
+      } else {
+        skipped.push(`${candidate.id}: ${outcome.reason}`);
+        if (outcome.decision === "exhausted") {
+          await markOrphanedRunContinuationDecision(
+            candidate.id,
+            ORPHANED_RUN_CONTINUATION_DECISION_EXHAUSTED,
+          );
+        }
+      }
     }
 
     return {
@@ -20133,6 +20181,19 @@ export function heartbeatService(
       hostSaturated: hostHealth.saturated,
       graceMs,
     };
+  }
+
+  // The sweep's decision about one orphan run. A decided run is never a
+  // candidate again, so the candidate window stays bounded however many
+  // decided rows the table holds.
+  async function markOrphanedRunContinuationDecision(
+    runId: string,
+    decision: OrphanedRunContinuationDecision,
+  ) {
+    await db
+      .update(heartbeatRuns)
+      .set({ orphanedContinuationDecision: decision })
+      .where(eq(heartbeatRuns.id, runId));
   }
 
   function issueIdFromRunContext(contextSnapshot: unknown) {

@@ -231,11 +231,81 @@ describe("orphaned run continuation decision", () => {
       now: new Date("2026-10-21T10:00:00.000Z"),
       hostSaturated: false,
       laterRunOnIssue: true,
+      continuationInFlight: false,
     });
 
     expect(eligibility.eligible).toBe(false);
     if (eligibility.eligible) return;
     expect(eligibility.reason).toContain("dispatched again");
+  });
+
+  it("does not continue while a continuation of the same run is in flight", () => {
+    const eligibility = evaluateOrphanedRunContinuationEligibility({
+      run: run(),
+      now: new Date("2026-10-21T10:00:00.000Z"),
+      hostSaturated: false,
+      laterRunOnIssue: false,
+      continuationInFlight: true,
+    });
+
+    expect(eligibility.eligible).toBe(false);
+    if (eligibility.eligible) return;
+    expect(eligibility.reason).toContain("already in flight");
+  });
+
+  it("continues when both at-most-one gates are open", () => {
+    const eligibility = evaluateOrphanedRunContinuationEligibility({
+      run: run(),
+      now: new Date("2026-10-21T10:00:00.000Z"),
+      hostSaturated: false,
+      laterRunOnIssue: false,
+      continuationInFlight: false,
+    });
+
+    expect(eligibility.eligible).toBe(true);
+  });
+
+  it("holds the attempt cap on the orphaned path", () => {
+    // The attempt counter is read from the source run row, so the cap holds
+    // across a chain of orphans on the same issue.
+    const second = decideRunLivenessContinuation({
+      run: run({ continuationAttempt: 1 }),
+      issue: issue(),
+      agent: agent(),
+      livenessState: null,
+      livenessReason: null,
+      nextAction: null,
+      budgetBlocked: false,
+      idempotentWakeExists: false,
+      source: orphanedSource,
+    });
+    expect(second.kind).toBe("enqueue");
+    if (second.kind !== "enqueue") return;
+    expect(second.nextAttempt).toBe(2);
+    expect(second.idempotencyKey).toBe(
+      buildOrphanedRunContinuationIdempotencyKey({
+        issueId,
+        sourceRunId: runId,
+        errorCode: ORPHANED_RUN_CONTINUATION_ERROR_CODE,
+        nextAttempt: 2,
+      }),
+    );
+
+    const third = decideRunLivenessContinuation({
+      run: run({ continuationAttempt: 2 }),
+      issue: issue(),
+      agent: agent(),
+      livenessState: null,
+      livenessReason: null,
+      nextAction: null,
+      budgetBlocked: false,
+      idempotentWakeExists: false,
+      source: orphanedSource,
+    });
+    expect(third.kind).toBe("exhausted");
+    if (third.kind !== "exhausted") return;
+    expect(third.attempt).toBe(2);
+    expect(third.maxAttempts).toBe(DEFAULT_MAX_LIVENESS_CONTINUATION_ATTEMPTS);
   });
 
   it("waits for the grace period after the work stopped", () => {

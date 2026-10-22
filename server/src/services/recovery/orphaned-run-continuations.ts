@@ -28,6 +28,20 @@ export const ORPHANED_RUN_ISSUE_TERMINAL_ERROR_CODE =
 // state, so the error-code path can never share an idempotency key with the
 // liveness path.
 export const ORPHANED_RUN_CONTINUATION_KEY_SEGMENT = "orphaned_run";
+// The decisions the sweep takes about an orphaned run. A decided run is never
+// a candidate again, so the candidate window is bounded by the runs the sweep
+// has not decided yet instead of by the age of the table. Without this marker
+// a row the sweep skipped keeps its old timestamp forever, and once enough
+// such rows exist the sweep only ever sees those and a fresh orphan is never
+// reached.
+export const ORPHANED_RUN_CONTINUATION_DECISION_CONTINUED = "continued";
+export const ORPHANED_RUN_CONTINUATION_DECISION_EXHAUSTED = "exhausted";
+export const ORPHANED_RUN_CONTINUATION_DECISION_DISPATCHED_AGAIN =
+  "dispatched_again";
+export type OrphanedRunContinuationDecision =
+  | typeof ORPHANED_RUN_CONTINUATION_DECISION_CONTINUED
+  | typeof ORPHANED_RUN_CONTINUATION_DECISION_EXHAUSTED
+  | typeof ORPHANED_RUN_CONTINUATION_DECISION_DISPATCHED_AGAIN;
 // Grace period after the work stopped, before the continuation may fire.
 // The measured re-dispatch lag on 21 Oct 2026 was 1540s and 7016s, so the
 // grace must exceed the larger one.
@@ -153,16 +167,26 @@ export function evaluateOrphanedRunContinuationPreflight(input: {
   return { eligible: true, workStoppedAt };
 }
 
-// The full gate, including "the seat was not dispatched again on this issue".
+// The full gate, including the two "at most one" gates: the seat was not
+// dispatched again on this issue, and no continuation of this run is already
+// in flight. Production calls this helper, so the gates it holds are the
+// gates that decide.
 export function evaluateOrphanedRunContinuationEligibility(input: {
   run: OrphanedRunContinuationRun;
   now: Date;
   graceMs?: number;
   hostSaturated: boolean;
   laterRunOnIssue: boolean;
+  continuationInFlight: boolean;
 }): OrphanedRunContinuationEligibility {
   const preflight = evaluateOrphanedRunContinuationPreflight(input);
   if (!preflight.eligible) return preflight;
+  if (input.continuationInFlight) {
+    return {
+      eligible: false,
+      reason: "a continuation of this run is already in flight",
+    };
+  }
   if (input.laterRunOnIssue) {
     return {
       eligible: false,
