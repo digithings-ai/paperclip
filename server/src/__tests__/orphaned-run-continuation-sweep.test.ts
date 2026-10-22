@@ -345,6 +345,81 @@ describeEmbeddedPostgres("heartbeat sweepOrphanedRunContinuations", () => {
     return runIds.map((runId, index) => ({ runId, issueId: issueIds[index] }));
   }
 
+  // Rows the sweep can never act on: the process-death authority of the
+  // backstop does not require an issue, so a run can carry no issue id. Such
+  // a run can never be continued, so the sweep skips it without deciding
+  // about it and the row keeps its old timestamp. They are bulk seeded
+  // because the property is about the window size, not about the rows.
+  async function seedUndecidableOrphans(companyId: string, agentId: string, count: number) {
+    const runIds = Array.from({ length: count }, () => randomUUID());
+    await db.insert(heartbeatRuns).values(
+      runIds.map((runId, index) => ({
+        id: runId,
+        companyId,
+        agentId,
+        status: "interrupted",
+        invocationSource: "manual",
+        errorCode: ORPHANED_RUN_CONTINUATION_ERROR_CODE,
+        lastOutputAt: WORK_STOPPED_AT,
+        finishedAt: new Date(WORK_STOPPED_AT.getTime() + 30 * 60 * 1000),
+        createdAt: new Date(WORK_STOPPED_AT.getTime() - 60 * 60 * 1000),
+        // Older than the fresh orphan, so a window that never moves on sees
+        // only these rows.
+        updatedAt: new Date(WORK_STOPPED_AT.getTime() + index * 1000),
+        // No issue id in the context: the run can never be continued.
+        contextSnapshot: {},
+      })),
+    );
+    return runIds;
+  }
+
+  it("reaches a fresh orphan behind rows the sweep can never act on", async () => {
+    const { companyId, agentId } = await seed();
+
+    // More rows the sweep skips without deciding than the candidate window
+    // holds (the default limit is 200). They are older than the fresh orphan,
+    // so a sweep whose window never moves on sees only these and never
+    // reaches the fresh one.
+    await seedUndecidableOrphans(companyId, agentId, 201);
+
+    const freshIssueId = await seedIssue(companyId, agentId);
+    const freshRunId = await seedOrphan({
+      companyId,
+      agentId,
+      issueId: freshIssueId,
+      updatedAt: NOW,
+    });
+
+    // The window is a scan over an unbounded set, so the sweep keeps its
+    // position between ticks: one service instance, two ticks.
+    const service = heartbeat();
+    const first = await service.sweepOrphanedRunContinuations({
+      now: NOW,
+      graceMs: GRACE_MS,
+      hostHealth: HEALTHY_HOST,
+    });
+    expect(first.scanned).toBe(200);
+    expect(first.continued).toBe(0);
+
+    const second = await service.sweepOrphanedRunContinuations({
+      now: NOW,
+      graceMs: GRACE_MS,
+      hostHealth: HEALTHY_HOST,
+    });
+    expect(second.continued).toBe(1);
+
+    const wakes = await wakesFor(freshRunId, freshIssueId);
+    expect(wakes).toHaveLength(1);
+    expect(wakes[0]?.idempotencyKey).toBe(
+      buildOrphanedRunContinuationIdempotencyKey({
+        issueId: freshIssueId,
+        sourceRunId: freshRunId,
+        errorCode: ORPHANED_RUN_CONTINUATION_ERROR_CODE,
+        nextAttempt: 1,
+      }),
+    );
+  });
+
   it("reaches a fresh orphan however many decided rows the table holds", async () => {
     const { companyId, agentId } = await seed();
 
