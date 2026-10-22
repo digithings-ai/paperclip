@@ -517,7 +517,9 @@ describeEmbeddedPostgres("connection gateway tool brake", () => {
   });
 
   it("refuses a meta tool added to the catalogue after the allowlist was written", async () => {
-    const opened = await open([ALLOWED_TOOL], { seats: [{ allowlist: [ALLOWED_TOOL] }] });
+    const opened = await open([ALLOWED_TOOL], {
+      seats: [{ allowlist: [ALLOWED_TOOL, "atlassian.executeWrite"] }],
+    });
     const [application] = await db.select().from(toolApplications).where(eq(toolApplications.companyId, opened.companyId));
     await insertCatalogTool(db, opened.companyId, application!.id, opened.connectionId, "atlassian.executeWrite");
     expect(await upstreamNames(opened)).toEqual([ALLOWED_TOOL]);
@@ -614,6 +616,45 @@ describeEmbeddedPostgres("connection gateway tool brake", () => {
     const names = await upstreamNames(opened);
     expect(names).toContain(ALLOWED_TOOL);
     expect(names).not.toContain(OTHER_TOOL);
+  });
+
+  it("re-checks the allowlist before an approved call reaches upstream", async () => {
+    const opened = await open([ALLOWED_TOOL, OTHER_TOOL], {
+      seats: [{ allowlist: [ALLOWED_TOOL, OTHER_TOOL] }],
+    });
+    const otherName = mangled(opened, OTHER_TOOL);
+    await db.insert(toolPolicies).values({
+      companyId: opened.companyId,
+      name: `Review ${randomUUID()}`,
+      policyType: "require_approval",
+      selectors: { toolName: otherName },
+    });
+    const pending = await callTool(opened, OTHER_TOOL, { message: "reviewed" });
+    expect([pending.status, pending.reasonCode]).toEqual([409, "approval_required"]);
+    const [actionRequest] = await db.select().from(toolActionRequests).where(eq(toolActionRequests.companyId, opened.companyId));
+    const [interaction] = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.companyId, opened.companyId));
+    await db.update(issueThreadInteractions).set({
+      status: "accepted",
+      resolvedByUserId: "board-user",
+      resolvedAt: new Date(),
+      updatedAt: new Date(),
+    }).where(eq(issueThreadInteractions.id, interaction!.id));
+    const profiles = await db.select().from(toolProfiles).where(eq(toolProfiles.companyId, opened.companyId));
+    for (const profile of profiles) {
+      const metadata = (profile.metadata ?? {}) as Record<string, unknown>;
+      if (metadata[BRAKE.profileFlag] !== true) continue;
+      await db.update(toolProfiles).set({
+        metadata: { ...metadata, [BRAKE.allowlistKey]: [ALLOWED_TOOL] },
+      }).where(eq(toolProfiles.id, profile.id));
+    }
+    const before = opened.remote.requests.length;
+    await expect(opened.gateway.executeTool({
+      sessionToken: opened.seats[0]!.token,
+      tool: otherName,
+      approvedActionRequestId: actionRequest!.id,
+      parameters: { message: "reviewed" },
+    })).rejects.toMatchObject({ reasonCode: BRAKE.reasonAllowlistDenied });
+    expect(opened.remote.requests.length - before).toBe(0);
   });
 
   it("re-checks the allowlist at call time", async () => {

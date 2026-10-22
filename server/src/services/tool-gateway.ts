@@ -2752,6 +2752,26 @@ export function createToolGatewayService(
     }), signal);
   }
 
+
+  async function refuseIfConnectionToolBrakeDenies(
+    session: ToolGatewaySession,
+    tool: ToolGatewayDescriptor,
+    parameters: unknown,
+  ) {
+    const accessDecision = await policyService.decide(policyInputForTool({
+      session,
+      tool,
+      parameters,
+    }));
+    const reasonCode = String(accessDecision.reasonCode);
+    const refused = reasonCode === CONNECTION_GATEWAY_TOOL_BRAKE.reasonAllowlistAbsent
+      || reasonCode === CONNECTION_GATEWAY_TOOL_BRAKE.reasonAllowlistEmpty
+      || reasonCode === CONNECTION_GATEWAY_TOOL_BRAKE.reasonAllowlistDenied
+      || reasonCode === CONNECTION_GATEWAY_TOOL_BRAKE.reasonMetaTool;
+    if (!refused) return;
+    throw new ToolGatewayHttpError(403, accessDecision.explanation, reasonCode);
+  }
+
   function policyErrorStatus(decision: ToolAccessDecision) {
     if (decision.decision === "rate_limited") return 429;
     return 403;
@@ -8090,6 +8110,19 @@ export function createToolGatewayService(
     // reflectToolActionInteractionLifecycle.
     await assertIssueOpenForApprovedAction({ claimed, invocation });
 
+    try {
+      await refuseIfConnectionToolBrakeDenies(session, tool, parameters);
+    } catch (error) {
+      await markApprovedActionFailed({
+        actionRequestId: claimed.id,
+        invocationId: invocation.id,
+        claimUpdatedAt: claimed.updatedAt,
+        expectedInvocationStatus: "awaiting_approval",
+        error,
+      });
+      throw error;
+    }
+
     const startedAt = Date.now();
     await db
       .update(toolInvocations)
@@ -10445,6 +10478,7 @@ export function createToolGatewayService(
             toolName: storedInvocation.toolName,
           });
         }
+        await refuseIfConnectionToolBrakeDenies(session, tool, storedParameters);
         const claimedAt = new Date();
         const [claimed] = await db
           .update(toolActionRequests)
