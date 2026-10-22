@@ -2773,6 +2773,69 @@ async function getWorkspaceInheritanceIssue(
   return issue;
 }
 
+/**
+ * The execution-workspace policy stored on a project.
+ *
+ * Read before the workspace-inheritance branch of the create path decides
+ * whether a new issue is born isolated or may inherit the source issue's
+ * workspace, so the policy is available on the path that needs it.
+ */
+async function loadProjectExecutionWorkspacePolicy(
+  db: DbReader,
+  companyId: string,
+  projectId: string | null | undefined,
+): Promise<ReturnType<typeof parseProjectExecutionWorkspacePolicy>> {
+  if (!projectId) return null;
+  const project = await db
+    .select({ executionWorkspacePolicy: projects.executionWorkspacePolicy })
+    .from(projects)
+    .where(and(eq(projects.id, projectId), eq(projects.companyId, companyId)))
+    .then((rows) => rows[0] ?? null);
+  return parseProjectExecutionWorkspacePolicy(project?.executionWorkspacePolicy);
+}
+
+/**
+ * The project that owns a workspace.
+ *
+ * A create can name a workspace without naming a project, and the project is
+ * what carries the execution-workspace policy, so the policy of a
+ * workspace-only create is the policy of the workspace's project.
+ */
+async function resolveWorkspaceOwnerProjectId(
+  db: DbReader,
+  companyId: string,
+  projectWorkspaceId: string | null | undefined,
+  executionWorkspaceId: string | null | undefined,
+): Promise<string | null> {
+  if (projectWorkspaceId) {
+    const workspace = await db
+      .select({ projectId: projectWorkspaces.projectId })
+      .from(projectWorkspaces)
+      .where(
+        and(
+          eq(projectWorkspaces.id, projectWorkspaceId),
+          eq(projectWorkspaces.companyId, companyId),
+        ),
+      )
+      .then((rows) => rows[0] ?? null);
+    if (workspace?.projectId) return workspace.projectId;
+  }
+  if (executionWorkspaceId) {
+    const workspace = await db
+      .select({ projectId: executionWorkspaces.projectId })
+      .from(executionWorkspaces)
+      .where(
+        and(
+          eq(executionWorkspaces.id, executionWorkspaceId),
+          eq(executionWorkspaces.companyId, companyId),
+        ),
+      )
+      .then((rows) => rows[0] ?? null);
+    if (workspace?.projectId) return workspace.projectId;
+  }
+  return null;
+}
+
 // Mine participation fails closed. Add new user-authored issue mutation actions
 // here instead of admitting every issue activity, because reads, previews, and
 // denied resource requests are audited too.
@@ -9973,61 +10036,96 @@ export function issueService(db: Db) {
           issueData.executionWorkspaceId !== undefined ||
           issueData.executionWorkspacePreference !== undefined ||
           issueData.executionWorkspaceSettings !== undefined;
-        if (workspaceInheritanceIssueId) {
-          const workspaceSource = await getWorkspaceInheritanceIssue(
+        // The inheritance source is resolved before the project policy is
+        // read: the effective project of the new issue can come from the
+        // source issue, and the policy is what decides whether this create is
+        // born isolated or may inherit the source's workspace.
+        const workspaceSource = workspaceInheritanceIssueId
+          ? await getWorkspaceInheritanceIssue(
+              tx,
+              companyId,
+              workspaceInheritanceIssueId,
+            )
+          : null;
+        if (issueData.projectId == null && workspaceSource?.projectId) {
+          issueData.projectId = workspaceSource.projectId;
+        }
+        // Workspace linkage is only inheritable inside the source project. A
+        // cross-project child (for example, a Paperclip ID issue created from
+        // a Paperclip App parent) must fall through to its own project's
+        // default workspaces, otherwise the inherited ids fail the
+        // project-match assertions below and the create is impossible without
+        // the caller naming the target workspaces explicitly.
+        const inheritsSourceProject =
+          !workspaceSource ||
+          issueData.projectId == null ||
+          issueData.projectId === workspaceSource.projectId;
+        if (
+          inheritsSourceProject &&
+          projectWorkspaceId == null &&
+          workspaceSource?.projectWorkspaceId
+        ) {
+          projectWorkspaceId = workspaceSource.projectWorkspaceId;
+        }
+        // The project policy is read before the inheritance branch below runs.
+        // That branch is what turns a null birth preference into
+        // `reuse_existing` on a child of a bound issue, so a policy that was
+        // only applied afterwards would never suppress the inheritance.
+        const policyProjectId =
+          issueData.projectId ??
+          (await resolveWorkspaceOwnerProjectId(
             tx,
             companyId,
-            workspaceInheritanceIssueId,
-          );
-          if (issueData.projectId == null && workspaceSource.projectId) {
-            issueData.projectId = workspaceSource.projectId;
-          }
-          // Workspace linkage is only inheritable inside the source project. A
-          // cross-project child (for example, a Paperclip ID issue created from
-          // a Paperclip App parent) must fall through to its own project's
-          // default workspaces, otherwise the inherited ids fail the
-          // project-match assertions below and the create is impossible without
-          // the caller naming the target workspaces explicitly.
-          const inheritsSourceProject =
-            issueData.projectId == null ||
-            issueData.projectId === workspaceSource.projectId;
-          if (
-            inheritsSourceProject &&
-            projectWorkspaceId == null &&
-            workspaceSource.projectWorkspaceId
-          ) {
-            projectWorkspaceId = workspaceSource.projectWorkspaceId;
-          }
-          if (
-            inheritsSourceProject &&
-            isolatedWorkspacesEnabled &&
-            !hasExplicitExecutionWorkspaceOverride &&
-            workspaceSource.executionWorkspaceId
-          ) {
-            const sourceWorkspace = await tx
-              .select({
-                id: executionWorkspaces.id,
-                mode: executionWorkspaces.mode,
-              })
-              .from(executionWorkspaces)
-              .where(
-                eq(
-                  executionWorkspaces.id,
-                  workspaceSource.executionWorkspaceId,
-                ),
-              )
-              .then((rows) => rows[0] ?? null);
-            if (sourceWorkspace) {
-              executionWorkspaceId = sourceWorkspace.id;
-              executionWorkspacePreference = "reuse_existing";
-              executionWorkspaceSettings = {
-                ...((workspaceSource.executionWorkspaceSettings as
-                  Record<string, unknown> | null | undefined) ?? {}),
-                mode: issueExecutionWorkspaceModeForPersistedWorkspace(
-                  sourceWorkspace.mode,
-                ),
-              };
-            }
+            projectWorkspaceId,
+            executionWorkspaceId,
+          ));
+        const effectiveProjectPolicy = gateProjectExecutionWorkspacePolicy(
+          await loadProjectExecutionWorkspacePolicy(
+            tx,
+            companyId,
+            policyProjectId,
+          ),
+          isolatedWorkspacesEnabled,
+        );
+        // A create that carries no explicit execution-workspace override is
+        // born isolated when its project says so. Without this the issue is
+        // born with a null preference, and a null preference is what lets the
+        // inheritance branch below bind the issue to the parent's workspace.
+        const policyIsolatesThisCreate =
+          !hasExplicitExecutionWorkspaceOverride &&
+          effectiveProjectPolicy?.enabled === true &&
+          effectiveProjectPolicy.defaultMode === "isolated_workspace";
+        if (policyIsolatesThisCreate) {
+          executionWorkspacePreference = "isolated_workspace";
+          executionWorkspaceSettings = { mode: "isolated_workspace" };
+        }
+        const sourceExecutionWorkspaceId =
+          workspaceSource?.executionWorkspaceId ?? null;
+        if (
+          inheritsSourceProject &&
+          isolatedWorkspacesEnabled &&
+          !hasExplicitExecutionWorkspaceOverride &&
+          !policyIsolatesThisCreate &&
+          sourceExecutionWorkspaceId
+        ) {
+          const sourceWorkspace = await tx
+            .select({
+              id: executionWorkspaces.id,
+              mode: executionWorkspaces.mode,
+            })
+            .from(executionWorkspaces)
+            .where(eq(executionWorkspaces.id, sourceExecutionWorkspaceId))
+            .then((rows) => rows[0] ?? null);
+          if (sourceWorkspace) {
+            executionWorkspaceId = sourceWorkspace.id;
+            executionWorkspacePreference = "reuse_existing";
+            executionWorkspaceSettings = {
+              ...((workspaceSource?.executionWorkspaceSettings as
+                Record<string, unknown> | null | undefined) ?? {}),
+              mode: issueExecutionWorkspaceModeForPersistedWorkspace(
+                sourceWorkspace.mode,
+              ),
+            };
           }
         }
         if (issueData.projectId == null && projectWorkspaceId) {
@@ -10062,21 +10160,10 @@ export function issueService(db: Db) {
         const loadProjectPolicyOnce = async () => {
           if (projectPolicyLoaded) return projectPolicyCached;
           projectPolicyLoaded = true;
-          if (!issueData.projectId) return null;
-          const projectRow = await tx
-            .select({
-              executionWorkspacePolicy: projects.executionWorkspacePolicy,
-            })
-            .from(projects)
-            .where(
-              and(
-                eq(projects.id, issueData.projectId),
-                eq(projects.companyId, companyId),
-              ),
-            )
-            .then((rows) => rows[0] ?? null);
-          projectPolicyCached = parseProjectExecutionWorkspacePolicy(
-            projectRow?.executionWorkspacePolicy,
+          projectPolicyCached = await loadProjectExecutionWorkspacePolicy(
+            tx,
+            companyId,
+            issueData.projectId,
           );
           return projectPolicyCached;
         };
@@ -10105,21 +10192,7 @@ export function issueService(db: Db) {
             )?.mode,
           }) ?? executionWorkspacePreference;
         if (!projectWorkspaceId && issueData.projectId) {
-          const project = await tx
-            .select({
-              executionWorkspacePolicy: projects.executionWorkspacePolicy,
-            })
-            .from(projects)
-            .where(
-              and(
-                eq(projects.id, issueData.projectId),
-                eq(projects.companyId, companyId),
-              ),
-            )
-            .then((rows) => rows[0] ?? null);
-          const projectPolicy = parseProjectExecutionWorkspacePolicy(
-            project?.executionWorkspacePolicy,
-          );
+          const projectPolicy = await loadProjectPolicyOnce();
           projectWorkspaceId = projectPolicy?.defaultProjectWorkspaceId ?? null;
           if (!projectWorkspaceId) {
             projectWorkspaceId = await tx
