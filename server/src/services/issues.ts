@@ -11,6 +11,7 @@ import type { ExecutionProjection } from "@paperclipai/shared";
 import { Buffer } from "node:buffer";
 import { createHash, randomUUID } from "node:crypto";
 import { isExplicitContinuationRetryClaim } from "./explicit-continuation-retry-claim.js";
+import { bindRunSourceIssueToCheckout } from "./run-source-issue.js";
 import { markdownToPlainText, parseMarkdown } from "chat";
 import {
   and,
@@ -7580,6 +7581,7 @@ export function issueService(db: Db) {
         )
         .returning({
           id: issues.id,
+          companyId: issues.companyId,
           status: issues.status,
           assigneeAgentId: issues.assigneeAgentId,
           checkoutRunId: issues.checkoutRunId,
@@ -7645,6 +7647,7 @@ export function issueService(db: Db) {
         )
         .returning({
           id: issues.id,
+          companyId: issues.companyId,
           status: issues.status,
           assigneeAgentId: issues.assigneeAgentId,
           checkoutRunId: issues.checkoutRunId,
@@ -7654,6 +7657,44 @@ export function issueService(db: Db) {
 
       return adopted;
     });
+  }
+
+  // Adoption is a checkout by another name: it hands the issue's lock to the
+  // actor's run, exactly as the checkout route does, but it happens inside
+  // assertCheckoutOwner instead of in the route -- so the step that records
+  // the run's scope never ran. A run admitted without an issue then owns an
+  // issue with no source issue, and the interaction scope guard refuses the
+  // cards it posts on the very issue it owns. Bind it here, where the lock
+  // moves. bindRunSourceIssueToCheckout fills a gap only: a run that already
+  // names a source issue keeps it, so this cannot hand a run another issue's
+  // scope.
+  async function bindAdoptedRunSourceIssue(input: {
+    issueId: string;
+    companyId: string;
+    actorAgentId: string;
+    actorRunId: string;
+  }) {
+    try {
+      const bound = await bindRunSourceIssueToCheckout(db, {
+        runId: input.actorRunId,
+        companyId: input.companyId,
+        issueId: input.issueId,
+        agentId: input.actorAgentId,
+      });
+      if (!bound) {
+        logger.error(
+          { runId: input.actorRunId, issueId: input.issueId },
+          "adopted checkout run could not be bound to its source issue",
+        );
+      }
+    } catch (err) {
+      // The adoption is committed and must not fail because of this. Log
+      // loudly: without the binding this run's own cards are refused.
+      logger.error(
+        { err, runId: input.actorRunId, issueId: input.issueId },
+        "failed to bind the adopted checkout run's source issue",
+      );
+    }
   }
 
   async function clearExecutionRunIfTerminal(
@@ -11756,6 +11797,12 @@ export function issueService(db: Db) {
           });
 
           if (adopted) {
+            await bindAdoptedRunSourceIssue({
+              issueId: id,
+              companyId: adopted.companyId,
+              actorAgentId,
+              actorRunId: actorRunId!,
+            });
             return {
               ownership: {
                 ...adopted,
@@ -11782,6 +11829,12 @@ export function issueService(db: Db) {
           });
 
           if (staleAdoption.adopted) {
+            await bindAdoptedRunSourceIssue({
+              issueId: id,
+              companyId: staleAdoption.adopted.companyId,
+              actorAgentId,
+              actorRunId,
+            });
             return {
               ownership: {
                 ...staleAdoption.adopted,
