@@ -1047,6 +1047,11 @@ export const TOOL_CONNECTION_HEALTH_STATUSES = [
   // connection: the connection stays discoverable so its other tools keep
   // working and the next successful call restores "ok".
   "tool_timeout",
+  // A background health probe failed. One failed probe is one sample, not
+  // proof that every call will fail, so the connection stays discoverable and
+  // a call that really fails answers with the real error at call time. The
+  // precise reason stays in the health message and in the audit record.
+  "probe_failed",
 ] as const;
 export type ToolConnectionHealthStatus = (typeof TOOL_CONNECTION_HEALTH_STATUSES)[number];
 
@@ -1060,6 +1065,10 @@ export const TOOL_CONNECTION_ATTENTION_HEALTH_STATUSES: readonly ToolConnectionH
   "failed",
   "error",
   "missing_secret",
+  // A failed background probe still needs a human. This list only drives the
+  // needs-attention surfaces. It never hides a connection from the
+  // catalogue: the catalogue filter is a separate list.
+  "probe_failed",
 ];
 
 export function isToolConnectionAttentionHealth(status: ToolConnectionHealthStatus): boolean {

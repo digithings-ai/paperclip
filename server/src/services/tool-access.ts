@@ -7508,7 +7508,7 @@ export function toolAccessService(
   async function checkConnectionHealth(
     connectionId: string,
     actor?: ActorInfo,
-    options: { allowUnauthenticatedProbe?: boolean } = {},
+    options: { allowUnauthenticatedProbe?: boolean; probe?: boolean } = {},
   ): Promise<ToolConnectionHealthCheckResult> {
     const connection = await getConnectionRow(connectionId);
     if (connection.connectionPurpose === "ai") return { connection: toConnection(connection), runtimeSlot: null };
@@ -7612,9 +7612,18 @@ export function toolAccessService(
       )
         throw error;
       const failure = sanitizeHttpFailure(error);
+      // A background probe is one sample. It is not proof that every call
+      // will fail, so it must not write a status that hides the connection
+      // from every session's catalogue. The probe failure gets its own
+      // status, and the precise reason stays in the health message and in
+      // the audit record. A call that really fails answers at call time.
+      // A user-initiated check keeps the conclusive status, because that
+      // check did prove the credential is gone.
+      const status: ToolConnectionHealthStatus =
+        options.probe === true ? "probe_failed" : failure.status;
       const updated = await updateConnectionHealth(
         connection,
-        failure.status,
+        status,
         failure.message,
       );
       const runtimeSlot =
@@ -7628,7 +7637,7 @@ export function toolAccessService(
         outcome: "failure",
         reasonCode: failure.code,
         actor,
-        details: { status: failure.status, transport: connection.transport },
+        details: { status, transport: connection.transport, probe: options.probe === true },
       });
       throw new HttpError(healthFailureHttpStatus(failure), failure.message, {
         code: failure.code,
@@ -8148,10 +8157,16 @@ export function toolAccessService(
     const failedConnectionIds: string[] = [];
     for (const connection of due) {
       try {
-        await checkConnectionHealth(connection.id, {
-          actorType: "system",
-          actorId: "tool_health_sweep",
-        });
+        await checkConnectionHealth(
+          connection.id,
+          {
+            actorType: "system",
+            actorId: "tool_health_sweep",
+          },
+          // This probe is one sample, not a verdict. It must not write a
+          // status that hides the connection from every session.
+          { probe: true },
+        );
         healthy += 1;
       } catch {
         failed += 1;

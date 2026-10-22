@@ -18008,8 +18008,11 @@ describeEmbeddedPostgres("tool access service", () => {
       failed: 1,
       failedConnectionIds: [connection.id],
     });
+    // The sweep is one sample. It is not proof that every call fails, so it
+    // writes a status that keeps the connection in the catalogue of every
+    // session. The reason stays in the message and in the audit record.
     expect(updatedConnection).toMatchObject({
-      healthStatus: "error",
+      healthStatus: "probe_failed",
       healthMessage: "revoked token",
       lastError: "revoked token",
     });
@@ -18019,6 +18022,21 @@ describeEmbeddedPostgres("tool access service", () => {
       lastError: null,
       healthCheckedAt: new Date(0),
       lastHealthAt: new Date(0),
+    });
+
+    // A health check that a person asked for is not a sample. That check did
+    // try the connection, so it keeps the conclusive status.
+    await expect(
+      service.checkHealth(connection.id, { actorType: "user", actorId: "board" }),
+    ).rejects.toThrow(/revoked token/);
+    const [recheckedConnection] = await db
+      .select()
+      .from(toolConnections)
+      .where(eq(toolConnections.id, connection.id));
+    expect(recheckedConnection).toMatchObject({
+      healthStatus: "error",
+      healthMessage: "revoked token",
+      lastError: "revoked token",
     });
   });
 

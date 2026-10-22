@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { createServer, type IncomingMessage } from "node:http";
 import express from "express";
-import { and, eq, sql } from "drizzle-orm";
+import { and, eq, ne, sql } from "drizzle-orm";
 import request from "supertest";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
@@ -44,6 +44,7 @@ import {
   userSecretDefinitions,
 } from "@paperclipai/db";
 import { buildPaperclipRuntimeMcpServers } from "../services/heartbeat.js";
+import type { ToolConnectionHealthStatus } from "@paperclipai/shared";
 import { resolveNativeRuntimeMcpSnapshot } from "../services/native-runtime/runtime-context.js";
 import type { PluginToolDispatcher } from "../services/plugin-tool-dispatcher.js";
 import { mcpGatewayProtocolRoutes, toolGatewayRoutes } from "../routes/tool-gateway.js";
@@ -199,7 +200,7 @@ async function createRemoteMcpTool(
     title?: string | null;
     connectionEnabled?: boolean;
     connectionStatus?: "draft" | "active" | "disabled" | "archived";
-    healthStatus?: "unknown" | "healthy" | "degraded" | "failed" | "unchecked" | "ok" | "error" | "missing_secret";
+    healthStatus?: ToolConnectionHealthStatus;
     catalogStatus?: "active" | "disabled" | "quarantined" | "removed";
     quarantinedAt?: Date | null;
     credentialRefs?: typeof toolConnections.$inferInsert["credentialRefs"];
@@ -307,7 +308,7 @@ async function createLocalStdioMcpTool(
     title?: string | null;
     connectionEnabled?: boolean;
     connectionStatus?: "draft" | "active" | "disabled" | "archived";
-    healthStatus?: "unknown" | "healthy" | "degraded" | "failed" | "unchecked" | "ok" | "error" | "missing_secret";
+    healthStatus?: ToolConnectionHealthStatus;
     catalogStatus?: "active" | "disabled" | "quarantined" | "removed";
     riskLevel?: "read" | "write" | "destructive";
     credentialPolicy?: "shared" | "per_user" | "per_user_with_fallback";
@@ -4493,6 +4494,90 @@ rl.on("line", (line) => {
           throw new Error("Expected remote MCP call to time out");
         },
         (error) => expectGatewayError(error, 504, "tool_timeout"),
+      );
+    } finally {
+      await fake.close();
+    }
+  });
+
+  it("keeps a connection discoverable after a background health probe fails, and fails the call at call time", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    const fake = await startFakeRemoteMcpServer(() => ({
+      status: 503,
+      body: {
+        jsonrpc: "2.0",
+        id: "probe",
+        error: { code: -32000, message: "upstream unavailable" },
+      },
+    }));
+    try {
+      const probed = await createRemoteMcpTool(db, company.id, {
+        applicationKey: "probe-failure",
+        toolName: "kv_get",
+        url: fake.url,
+      });
+      const condemned = await createRemoteMcpTool(db, company.id, {
+        applicationKey: "probe-failure-condemned",
+        toolName: "kv_set",
+        url: fake.url,
+        healthStatus: "error",
+      });
+      await allowAllToolsForAgent(db, company.id, agent.id);
+      // Only the new connection is due for a probe.
+      await db
+        .update(toolConnections)
+        .set({ healthCheckedAt: new Date() })
+        .where(ne(toolConnections.id, probed.connection.id));
+
+      const access = toolAccessService(db);
+      const sweep = await access.sweepConnectionHealth();
+      expect(sweep.failedConnectionIds).toContain(probed.connection.id);
+
+      // The probe records its own status. It does not write a status that
+      // hides the connection from every session.
+      const [connection] = await db
+        .select()
+        .from(toolConnections)
+        .where(eq(toolConnections.id, probed.connection.id));
+      expect(connection.healthStatus).toBe("probe_failed");
+
+      const gateway = createTestToolGatewayService(db);
+      const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+      const probedName = expectedConnectedToolName({
+        applicationKey: "probe-failure",
+        connectionId: probed.connection.id,
+        toolName: probed.catalogEntry.toolName,
+      });
+      const condemnedName = expectedConnectedToolName({
+        applicationKey: "probe-failure-condemned",
+        connectionId: condemned.connection.id,
+        toolName: condemned.catalogEntry.toolName,
+      });
+
+      const listed = await gateway.listToolsForSession(session.token);
+      expect(listed.map((tool) => tool.name)).toContain(probedName);
+      // A connection whose every call will fail is still hidden.
+      expect(listed.map((tool) => tool.name)).not.toContain(condemnedName);
+
+      // The call fails at call time, with the real reason. It is not a
+      // 404 tool_not_found from the lookup.
+      await gateway.executeTool({
+        sessionToken: session.token,
+        tool: probedName,
+        parameters: { key: "alpha" },
+        timeoutMs: 5000,
+      }).then(
+        () => {
+          throw new Error("Expected the remote MCP call to fail");
+        },
+        (error) => {
+          expect(error).toBeInstanceOf(ToolGatewayHttpError);
+          const gatewayError = error as ToolGatewayHttpError;
+          expect(gatewayError.status).not.toBe(404);
+          expect(gatewayError.reasonCode).not.toBe("tool_not_found");
+        },
       );
     } finally {
       await fake.close();
