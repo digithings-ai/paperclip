@@ -8,6 +8,7 @@ import { HttpError } from "../errors.js";
 import { claimSlackRateLimitRetry } from "./connectors/slack-retry.js";
 import { resolveSlackTaskAuthority } from "./connectors/slack-authority.js";
 import { SLACK_TOOLS } from "@paperclipai/shared";
+import { CONNECTION_GATEWAY_TOOL_BRAKE } from "@paperclipai/shared/constants";
 import type { ToolConnectionHealthStatus } from "@paperclipai/shared";
 import { slackToolsForSession } from "./connectors/slack-catalog.js";
 import { executeSlackTool } from "./connectors/slack.js";
@@ -3048,6 +3049,7 @@ export function createToolGatewayService(
             }
           : tool,
       );
+    const considered = [...decisions];
     if (onDemandTargets.length > 0) {
       const targetDecisions = await decideToolsForListing(
         onDemandTargets,
@@ -3055,6 +3057,7 @@ export function createToolGatewayService(
         decisionCache,
         signal,
       );
+      considered.push(...targetDecisions);
       if (
         targetDecisions.some(
           ({ decision }) =>
@@ -3063,6 +3066,18 @@ export function createToolGatewayService(
       ) {
         visibleTools.push(...VIRTUAL_TOOLS);
       }
+    }
+    const loudDenial = considered.find(({ decision }) => {
+      const reasonCode = String(decision.reasonCode);
+      return reasonCode === CONNECTION_GATEWAY_TOOL_BRAKE.reasonAllowlistAbsent
+        || reasonCode === CONNECTION_GATEWAY_TOOL_BRAKE.reasonAllowlistEmpty;
+    });
+    if (loudDenial && visibleTools.length === 0) {
+      throw new ToolGatewayHttpError(
+        403,
+        loudDenial.decision.explanation,
+        loudDenial.decision.reasonCode,
+      );
     }
     return visibleTools;
   }

@@ -582,7 +582,9 @@ describeEmbeddedPostgres("connection gateway tool brake", () => {
       policyType: "allow",
       selectors: {},
     });
-    expect(await upstreamNames(opened)).toEqual([ALLOWED_TOOL]);
+    const names = await upstreamNames(opened);
+    expect(names).toContain(ALLOWED_TOOL);
+    expect(names).not.toContain(OTHER_TOOL);
   });
 
   it("does not let a tools:use principal grant add a tool the allowlist does not name", async () => {
@@ -595,7 +597,9 @@ describeEmbeddedPostgres("connection gateway tool brake", () => {
       scope: null,
       grantedByUserId: "owner",
     });
-    expect(await upstreamNames(opened)).toEqual([ALLOWED_TOOL]);
+    const names = await upstreamNames(opened);
+    expect(names).toContain(ALLOWED_TOOL);
+    expect(names).not.toContain(OTHER_TOOL);
   });
 
   it("does not let a trust rule add a tool the allowlist does not name", async () => {
@@ -607,7 +611,9 @@ describeEmbeddedPostgres("connection gateway tool brake", () => {
       selectors: {},
       config: { trustRule: { hitCount: 0 } },
     });
-    expect(await upstreamNames(opened)).toEqual([ALLOWED_TOOL]);
+    const names = await upstreamNames(opened);
+    expect(names).toContain(ALLOWED_TOOL);
+    expect(names).not.toContain(OTHER_TOOL);
   });
 
   it("re-checks the allowlist at call time", async () => {

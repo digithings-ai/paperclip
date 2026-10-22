@@ -42,6 +42,7 @@ import type {
   ToolRiskLevel,
 } from "@paperclipai/shared";
 import { toolPolicyConditionsSchema } from "@paperclipai/shared";
+import { CONNECTION_GATEWAY_TOOL_BRAKE } from "@paperclipai/shared/constants";
 import { badRequest, conflict, notFound, unprocessable } from "../errors.js";
 import {
   effectiveToolProfileBindings,
@@ -1335,11 +1336,156 @@ export function toolAccessPolicyService(db: Db) {
     });
   }
 
+
+  function connectionGatewayMetaTool(rawName: string): boolean {
+    const refused = new Set(
+      CONNECTION_GATEWAY_TOOL_BRAKE.metaSegments.map((segment) => segment.toLowerCase()),
+    );
+    const normalised = rawName.replace(/[^a-zA-Z0-9_-]/g, "_").toLowerCase();
+    return normalised.split(/[._-]/).some((segment) => refused.has(segment));
+  }
+
+  function readConnectionAllowlist(metadata: unknown):
+    | { kind: "absent" }
+    | { kind: "empty" }
+    | { kind: "names"; names: string[] } {
+    if (!isRecord(metadata) || !(CONNECTION_GATEWAY_TOOL_BRAKE.allowlistKey in metadata)) {
+      return { kind: "absent" };
+    }
+    const value = metadata[CONNECTION_GATEWAY_TOOL_BRAKE.allowlistKey];
+    if (!Array.isArray(value)) return { kind: "absent" };
+    const names = value.filter((item): item is string => typeof item === "string");
+    if (names.length === 0) return { kind: "empty" };
+    return { kind: "names", names };
+  }
+
+  function brakeDecision(
+    ordinary: ToolAccessDecision,
+    reasonCode: string,
+    explanation: string,
+  ): ToolAccessDecision {
+    return {
+      ...ordinary,
+      decision: "deny",
+      allowed: false,
+      reasonCode: reasonCode as ToolAccessReasonCode,
+      explanation,
+    };
+  }
+
+  type ConnectionToolCeiling =
+    | { governed: false }
+    | { governed: true; kind: "absent" }
+    | { governed: true; kind: "empty" }
+    | { governed: true; kind: "names"; names: ReadonlySet<string> };
+
+  async function connectionToolCeiling(
+    ctx: ToolAccessContext,
+    cache: ToolAccessDecisionCache | undefined,
+  ): Promise<ConnectionToolCeiling> {
+    if (!ctx.connectionId) return { governed: false };
+    const key = [
+      "connection-tool-brake",
+      ctx.companyId,
+      ctx.agentId,
+      ctx.gatewayId,
+      ctx.issueId,
+      ctx.projectId,
+      ctx.routineId,
+      ctx.connectionId,
+    ].join(":");
+    return cachedRead(cache, key, async (): Promise<ConnectionToolCeiling> => {
+      const bindings = await db.select().from(toolProfileBindings).where(
+        eq(toolProfileBindings.companyId, ctx.companyId),
+      );
+      const matching = bindings.filter((binding) => targetMatches(binding, ctx));
+      if (matching.length === 0) return { governed: false };
+      const profiles = await db.select().from(toolProfiles).where(
+        inArray(toolProfiles.id, matching.map((binding) => binding.profileId)),
+      );
+      if (profiles.length === 0) return { governed: false };
+      const entries = await db.select().from(toolProfileEntries).where(
+        inArray(toolProfileEntries.profileId, profiles.map((profile) => profile.id)),
+      );
+      const governing = profiles.filter((profile) => {
+        if (profile.status !== "active" || profile.defaultAction !== "deny") return false;
+        if (!isRecord(profile.metadata)) return false;
+        if (profile.metadata[CONNECTION_GATEWAY_TOOL_BRAKE.profileFlag] !== true) return false;
+        const connectionEntries = entries.filter(
+          (entry) => entry.profileId === profile.id && entry.selectorType === "connection",
+        );
+        if (connectionEntries.length === 0) return true;
+        return connectionEntries.some(
+          (entry) => entry.effect === "include" && entry.connectionId === ctx.connectionId,
+        );
+      });
+      if (governing.length === 0) return { governed: false };
+      const lists = governing.map((profile) => readConnectionAllowlist(profile.metadata));
+      if (lists.some((list) => list.kind === "absent")) return { governed: true, kind: "absent" };
+      if (lists.some((list) => list.kind === "empty")) return { governed: true, kind: "empty" };
+      let names: Set<string> | null = null;
+      for (const list of lists) {
+        if (list.kind !== "names") continue;
+        const next = new Set(list.names);
+        if (names === null) {
+          names = next;
+          continue;
+        }
+        names = new Set([...names].filter((name) => next.has(name)));
+      }
+      return { governed: true, kind: "names", names: names ?? new Set<string>() };
+    });
+  }
+
+  async function applyConnectionToolBrake(
+    input: ToolAccessDecisionInput,
+    ctx: ToolAccessContext,
+    ordinary: ToolAccessDecision,
+    cache: ToolAccessDecisionCache | undefined,
+  ): Promise<ToolAccessDecision> {
+    const ceiling = await connectionToolCeiling(ctx, cache);
+    if (!ceiling.governed) return ordinary;
+    const rawName = ctx.upstreamToolName;
+    if (typeof rawName === "string" && connectionGatewayMetaTool(rawName)) {
+      const denied = brakeDecision(
+        ordinary,
+        CONNECTION_GATEWAY_TOOL_BRAKE.reasonMetaTool,
+        "Meta tool refused before the connection allowlist is applied.",
+      );
+      await writeAudit(input, denied);
+      return denied;
+    }
+    if (ceiling.kind === "absent" || ceiling.kind === "empty") {
+      const absent = ceiling.kind === "absent";
+      const denied = brakeDecision(
+        ordinary,
+        absent
+          ? CONNECTION_GATEWAY_TOOL_BRAKE.reasonAllowlistAbsent
+          : CONNECTION_GATEWAY_TOOL_BRAKE.reasonAllowlistEmpty,
+        absent
+          ? "Connection tool allowlist is absent."
+          : "Connection tool allowlist is empty.",
+      );
+      await writeAudit(input, denied);
+      return denied;
+    }
+    if (ordinary.decision !== "allow" && ordinary.decision !== "require_approval") return ordinary;
+    if (typeof rawName === "string" && ceiling.names.has(rawName)) return ordinary;
+    const denied = brakeDecision(
+      ordinary,
+      CONNECTION_GATEWAY_TOOL_BRAKE.reasonAllowlistDenied,
+      "Tool is outside the connection tool allowlist.",
+    );
+    await writeAudit(input, denied);
+    return denied;
+  }
+
   /**
    * Decides one tool access request. Pass the same `cache` to every call of a
    * batch that shares one actor and run context (for example, one tools/list
    * response) so the batch reads the shared policy inputs once.
    */
+
   async function decide(
     input: ToolAccessDecisionInput,
     options: { cache?: ToolAccessDecisionCache } = {},
@@ -1350,6 +1496,7 @@ export function toolAccessPolicyService(db: Db) {
     const loaded = await loadContext(input, cache);
     if (!loaded.ok) return loaded.decision;
     const { ctx, redaction } = loaded;
+    const brake = (ordinary: ToolAccessDecision) => applyConnectionToolBrake(input, ctx, ordinary, cache);
     const profileState = await effectiveProfiles(ctx, cache);
     const effectiveProfileIds = profileState.profiles.map((profile) => profile.id);
     const permittedByProfile = profileState.profiles.some((profile) => {
@@ -1364,7 +1511,7 @@ export function toolAccessPolicyService(db: Db) {
       if (conditions && selectorMatches(policy.selectors, ctx)) {
         const parsed = toolPolicyConditionsSchema.safeParse(conditions);
         if (!parsed.success) {
-          return decision(
+          return brake(decision(
             "deny",
             "deny_policy_block",
             "Tool access denied because a matching policy uses unsupported runtime conditions.",
@@ -1382,7 +1529,7 @@ export function toolAccessPolicyService(db: Db) {
                 })),
               },
             },
-          );
+          ));
         }
       }
     }
@@ -1398,32 +1545,32 @@ export function toolAccessPolicyService(db: Db) {
         conditionsMatched: conditionEvaluation.matchedGroups,
       };
       if (unsupportedRuntimePolicyType(policy.policyType)) {
-        return decision(
+        return brake(decision(
           "deny",
           "deny_policy_block",
           "Tool access denied because a matching policy uses unsupported runtime semantics.",
           effectiveProfileIds,
           [policy.id],
           { redactionPlan: redaction.redactionPlan, policyExplanation },
-        );
+        ));
       }
       if (policy.policyType === "block") {
-        return decision("deny", "deny_policy_block", policy.description ?? "Tool access is blocked by policy.", effectiveProfileIds, [policy.id], { redactionPlan: redaction.redactionPlan, policyExplanation });
+        return brake(decision("deny", "deny_policy_block", policy.description ?? "Tool access is blocked by policy.", effectiveProfileIds, [policy.id], { redactionPlan: redaction.redactionPlan, policyExplanation }));
       }
       if (policy.policyType === "rate_limit") {
         if (!rateLimitRule(policy)) {
-          return decision(
+          return brake(decision(
             "deny",
             "deny_policy_block",
             "Tool access denied because a matching rate-limit policy has invalid runtime config.",
             effectiveProfileIds,
             [policy.id],
             { redactionPlan: redaction.redactionPlan, policyExplanation },
-          );
+          ));
         }
         const state = await enforceRateLimit(policy, ctx, input.consumeRateLimit === true);
         if (state?.limited) {
-          return decision("rate_limited", "rate_limited", "Tool access rate limit exceeded.", effectiveProfileIds, [policy.id], { rateLimitState: state, redactionPlan: redaction.redactionPlan, policyExplanation });
+          return brake(decision("rate_limited", "rate_limited", "Tool access rate limit exceeded.", effectiveProfileIds, [policy.id], { rateLimitState: state, redactionPlan: redaction.redactionPlan, policyExplanation }));
         }
         continue;
       }
@@ -1433,38 +1580,38 @@ export function toolAccessPolicyService(db: Db) {
         if (!argumentFiltersMatch(rule.argumentFilters, ctx)) continue;
         // Remembered permissions cannot override an explicit block. Preserve
         // priority semantics for ordinary allow/require-approval policies.
-        if (explicitBlock) return decision("deny", "deny_policy_block", explicitBlock.policy.description ?? "Tool access is blocked by policy.", effectiveProfileIds, [explicitBlock.policy.id], { redactionPlan: redaction.redactionPlan });
+        if (explicitBlock) return brake(decision("deny", "deny_policy_block", explicitBlock.policy.description ?? "Tool access is blocked by policy.", effectiveProfileIds, [explicitBlock.policy.id], { redactionPlan: redaction.redactionPlan }));
 
         if (trustRuleNeedsReview(policy, ctx)) {
-          return decision(
+          return brake(decision(
             "require_approval",
             "requires_review_changed_tool",
             "Tool definition changed or was quarantined after this trust rule was created; review is required.",
             effectiveProfileIds,
             [policy.id],
             { redactionPlan: redaction.redactionPlan, policyExplanation },
-          );
+          ));
         }
         if (input.consumeRateLimit === true) {
           await recordTrustRuleHit(policy, ctx, redaction);
         }
-        return decision("allow", "allow_trust_rule", policy.description ?? "Tool access allowed by trust rule.", effectiveProfileIds, [policy.id], { redactionPlan: redaction.redactionPlan, policyExplanation });
+        return brake(decision("allow", "allow_trust_rule", policy.description ?? "Tool access allowed by trust rule.", effectiveProfileIds, [policy.id], { redactionPlan: redaction.redactionPlan, policyExplanation }));
       }
       if (policy.policyType === "require_approval") {
         // The connection's Ask first control restricts an existing action grant;
         // it must never grant access to agents outside that connection's profile.
         if (["app_gallery_finish", "connection_intent"].includes(String(policy.config?.source)) && !permittedByProfile) continue;
         if (policy.config?.source === "connection_intent" && explicitBlock) {
-          return decision("deny", "deny_policy_block", explicitBlock.policy.description ?? "Tool access is blocked by policy.", effectiveProfileIds, [explicitBlock.policy.id], { redactionPlan: redaction.redactionPlan });
+          return brake(decision("deny", "deny_policy_block", explicitBlock.policy.description ?? "Tool access is blocked by policy.", effectiveProfileIds, [explicitBlock.policy.id], { redactionPlan: redaction.redactionPlan }));
         }
-        return decision("require_approval", "requires_approval_policy", policy.description ?? "Tool access requires approval.", effectiveProfileIds, [policy.id], { redactionPlan: redaction.redactionPlan, policyExplanation });
+        return brake(decision("require_approval", "requires_approval_policy", policy.description ?? "Tool access requires approval.", effectiveProfileIds, [policy.id], { redactionPlan: redaction.redactionPlan, policyExplanation }));
       }
       if (policy.policyType === "allow") {
-        return decision("allow", "allow_policy", "Tool access allowed by policy.", effectiveProfileIds, [policy.id], { redactionPlan: redaction.redactionPlan, policyExplanation });
+        return brake(decision("allow", "allow_policy", "Tool access allowed by policy.", effectiveProfileIds, [policy.id], { redactionPlan: redaction.redactionPlan, policyExplanation }));
       }
     }
     if (await explicitGrant(ctx, cache)) {
-      return decision("allow", "allow_explicit_grant", "Tool access allowed by explicit grant.", effectiveProfileIds, [], { redactionPlan: redaction.redactionPlan });
+      return brake(decision("allow", "allow_explicit_grant", "Tool access allowed by explicit grant.", effectiveProfileIds, [], { redactionPlan: redaction.redactionPlan }));
     }
 
     const entriesByProfile = new Map<string, Array<typeof toolProfileEntries.$inferSelect>>();
@@ -1478,11 +1625,11 @@ export function toolAccessPolicyService(db: Db) {
       const matchingEntries = entries.filter((entry) => profileEntryMatches(entry, ctx));
       if (matchingEntries.some((entry) => entry.effect === "exclude")) continue;
       if (profile.defaultAction === "allow" || matchingEntries.some((entry) => entry.effect === "include")) {
-        return decision("allow", "allow_profile", "Tool access allowed by effective profile.", effectiveProfileIds, [], { redactionPlan: redaction.redactionPlan });
+        return brake(decision("allow", "allow_profile", "Tool access allowed by effective profile.", effectiveProfileIds, [], { redactionPlan: redaction.redactionPlan }));
       }
     }
 
-    return decision("deny", "deny_default", "No effective tool profile, grant, or allow policy permits this call.", effectiveProfileIds, [], { redactionPlan: redaction.redactionPlan });
+    return brake(decision("deny", "deny_default", "No effective tool profile, grant, or allow policy permits this call.", effectiveProfileIds, [], { redactionPlan: redaction.redactionPlan }));
   }
 
   async function writeAudit(
