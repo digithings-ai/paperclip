@@ -1736,3 +1736,18 @@ export const PLUGIN_BRIDGE_ERROR_CODES = [
   "UNKNOWN",
 ] as const;
 export type PluginBridgeErrorCode = (typeof PLUGIN_BRIDGE_ERROR_CODES)[number];
+
+/**
+ * Ceiling for a connection governed by a deny-default brake profile.
+ * Precedence of ordinary profiles is unchanged. DIG-5190.
+ */
+export const CONNECTION_GATEWAY_TOOL_BRAKE = {
+  profileFlag: "connectionToolBrake",
+  allowlistKey: "connectionToolAllowlist",
+  metaSegments: ["discover", "executeRead", "executeWrite", "executeDestructive"],
+  reasonAllowlistAbsent: "allowlist_absent",
+  reasonAllowlistEmpty: "allowlist_empty",
+  reasonAllowlistDenied: "allowlist_denied",
+  reasonMetaTool: "meta_tool_refused",
+} as const;
+
