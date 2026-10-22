@@ -306,22 +306,52 @@ describeEmbeddedPostgres("heartbeat sweepOrphanedRunContinuations", () => {
     expect(source?.orphanedContinuationDecision).toBe("exhausted");
   });
 
+  // More decided rows than the candidate window holds: the sweep reads at most
+  // 200 candidates per tick. They are bulk seeded because the property is
+  // about the window size, not about the number of rows.
+  async function seedDecidedOrphans(companyId: string, agentId: string, count: number) {
+    const issueIds = Array.from({ length: count }, () => randomUUID());
+    await db.insert(issues).values(
+      issueIds.map((issueId) => ({
+        id: issueId,
+        companyId,
+        title: "Decided orphan fixture",
+        status: "in_progress" as const,
+        assigneeAgentId: agentId,
+        responsibleUserId: "board-user",
+      })),
+    );
+    const runIds = issueIds.map(() => randomUUID());
+    await db.insert(heartbeatRuns).values(
+      runIds.map((runId, index) => ({
+        id: runId,
+        companyId,
+        agentId,
+        status: "interrupted",
+        invocationSource: "manual",
+        errorCode: ORPHANED_RUN_CONTINUATION_ERROR_CODE,
+        lastOutputAt: WORK_STOPPED_AT,
+        finishedAt: new Date(WORK_STOPPED_AT.getTime() + 30 * 60 * 1000),
+        createdAt: new Date(WORK_STOPPED_AT.getTime() - 60 * 60 * 1000),
+        // Older than the fresh orphan, so a window that is not filtered by the
+        // decision marker never reaches it.
+        updatedAt: new Date(WORK_STOPPED_AT.getTime() + index * 1000),
+        // The sweep already decided about these rows: the issue was dispatched
+        // again, so they are never continued.
+        orphanedContinuationDecision: "dispatched_again",
+        contextSnapshot: { issueId: issueIds[index] },
+      })),
+    );
+    return runIds.map((runId, index) => ({ runId, issueId: issueIds[index] }));
+  }
+
   it("reaches a fresh orphan however many decided rows the table holds", async () => {
     const { companyId, agentId } = await seed();
 
-    // Six old rows the sweep already decided about. They are older than the
-    // fresh orphan, so a sweep that does not exclude decided rows sees only
-    // these and never reaches the fresh one.
-    for (let index = 0; index < 6; index += 1) {
-      const issueId = await seedIssue(companyId, agentId);
-      await seedOrphan({
-        companyId,
-        agentId,
-        issueId,
-        orphanedContinuationDecision: "dispatched_again",
-        updatedAt: new Date(WORK_STOPPED_AT.getTime() + index * 1000),
-      });
-    }
+    // More decided rows than the candidate window holds (the default limit is
+    // 200). They are older than the fresh orphan, so a sweep that does not
+    // exclude decided rows sees only these and never reaches the fresh one.
+    const decided = await seedDecidedOrphans(companyId, agentId, 201);
 
     const freshIssueId = await seedIssue(companyId, agentId);
     const freshRunId = await seedOrphan({
@@ -331,9 +361,32 @@ describeEmbeddedPostgres("heartbeat sweepOrphanedRunContinuations", () => {
       updatedAt: NOW,
     });
 
-    const result = await sweep({ limit: 5 });
+    const result = await sweep();
 
     expect(result.continued).toBe(1);
-    expect(await wakesFor(freshRunId, freshIssueId)).toHaveLength(1);
+    const wakes = await wakesFor(freshRunId, freshIssueId);
+    expect(wakes).toHaveLength(1);
+    expect(wakes[0]?.idempotencyKey).toBe(
+      buildOrphanedRunContinuationIdempotencyKey({
+        issueId: freshIssueId,
+        sourceRunId: freshRunId,
+        errorCode: ORPHANED_RUN_CONTINUATION_ERROR_CODE,
+        nextAttempt: 1,
+      }),
+    );
+
+    // The decided rows are not continued again.
+    const allWakes = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(
+        like(agentWakeupRequests.idempotencyKey, "run_liveness_continuation:%"),
+      );
+    expect(allWakes).toHaveLength(1);
+    for (const row of decided) {
+      expect(
+        allWakes.some((wake) => wake.idempotencyKey?.includes(row.runId)),
+      ).toBe(false);
+    }
   });
 });

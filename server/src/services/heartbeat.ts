@@ -20172,6 +20172,22 @@ export function heartbeatService(
       }
     }
 
+    if (candidates.length >= limit) {
+      // The candidate window is full, so the next candidate sits behind the
+      // limit. Say so: a sweep that can no longer see fresh orphans must not
+      // look like a sweep that found nothing to do.
+      logger.warn(
+        {
+          limit,
+          scanned: candidates.length,
+          eligible,
+          continued,
+          skipped: skipped.length,
+        },
+        "orphaned run continuation sweep filled its candidate window",
+      );
+    }
+
     return {
       scanned: candidates.length,
       eligible,
