@@ -14375,7 +14375,11 @@ describeEmbeddedPostgres("tool access service", () => {
       expect(JSON.stringify(response.body)).not.toContain("api.slack.com/apps/fixture");
       expect(capture).not.toHaveBeenCalled();
       const [updated] = await db.select().from(toolConnections).where(eq(toolConnections.id, connection!.id));
-      expect(updated?.healthStatus).toBe("error");
+      // The GET catalog route refreshes the cache in the background, with a
+      // system actor, so a failure there writes "probe_failed" and the
+      // connection stays discoverable. A refresh or a health check that a
+      // person asked for writes the conclusive status.
+      expect(updated?.healthStatus).toBe(path === "catalog" ? "probe_failed" : "error");
       expect(updated?.healthMessage).toBe(response.body.error);
       await expect(db.select().from(toolCatalogEntries).where(eq(toolCatalogEntries.connectionId, connection!.id)))
         .resolves.toHaveLength(0);
@@ -18037,6 +18041,54 @@ describeEmbeddedPostgres("tool access service", () => {
       healthStatus: "error",
       healthMessage: "revoked token",
       lastError: "revoked token",
+    });
+  });
+
+  it("keeps a connection discoverable when the background catalog cache refresh fails, and keeps the conclusive status for a refresh a person asked for", async () => {
+    const company = await createCompany(db);
+    const service = createTestToolAccessService(db);
+    vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("remote unavailable"));
+    const connection = await service.createConnection(company.id, {
+      name: "Background refreshed remote",
+      transport: "mcp_remote",
+      config: { url: "https://fixture.example/mcp" },
+      enabled: true,
+      status: "active",
+    });
+
+    // The system catalog cache refreshes on its own. One failed tools/list is
+    // one sample, so it must not write a status that hides the connection
+    // from every session.
+    await expect(
+      service.refreshCatalog(connection.id, {
+        actorType: "system",
+        actorId: "tool_catalog_cache",
+      }),
+    ).rejects.toThrow(/remote unavailable/);
+    const [afterSystemRefresh] = await db
+      .select()
+      .from(toolConnections)
+      .where(eq(toolConnections.id, connection.id));
+    expect(afterSystemRefresh).toMatchObject({
+      healthStatus: "probe_failed",
+      healthMessage: "remote unavailable",
+    });
+
+    // A refresh that a person asked for keeps the conclusive status, because
+    // that refresh did test the connection on purpose.
+    await expect(
+      service.refreshCatalog(connection.id, {
+        actorType: "user",
+        actorId: "board",
+      }),
+    ).rejects.toThrow(/remote unavailable/);
+    const [afterUserRefresh] = await db
+      .select()
+      .from(toolConnections)
+      .where(eq(toolConnections.id, connection.id));
+    expect(afterUserRefresh).toMatchObject({
+      healthStatus: "error",
+      healthMessage: "remote unavailable",
     });
   });
 

@@ -4524,6 +4524,12 @@ rl.on("line", (line) => {
         url: fake.url,
         healthStatus: "error",
       });
+      const revoked = await createRemoteMcpTool(db, company.id, {
+        applicationKey: "probe-failure-revoked",
+        toolName: "kv_list",
+        url: fake.url,
+        healthStatus: "missing_secret",
+      });
       await allowAllToolsForAgent(db, company.id, agent.id);
       // Only the new connection is due for a probe.
       await db
@@ -4555,30 +4561,34 @@ rl.on("line", (line) => {
         connectionId: condemned.connection.id,
         toolName: condemned.catalogEntry.toolName,
       });
+      const revokedName = expectedConnectedToolName({
+        applicationKey: "probe-failure-revoked",
+        connectionId: revoked.connection.id,
+        toolName: revoked.catalogEntry.toolName,
+      });
 
       const listed = await gateway.listToolsForSession(session.token);
       expect(listed.map((tool) => tool.name)).toContain(probedName);
-      // A connection whose every call will fail is still hidden.
+      // A connection whose every call will fail is still hidden. Both a
+      // failed health status and a missing secret hide it.
       expect(listed.map((tool) => tool.name)).not.toContain(condemnedName);
+      expect(listed.map((tool) => tool.name)).not.toContain(revokedName);
 
-      // The call fails at call time, with the real reason. It is not a
-      // 404 tool_not_found from the lookup.
-      await gateway.executeTool({
-        sessionToken: session.token,
-        tool: probedName,
-        parameters: { key: "alpha" },
-        timeoutMs: 5000,
-      }).then(
-        () => {
-          throw new Error("Expected the remote MCP call to fail");
-        },
-        (error) => {
-          expect(error).toBeInstanceOf(ToolGatewayHttpError);
-          const gatewayError = error as ToolGatewayHttpError;
-          expect(gatewayError.status).not.toBe(404);
-          expect(gatewayError.reasonCode).not.toBe("tool_not_found");
-        },
-      );
+      // The call fails at call time, with the real reason from the remote. It
+      // is not a 404 tool_not_found from the lookup. The health write of the
+      // call path itself is not part of this change, so the test does not pin
+      // the health status after the call.
+      await expect(
+        gateway.executeTool({
+          sessionToken: session.token,
+          tool: probedName,
+          parameters: { key: "alpha" },
+          timeoutMs: 5000,
+        }),
+      ).rejects.toSatisfy((error: unknown) => {
+        expectGatewayError(error, 502, "mcp_remote_status");
+        return true;
+      });
     } finally {
       await fake.close();
     }

@@ -7678,9 +7678,16 @@ export function toolAccessService(
       )
         throw error;
       const failure = sanitizeHttpFailure(error);
+      // A background catalog refresh is one sample, not a verdict. The system
+      // catalog cache refreshes on its own, so one failed tools/list must not
+      // write a status that hides the connection from every session. A refresh
+      // that a person asked for keeps the conclusive status, because that
+      // refresh did test the connection on purpose.
+      const status: ToolConnectionHealthStatus =
+        actor?.actorType === "system" ? "probe_failed" : failure.status;
       const updated = await updateConnectionHealth(
         connection,
-        failure.status,
+        status,
         failure.message,
       );
       await audit({
@@ -7689,7 +7696,7 @@ export function toolAccessService(
         action: "tool_connection.catalog_refresh",
         outcome: "failure",
         reasonCode: failure.code,
-        details: { status: failure.status },
+        details: { status },
         actor,
       });
       throw new HttpError(healthFailureHttpStatus(failure), failure.message, {
