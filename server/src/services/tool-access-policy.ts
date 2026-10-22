@@ -1411,12 +1411,13 @@ export function toolAccessPolicyService(db: Db) {
         if (profile.status !== "active" || profile.defaultAction !== "deny") return false;
         if (!isRecord(profile.metadata)) return false;
         if (profile.metadata[CONNECTION_GATEWAY_TOOL_BRAKE.profileFlag] !== true) return false;
-        const connectionEntries = entries.filter(
-          (entry) => entry.profileId === profile.id && entry.selectorType === "connection",
-        );
-        if (connectionEntries.length === 0) return true;
-        return connectionEntries.some(
-          (entry) => entry.effect === "include" && entry.connectionId === ctx.connectionId,
+        // A profile participates only for the connection its include entry names.
+        // No connection entry, or an entry for another connection, is a different pair.
+        return entries.some(
+          (entry) => entry.profileId === profile.id
+            && entry.selectorType === "connection"
+            && entry.effect === "include"
+            && entry.connectionId === ctx.connectionId,
         );
       });
       if (governing.length === 0) return { governed: false };

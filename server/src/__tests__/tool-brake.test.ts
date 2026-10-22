@@ -40,6 +40,7 @@ import {
   userSecretDefinitions,
 } from "@paperclipai/db";
 import { CONNECTION_GATEWAY_TOOL_BRAKE } from "@paperclipai/shared/constants";
+import { boundedMcpToolName, MAX_GATEWAY_TOOL_NAME_LENGTH } from "../services/mcp-tool-names.js";
 import { mcpGatewayProtocolRoutes, toolGatewayRoutes } from "../routes/tool-gateway.js";
 import { createToolGatewayService } from "../services/tool-gateway.js";
 import {
@@ -53,24 +54,60 @@ const testToolActionSigningSecret = "test-tool-action-signing-secret";
 const BRAKE = CONNECTION_GATEWAY_TOOL_BRAKE;
 
 /**
- * Byte-exact camelCase names published in DIG-2745 section 7.
- * The attachment records 41 Atlassian tools and prints these 12.
- * The other 29 are not in the attachment, so they are not in this catalogue.
+ * The 41 raw tool_catalog_entries.tool_name values from the DIG-2745 fixture
+ * dig2745-atlassian-tools-fixture-2026-10-22.json. The allowlist keys on these
+ * spellings. The string the gateway hands the model is a different one.
  */
-const PUBLISHED_ATLASSIAN_TOOL_NAMES = [
-  "createJiraIssue",
+const ATLASSIAN_RAW_TOOL_NAMES = [
   "addCommentToJiraIssue",
-  "transitionJiraIssue",
-  "editJiraIssue",
-  "getJiraIssue",
-  "getAccessibleAtlassianResources",
+  "addTeamworkGraphContext",
+  "addWorklogToJiraIssue",
   "atlassianUserInfo",
-  "getVisibleJiraProjects",
-  "searchJiraIssuesUsingJql",
-  "getJiraProjectIssueTypesMetadata",
+  "createCompassComponent",
+  "createCompassComponentRelationship",
+  "createCompassCustomFieldDefinition",
+  "createConfluenceFooterComment",
+  "createConfluenceInlineComment",
+  "createConfluencePage",
+  "createIssueLink",
+  "createJiraIssue",
+  "editJiraIssue",
   "fetch",
+  "getAccessibleAtlassianResources",
+  "getCompassComponent",
+  "getCompassComponents",
+  "getCompassCustomFieldDefinitions",
+  "getConfluenceCommentChildren",
+  "getConfluencePage",
+  "getConfluencePageDescendants",
+  "getConfluencePageFooterComments",
+  "getConfluencePageInlineComments",
+  "getConfluenceSpaces",
+  "getContentFormatGuide",
+  "getIssueLinkTypes",
+  "getJiraIssue",
+  "getJiraIssueRemoteIssueLinks",
+  "getJiraIssueTypeMetaWithFields",
+  "getJiraProjectIssueTypesMetadata",
+  "getPagesInConfluenceSpace",
+  "getTeamworkGraphContext",
+  "getTeamworkGraphObject",
+  "getTransitionsForJiraIssue",
+  "getVisibleJiraProjects",
+  "lookupJiraAccountId",
   "search",
+  "searchConfluenceUsingCql",
+  "searchJiraIssuesUsingJql",
+  "transitionJiraIssue",
+  "updateConfluencePage",
 ] as const;
+
+const MEASURED_APPLICATION_KEY = "app-gallery-jira-ea4753df-3235-4f68-89cb-ccf3e80bf479";
+const MEASURED_CONNECTION_ID = "b20116ec-a6fd-41f1-9c70-ef341b9bbcc7";
+const MEASURED_PRESENTED_ADD_COMMENT = "mcp.app-gallery-jira-ea4753df-3235-4f68-89cb-ccf3e80bf479-b20116ec:addcommenttojiraissue";
+const MEASURED_PRESENTED_LONGEST = "mcp.app-gallery-jira-ea4753df-3235-4f68-89cb-ccf3e80bf479-b20116ec:createcompasscomponentrelationship";
+const LONGEST_RAW_NAME = "createCompassComponentRelationship";
+const GATEWAY_RESOURCE_TOOLS = ["paperclip_list_resources", "paperclip_read_resource"] as const;
 
 const META_TOOL_NAMES = ["discover", "executeRead", "executeWrite", "executeDestructive"] as const;
 const ALLOWED_TOOL = "addCommentToJiraIssue";
@@ -97,7 +134,9 @@ type Seat = {
 type Opened = {
   companyId: string;
   connectionId: string;
+  applicationId: string;
   applicationKey: string;
+  gatewayProfileId: string;
   remote: {
     requests: FakeMcpRequest[];
     close: () => Promise<void>;
@@ -222,6 +261,7 @@ async function insertBrake(
   targetType: "agent" | "company",
   targetId: string,
   allowlist: Allowlist,
+  connectionId: string,
 ) {
   const metadata: Record<string, unknown> = { [BRAKE.profileFlag]: true };
   if (allowlist !== "absent") metadata[BRAKE.allowlistKey] = [...allowlist];
@@ -238,6 +278,13 @@ async function insertBrake(
     targetType,
     targetId,
   });
+  await db.insert(toolProfileEntries).values({
+    companyId,
+    profileId: profile!.id,
+    selectorType: "connection",
+    effect: "include",
+    connectionId,
+  });
   return profile!;
 }
 
@@ -247,11 +294,13 @@ async function openCatalogue(
   options: {
     seats?: Array<{ allowlist?: Allowlist }>;
     companyAllowlist?: Allowlist;
+    applicationKey?: string;
+    connectionId?: string;
   } = {},
 ): Promise<Opened> {
   const company = await createCompany(db);
   const remote = await startFakeRemoteMcpServer();
-  const applicationKey = "atlassian";
+  const applicationKey = options.applicationKey ?? "atlassian";
   const [application] = await db.insert(toolApplications).values({
     companyId: company.id,
     applicationKey,
@@ -260,6 +309,7 @@ async function openCatalogue(
     status: "active",
   }).returning();
   const [connection] = await db.insert(toolConnections).values({
+    ...(options.connectionId ? { id: options.connectionId } : {}),
     companyId: company.id,
     applicationId: application!.id,
     name: `Atlassian ${randomUUID()}`,
@@ -299,7 +349,7 @@ async function openCatalogue(
     connectionId: connection!.id,
   });
   if (options.companyAllowlist !== undefined) {
-    await insertBrake(db, company.id, "company", company.id, options.companyAllowlist);
+    await insertBrake(db, company.id, "company", company.id, options.companyAllowlist, connection!.id);
   }
   const gateway = createTestToolGatewayService(db);
   const seatSpecs = options.seats ?? [{ allowlist: [ALLOWED_TOOL] as Allowlist }];
@@ -308,7 +358,7 @@ async function openCatalogue(
     const agent = await createAgent(db, company.id);
     const { issue, project, run } = await createIssueAndRun(db, company.id, agent.id);
     if (spec.allowlist !== undefined) {
-      await insertBrake(db, company.id, "agent", agent.id, spec.allowlist);
+      await insertBrake(db, company.id, "agent", agent.id, spec.allowlist, connection!.id);
     }
     const named = await gateway.createNamedGateway({
       companyId: company.id,
@@ -343,7 +393,9 @@ async function openCatalogue(
   return {
     companyId: company.id,
     connectionId: connection!.id,
+    applicationId: application!.id,
     applicationKey,
+    gatewayProfileId: gatewayProfile!.id,
     remote,
     gateway,
     app,
@@ -450,17 +502,157 @@ describeEmbeddedPostgres("connection gateway tool brake", () => {
     return opened;
   }
 
-  it("offers exactly the one allowlisted raw name from the published Atlassian catalogue plus meta tools", async () => {
-    const catalogue = [...PUBLISHED_ATLASSIAN_TOOL_NAMES, ...META_TOOL_NAMES];
+  it("offers exactly the one allowlisted raw name from the 41-tool catalogue plus meta tools", async () => {
+    const catalogue = [...ATLASSIAN_RAW_TOOL_NAMES, ...META_TOOL_NAMES];
     const opened = await open(catalogue, { seats: [{ allowlist: [ALLOWED_TOOL] }] });
-    expect(await upstreamNames(opened)).toEqual([ALLOWED_TOOL]);
+    const tools = await opened.gateway.listToolsForNamedGateway({
+      gatewayId: opened.seats[0]!.gatewayId,
+      bearerToken: opened.seats[0]!.token,
+    });
+    expect(tools.map((tool) => tool.upstreamToolName).sort()).toEqual([ALLOWED_TOOL]);
+    expect(tools.map((tool) => tool.name)).toEqual([mangled(opened, ALLOWED_TOOL)]);
+    for (const resource of GATEWAY_RESOURCE_TOOLS) {
+      expect(tools.map((tool) => tool.name)).not.toContain(resource);
+      expect(tools.map((tool) => tool.upstreamToolName)).not.toContain(resource);
+    }
     const allowed = await callTool(opened, ALLOWED_TOOL, { message: "ok" });
     expect(allowed.status).toBe(200);
     expect(allowed.upstreamDelta).toBe(1);
   });
 
+  it("hands the model the prefixed presented name and matches the allowlist on the raw name", async () => {
+    const opened = await open([ALLOWED_TOOL, LONGEST_RAW_NAME], {
+      applicationKey: MEASURED_APPLICATION_KEY,
+      connectionId: MEASURED_CONNECTION_ID,
+      seats: [{ allowlist: [ALLOWED_TOOL, LONGEST_RAW_NAME] }],
+    });
+    const tools = await opened.gateway.listToolsForNamedGateway({
+      gatewayId: opened.seats[0]!.gatewayId,
+      bearerToken: opened.seats[0]!.token,
+    });
+    const byRaw = new Map(tools.map((tool) => [tool.upstreamToolName, tool.name]));
+    expect(byRaw.get(ALLOWED_TOOL)).toBe(MEASURED_PRESENTED_ADD_COMMENT);
+    expect(byRaw.get(LONGEST_RAW_NAME)).toBe(MEASURED_PRESENTED_LONGEST);
+    expect(MEASURED_PRESENTED_LONGEST.length).toBe(101);
+    expect(MEASURED_PRESENTED_LONGEST.length).toBeLessThanOrEqual(MAX_GATEWAY_TOOL_NAME_LENGTH);
+    expect(MEASURED_PRESENTED_LONGEST).toBe(boundedMcpToolName(MEASURED_PRESENTED_LONGEST, [MEASURED_CONNECTION_ID]));
+  });
+
+  it("does not let the presented name or its lower-case tail satisfy a raw-name entry", async () => {
+    const opened = await open([ALLOWED_TOOL], { seats: [{ allowlist: [ALLOWED_TOOL] }] });
+    const presented = mangled(opened, ALLOWED_TOOL);
+    const tail = "addcommenttojiraissue";
+    expect(presented.endsWith(`:${tail}`)).toBe(true);
+    expect(await upstreamNames(opened)).toEqual([ALLOWED_TOOL]);
+    const profiles = await db.select().from(toolProfiles).where(eq(toolProfiles.companyId, opened.companyId));
+    for (const profile of profiles) {
+      const metadata = (profile.metadata ?? {}) as Record<string, unknown>;
+      if (metadata[BRAKE.profileFlag] !== true) continue;
+      await db.update(toolProfiles).set({
+        metadata: { ...metadata, [BRAKE.allowlistKey]: [presented, tail, "add_comment_to_jira_issue", "AddCommentToJiraIssue"] },
+      }).where(eq(toolProfiles.id, profile.id));
+    }
+    expect(await upstreamNames(opened)).toEqual([]);
+  });
+
+  it("does not let a truncated hashed presented name satisfy a raw-name entry", async () => {
+    const opened = await open([ALLOWED_TOOL], { seats: [{ allowlist: [ALLOWED_TOOL] }] });
+    const overlong = `${"m".repeat(MAX_GATEWAY_TOOL_NAME_LENGTH)}:addcommenttojiraissue`;
+    const hashed = boundedMcpToolName(overlong, [opened.connectionId, ALLOWED_TOOL]);
+    expect(overlong.length).toBeGreaterThan(MAX_GATEWAY_TOOL_NAME_LENGTH);
+    expect(hashed).not.toBe(overlong);
+    expect(hashed).not.toBe(ALLOWED_TOOL);
+    const profiles = await db.select().from(toolProfiles).where(eq(toolProfiles.companyId, opened.companyId));
+    for (const profile of profiles) {
+      const metadata = (profile.metadata ?? {}) as Record<string, unknown>;
+      if (metadata[BRAKE.profileFlag] !== true) continue;
+      await db.update(toolProfiles).set({
+        metadata: { ...metadata, [BRAKE.allowlistKey]: [hashed] },
+      }).where(eq(toolProfiles.id, profile.id));
+    }
+    expect(await upstreamNames(opened)).toEqual([]);
+  });
+
+  it("intersects allowlists per connection, so a second connection on the same seat keeps its own names", async () => {
+    const opened = await open([ALLOWED_TOOL, OTHER_TOOL], { seats: [{ allowlist: [ALLOWED_TOOL] }] });
+    const [existing] = await db.select().from(toolConnections).where(eq(toolConnections.id, opened.connectionId));
+    const url = (existing!.config as { url: string }).url;
+    const [second] = await db.insert(toolConnections).values({
+      companyId: opened.companyId,
+      applicationId: opened.applicationId,
+      name: `Second ${randomUUID()}`,
+      uid: `test/${randomUUID()}`,
+      transport: "mcp_remote",
+      status: "active",
+      enabled: true,
+      healthStatus: "ok",
+      config: { url },
+      transportConfig: { url },
+      credentialRefs: [],
+      credentialSecretRefs: [],
+    }).returning();
+    await db.insert(connectionGrants).values({
+      companyId: opened.companyId,
+      connectionId: second!.id,
+      kind: "organization",
+      credentialSecretRefs: [],
+      status: "active",
+      isDefault: false,
+    });
+    for (const toolName of [ALLOWED_TOOL, OTHER_TOOL]) {
+      await insertCatalogTool(db, opened.companyId, opened.applicationId, second!.id, toolName);
+    }
+    await db.insert(toolProfileEntries).values({
+      companyId: opened.companyId,
+      profileId: opened.gatewayProfileId,
+      selectorType: "connection",
+      effect: "include",
+      applicationId: opened.applicationId,
+      connectionId: second!.id,
+    });
+    await insertBrake(db, opened.companyId, "agent", opened.seats[0]!.agentId, [OTHER_TOOL], second!.id);
+    const [unscoped] = await db.insert(toolProfiles).values({
+      companyId: opened.companyId,
+      profileKey: `unscoped-${randomUUID()}`,
+      name: `Unscoped ${randomUUID()}`,
+      defaultAction: "deny",
+      metadata: { [BRAKE.profileFlag]: true, [BRAKE.allowlistKey]: [] },
+    }).returning();
+    await db.insert(toolProfileBindings).values({
+      companyId: opened.companyId,
+      profileId: unscoped!.id,
+      targetType: "agent",
+      targetId: opened.seats[0]!.agentId,
+    });
+    const tools = await opened.gateway.listToolsForNamedGateway({
+      gatewayId: opened.seats[0]!.gatewayId,
+      bearerToken: opened.seats[0]!.token,
+    });
+    const namesOn = (connectionId: string) => tools
+      .filter((tool) => tool.connectionId === connectionId)
+      .map((tool) => tool.upstreamToolName)
+      .sort();
+    expect(namesOn(opened.connectionId)).toEqual([ALLOWED_TOOL]);
+    expect(namesOn(second!.id)).toEqual([OTHER_TOOL]);
+  });
+
+  it("returns the same presented names for the same seat, connection, and catalogue", async () => {
+    const opened = await open([ALLOWED_TOOL, OTHER_TOOL], { seats: [{ allowlist: [ALLOWED_TOOL] }] });
+    const read = async () => {
+      const tools = await opened.gateway.listToolsForNamedGateway({
+        gatewayId: opened.seats[0]!.gatewayId,
+        bearerToken: opened.seats[0]!.token,
+      });
+      return tools.map((tool) => `${tool.connectionId}:${tool.upstreamToolName}:${tool.name}`).sort();
+    };
+    expect(await read()).toEqual(await read());
+  });
+
+  // DIG-5208 publishes the fleet inventory and enables this assertion.
+  it.todo("matches the DIG-5208 inventory byte-exact on the raw name after the flip");
+
   it("refuses an absent allowlist loudly and records allowlist_absent per tool", async () => {
-    const opened = await open(PUBLISHED_ATLASSIAN_TOOL_NAMES, { seats: [{ allowlist: "absent" }] });
+    const opened = await open(ATLASSIAN_RAW_TOOL_NAMES, { seats: [{ allowlist: "absent" }] });
     const response = await request(opened.app)
       .post(opened.seats[0]!.endpointPath)
       .set("authorization", `Bearer ${opened.seats[0]!.token}`)
@@ -468,18 +660,18 @@ describeEmbeddedPostgres("connection gateway tool brake", () => {
     expect(response.status).toBe(403);
     expect(response.body.error.data.reasonCode).toBe(BRAKE.reasonAllowlistAbsent);
     expect(response.body.result?.tools).toBeUndefined();
-    expect(await reasonCount(db, opened.companyId, BRAKE.reasonAllowlistAbsent)).toBe(PUBLISHED_ATLASSIAN_TOOL_NAMES.length);
+    expect(await reasonCount(db, opened.companyId, BRAKE.reasonAllowlistAbsent)).toBe(ATLASSIAN_RAW_TOOL_NAMES.length);
   });
 
   it("refuses an empty allowlist loudly and records allowlist_empty per tool", async () => {
-    const opened = await open(PUBLISHED_ATLASSIAN_TOOL_NAMES, { seats: [{ allowlist: [] }] });
+    const opened = await open(ATLASSIAN_RAW_TOOL_NAMES, { seats: [{ allowlist: [] }] });
     const response = await request(opened.app)
       .post(opened.seats[0]!.endpointPath)
       .set("authorization", `Bearer ${opened.seats[0]!.token}`)
       .send({ jsonrpc: "2.0", id: 1, method: "tools/list" });
     expect(response.status).toBe(403);
     expect(response.body.error.data.reasonCode).toBe(BRAKE.reasonAllowlistEmpty);
-    expect(await reasonCount(db, opened.companyId, BRAKE.reasonAllowlistEmpty)).toBe(PUBLISHED_ATLASSIAN_TOOL_NAMES.length);
+    expect(await reasonCount(db, opened.companyId, BRAKE.reasonAllowlistEmpty)).toBe(ATLASSIAN_RAW_TOOL_NAMES.length);
     expect(await reasonCount(db, opened.companyId, BRAKE.reasonAllowlistAbsent)).toBe(0);
   });
 
@@ -678,7 +870,7 @@ describeEmbeddedPostgres("connection gateway tool brake", () => {
   });
 
   it("keeps today's behaviour when the connection has no brake profile", async () => {
-    const catalogue = [...PUBLISHED_ATLASSIAN_TOOL_NAMES, ...META_TOOL_NAMES];
+    const catalogue = [...ATLASSIAN_RAW_TOOL_NAMES, ...META_TOOL_NAMES];
     const opened = await open(catalogue, { seats: [{}] });
     expect(await upstreamNames(opened)).toEqual([...catalogue].sort());
   });
