@@ -20025,6 +20025,21 @@ export function heartbeatService(
     return recovery.sweepStaleIssueLocks();
   }
 
+  // The candidate window is a bounded scan over an unbounded set. A run the
+  // sweep cannot act on (no issue id in its context, a continuation refused
+  // for a permanent reason) is skipped without a decision, so it keeps its
+  // old timestamp and stays at the front of the window on every tick. Once
+  // more such rows exist than the window holds, a fresh orphan is never
+  // inside the window again and the feature stops working, silently and
+  // permanently. The watermark moves the window forward one scan at a time
+  // and wraps around at the end of the set, so every undecided candidate is
+  // reached within a bounded number of ticks however many rows the sweep
+  // skips.
+  const orphanedRunContinuationWatermarks = new Map<
+    string,
+    { updatedAt: Date; id: string }
+  >();
+
   // Bounded continuation for the runs the recovery backstop terminalized.
   //
   // The backstop terminalizes a run whose process and sandbox are gone and
@@ -20052,6 +20067,10 @@ export function heartbeatService(
     const graceMs = opts?.graceMs ?? readOrphanedRunContinuationGraceMs();
     const hostHealth = opts?.hostHealth ?? readHostHealth();
     const limit = opts?.limit ?? 200;
+    // One watermark per scope: the sweep runs once per tick for the whole
+    // instance, and a company-scoped sweep keeps its own position.
+    const watermarkKey = opts?.companyId ?? "*";
+    const watermark = orphanedRunContinuationWatermarks.get(watermarkKey);
 
     const candidates = await db
       .select({
@@ -20063,6 +20082,7 @@ export function heartbeatService(
         finishedAt: heartbeatRuns.finishedAt,
         startedAt: heartbeatRuns.startedAt,
         createdAt: heartbeatRuns.createdAt,
+        updatedAt: heartbeatRuns.updatedAt,
         contextSnapshot: heartbeatRuns.contextSnapshot,
       })
       .from(heartbeatRuns)
@@ -20078,9 +20098,20 @@ export function heartbeatService(
           opts?.companyId
             ? eq(heartbeatRuns.companyId, opts.companyId)
             : undefined,
+          // The window continues where the last scan stopped, so a candidate
+          // the sweep cannot act on never hides the ones behind it.
+          watermark
+            ? or(
+                gt(heartbeatRuns.updatedAt, watermark.updatedAt),
+                and(
+                  eq(heartbeatRuns.updatedAt, watermark.updatedAt),
+                  gt(heartbeatRuns.id, watermark.id),
+                ),
+              )
+            : undefined,
         ),
       )
-      .orderBy(asc(heartbeatRuns.updatedAt))
+      .orderBy(asc(heartbeatRuns.updatedAt), asc(heartbeatRuns.id))
       .limit(limit);
 
     const skipped: string[] = [];
@@ -20170,6 +20201,19 @@ export function heartbeatService(
           );
         }
       }
+    }
+
+    // The window continues where this scan stopped. A scan that reached the
+    // end of the candidate set starts the rotation again from the oldest row
+    // on the next tick.
+    const lastCandidate = candidates[candidates.length - 1];
+    if (!lastCandidate || candidates.length < limit) {
+      orphanedRunContinuationWatermarks.delete(watermarkKey);
+    } else {
+      orphanedRunContinuationWatermarks.set(watermarkKey, {
+        updatedAt: lastCandidate.updatedAt,
+        id: lastCandidate.id,
+      });
     }
 
     if (candidates.length >= limit) {
