@@ -24599,6 +24599,7 @@ export function heartbeatService(
           let finalizeBranchMetadata: Record<string, unknown> | null = null;
           let finalizeBranchRepairMetadata: Record<string, unknown> | null =
             null;
+          let deadWorktreeNote: Record<string, unknown> | null = null;
           if (status === "succeeded") {
             const branchInspection = await inspectFinalizeWorkspaceBranch();
             if (branchInspection) {
@@ -24715,7 +24716,19 @@ export function heartbeatService(
                 executionWorkspaceId: branchInspection.workspaceRecord.id,
                 ...managedGitWorktreeBranch,
               };
-              if (!inspection.valid) {
+              if (
+                !inspection.valid &&
+                inspection.reasonCode === "missing_worktree"
+              ) {
+                // A missing worktree holds no work to protect. The run
+                // finalizes, and the operation log names the archive route.
+                deadWorktreeNote = {
+                  reasonCode: "missing_worktree",
+                  reason: inspection.reason,
+                  archiveRoute: `PATCH /api/execution-workspaces/${branchInspection.workspaceRecord.id}`,
+                  archiveBody: { status: "archived" },
+                };
+              } else if (!inspection.valid) {
                 const workspaceValidationFingerprint =
                   fingerprintFinalizeWorkspaceBranchValidation({
                     issueId: issueRef?.id ?? null,
@@ -24744,7 +24757,7 @@ export function heartbeatService(
                 });
                 adapterFinalizeOutcome = "failed";
                 throw new WorkspaceValidationFailure(
-                  `Execution workspace ${branchInspection.workspaceRecord.id} expected git worktree branch "${inspection.expectedBranchName}" at "${inspection.worktreePath}", but ${inspection.reason ?? "the checked-out branch could not be verified"}. Record a sanctioned execution-workspace branch transition or restore the workspace branch before completing the run.`,
+                  `Execution workspace ${branchInspection.workspaceRecord.id} expected git worktree branch "${inspection.expectedBranchName}" at "${inspection.worktreePath}", but ${inspection.reason ?? "the checked-out branch could not be verified"}. Archive it with PATCH /api/execution-workspaces/${branchInspection.workspaceRecord.id} {"status":"archived"}, or restore the workspace branch before completing the run.`,
                   {
                     workspaceValidation: {
                       reason: "git_worktree_branch_incoherence",
@@ -24772,6 +24785,7 @@ export function heartbeatService(
               ...(finalizeBranchMetadata
                 ? { managedGitWorktreeBranch: finalizeBranchMetadata }
                 : {}),
+              ...(deadWorktreeNote ? { deadWorktree: deadWorktreeNote } : {}),
               ...(finalizeBranchRepairMetadata
                 ? {
                     managedGitWorktreeBranchRepair:

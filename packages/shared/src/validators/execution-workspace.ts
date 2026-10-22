@@ -17,6 +17,7 @@ export const executionWorkspaceDeliveryStateSchema = z.enum([
   "merged_by_ancestry",
   "unmerged",
   "unknown",
+  "worktree_missing",
 ]);
 
 const workspaceOverviewStatusFilterSchema = z.preprocess((value) => {

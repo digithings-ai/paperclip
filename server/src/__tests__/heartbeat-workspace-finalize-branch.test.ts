@@ -534,4 +534,63 @@ describeEmbeddedPostgres("heartbeat workspace finalization branch guard", () => 
       },
     });
   }, 20_000);
+
+  it("finalizes a run when the managed worktree path is already gone", async () => {
+    const repoRoot = await createGitRepo();
+    tempRoots.push(repoRoot);
+    const { agentId, issueId } = await seedRunTarget(db, repoRoot);
+    let executionWorkspaceId: string | null = null;
+    let workspaceCwd: string | null = null;
+
+    adapterExecute.mockImplementationOnce(async (input) => {
+      const workspace = readAdapterWorkspace(input);
+      executionWorkspaceId = workspace.executionWorkspaceId;
+      workspaceCwd = workspace.cwd;
+      await rm(workspace.cwd, { recursive: true, force: true });
+      await db.update(issues).set({ status: "done", updatedAt: new Date() }).where(eq(issues.id, issueId));
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        summary: "Adapter completed after the worktree directory was removed.",
+        provider: "test",
+        model: "test-model",
+      };
+    });
+
+    const heartbeat = heartbeatService(db);
+    const run = await wakeIssue(heartbeat, agentId, issueId);
+    expect(run).not.toBeNull();
+
+    const finishedRun = await waitForRunToFinish(heartbeat, run!.id);
+    expect(finishedRun).toMatchObject({
+      status: "succeeded",
+      errorCode: null,
+      error: null,
+    });
+    expect(finishedRun?.error ?? "").not.toContain("does not exist");
+    await waitForRuntimeStateLastRun(db, agentId, run!.id);
+    expect(adapterExecute).toHaveBeenCalledTimes(1);
+    await expect(rm(workspaceCwd!, { recursive: true, force: true })).resolves.toBeUndefined();
+
+    const finalizeOps = await listFinalizeOperations(db, run!.id);
+    expect(finalizeOps).toHaveLength(1);
+    expect(finalizeOps[0]).toMatchObject({
+      status: "succeeded",
+      executionWorkspaceId,
+    });
+    expect(finalizeOps[0]?.metadata).toMatchObject({
+      managedGitWorktreeBranch: expect.objectContaining({
+        executionWorkspaceId,
+        valid: false,
+        reasonCode: "missing_worktree",
+      }),
+      deadWorktree: {
+        reasonCode: "missing_worktree",
+        archiveRoute: `PATCH /api/execution-workspaces/${executionWorkspaceId}`,
+        archiveBody: { status: "archived" },
+      },
+    });
+    expect(JSON.stringify(finalizeOps[0]?.metadata)).not.toContain("reconcile-branch");
+  }, 20_000);
 });
