@@ -1047,6 +1047,11 @@ export const TOOL_CONNECTION_HEALTH_STATUSES = [
   // connection: the connection stays discoverable so its other tools keep
   // working and the next successful call restores "ok".
   "tool_timeout",
+  // A background health probe failed. One failed probe is one sample, not
+  // proof that every call will fail, so the connection stays discoverable and
+  // a call that really fails answers with the real error at call time. The
+  // precise reason stays in the health message and in the audit record.
+  "probe_failed",
 ] as const;
 export type ToolConnectionHealthStatus = (typeof TOOL_CONNECTION_HEALTH_STATUSES)[number];
 
@@ -1055,6 +1060,12 @@ export type ToolConnectionHealthStatus = (typeof TOOL_CONNECTION_HEALTH_STATUSES
  * or a degraded connection). Single source of truth shared by the needs-
  * attention aggregation and the prosumer Apps surfaces so their counts agree.
  */
+// This list is a hide-gate, not only a badge. A connection with one of these
+// statuses is not assigned to a native run (services/heartbeat.ts,
+// services/native-runtime/runtime-context.ts), cannot be selected for a
+// connection intent (services/connection-intents.ts) and is filtered out of
+// the usable connection lists in the UI. So a status that must stay
+// discoverable, such as "probe_failed", must not be in this list.
 export const TOOL_CONNECTION_ATTENTION_HEALTH_STATUSES: readonly ToolConnectionHealthStatus[] = [
   "degraded",
   "failed",

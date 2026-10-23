@@ -1276,11 +1276,13 @@ export function createToolGatewayService(
       // grant, and a successful call restores the shared health indicator.
       //
       // "tool_timeout" is kept discoverable for the same reason: one timed
-      // out call says nothing about the connection's other tools. Only a
-      // state in which every call will fail ("error", "missing_secret")
-      // hides the connection's tools.
+      // out call says nothing about the connection's other tools.
+      // "probe_failed" is kept discoverable for the same reason: one failed
+      // background probe is one sample, not proof that every call will fail.
+      // Only a state in which every call will fail ("error",
+      // "missing_secret") hides the connection's tools.
       or(
-        inArray(toolConnections.healthStatus, ["ok", "healthy", "tool_timeout"]),
+        inArray(toolConnections.healthStatus, ["ok", "healthy", "tool_timeout", "probe_failed"]),
         eq(toolConnections.credentialPolicy, "per_user"),
       ),
       eq(toolApplications.companyId, companyId),
