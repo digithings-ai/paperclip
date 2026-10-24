@@ -8,6 +8,7 @@ import { HttpError } from "../errors.js";
 import { claimSlackRateLimitRetry } from "./connectors/slack-retry.js";
 import { resolveSlackTaskAuthority } from "./connectors/slack-authority.js";
 import { SLACK_TOOLS } from "@paperclipai/shared";
+import { CONNECTION_GATEWAY_TOOL_BRAKE } from "@paperclipai/shared/constants";
 import type { ToolConnectionHealthStatus } from "@paperclipai/shared";
 import { slackToolsForSession } from "./connectors/slack-catalog.js";
 import { executeSlackTool } from "./connectors/slack.js";
@@ -2751,6 +2752,27 @@ export function createToolGatewayService(
     }), signal);
   }
 
+
+  async function refuseIfConnectionToolBrakeDenies(
+    session: ToolGatewaySession,
+    tool: ToolGatewayDescriptor,
+    parameters: unknown,
+  ) {
+    const accessDecision = await policyService.decide(policyInputForTool({
+      session,
+      tool,
+      parameters,
+    }));
+    const reasonCode = String(accessDecision.reasonCode);
+    const refused = reasonCode === CONNECTION_GATEWAY_TOOL_BRAKE.reasonAllowlistAbsent
+      || reasonCode === CONNECTION_GATEWAY_TOOL_BRAKE.reasonAllowlistEmpty
+      || reasonCode === CONNECTION_GATEWAY_TOOL_BRAKE.reasonProfileAbsent
+      || reasonCode === CONNECTION_GATEWAY_TOOL_BRAKE.reasonAllowlistDenied
+      || reasonCode === CONNECTION_GATEWAY_TOOL_BRAKE.reasonMetaTool;
+    if (!refused) return;
+    throw new ToolGatewayHttpError(403, accessDecision.explanation, reasonCode);
+  }
+
   function policyErrorStatus(decision: ToolAccessDecision) {
     if (decision.decision === "rate_limited") return 429;
     return 403;
@@ -3048,6 +3070,7 @@ export function createToolGatewayService(
             }
           : tool,
       );
+    const considered = [...decisions];
     if (onDemandTargets.length > 0) {
       const targetDecisions = await decideToolsForListing(
         onDemandTargets,
@@ -3055,6 +3078,7 @@ export function createToolGatewayService(
         decisionCache,
         signal,
       );
+      considered.push(...targetDecisions);
       if (
         targetDecisions.some(
           ({ decision }) =>
@@ -3063,6 +3087,19 @@ export function createToolGatewayService(
       ) {
         visibleTools.push(...VIRTUAL_TOOLS);
       }
+    }
+    const loudDenial = considered.find(({ decision }) => {
+      const reasonCode = String(decision.reasonCode);
+      return reasonCode === CONNECTION_GATEWAY_TOOL_BRAKE.reasonAllowlistAbsent
+        || reasonCode === CONNECTION_GATEWAY_TOOL_BRAKE.reasonAllowlistEmpty
+        || reasonCode === CONNECTION_GATEWAY_TOOL_BRAKE.reasonProfileAbsent;
+    });
+    if (loudDenial && visibleTools.length === 0) {
+      throw new ToolGatewayHttpError(
+        403,
+        loudDenial.decision.explanation,
+        loudDenial.decision.reasonCode,
+      );
     }
     return visibleTools;
   }
@@ -8075,6 +8112,19 @@ export function createToolGatewayService(
     // reflectToolActionInteractionLifecycle.
     await assertIssueOpenForApprovedAction({ claimed, invocation });
 
+    try {
+      await refuseIfConnectionToolBrakeDenies(session, tool, parameters);
+    } catch (error) {
+      await markApprovedActionFailed({
+        actionRequestId: claimed.id,
+        invocationId: invocation.id,
+        claimUpdatedAt: claimed.updatedAt,
+        expectedInvocationStatus: "awaiting_approval",
+        error,
+      });
+      throw error;
+    }
+
     const startedAt = Date.now();
     await db
       .update(toolInvocations)
@@ -8899,6 +8949,39 @@ export function createToolGatewayService(
         },
       });
       return tools;
+    },
+
+    /**
+     * The gateway-owned resource and prompt tools are appended by the HTTP
+     * `tools/list` handler after this service returns, so they bypass the
+     * per-tool decision above. Gate them here: on a braked connection they are
+     * not offered unless the allowlist names them. DIG-5190.
+     */
+    async offeredContextToolNamesForNamedGateway(input: {
+      gatewayId?: string | null;
+      gatewayPublicId?: string | null;
+      bearerToken: string;
+      callerHeaders?: Record<string, string | string[] | undefined>;
+    }): Promise<string[]> {
+      const session = await namedGatewaySessionFromBearer({
+        gatewayId: input.gatewayId ?? null,
+        gatewayPublicId: input.gatewayPublicId ?? null,
+        bearerToken: input.bearerToken,
+        protocolMethod: "tools/list",
+        callerHeaders: input.callerHeaders,
+      });
+      await assertGatewayTokenAction(session, "tools/list");
+      const offered = await policyService.connectionBrakedContextTools({
+        companyId: session.companyId,
+        agentId: session.agentId,
+        issueId: session.issueId,
+        projectId: session.projectId,
+        routineId: null,
+        runId: session.runId,
+        gatewayId: session.gatewayId ?? null,
+        toolNames: CONNECTION_GATEWAY_TOOL_BRAKE.gatewayContextTools,
+      });
+      return CONNECTION_GATEWAY_TOOL_BRAKE.gatewayContextTools.filter((name) => offered.has(name));
     },
 
     async executeContextForNamedGateway(input: {
@@ -10430,6 +10513,7 @@ export function createToolGatewayService(
             toolName: storedInvocation.toolName,
           });
         }
+        await refuseIfConnectionToolBrakeDenies(session, tool, storedParameters);
         const claimedAt = new Date();
         const [claimed] = await db
           .update(toolActionRequests)
