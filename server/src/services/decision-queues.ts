@@ -25,8 +25,9 @@ import type {
   DecisionQueueSeedRule,
   DecisionTriage,
 } from "@paperclipai/shared";
-import { notFound, unprocessable } from "../errors.js";
+import { badRequest, notFound, unprocessable } from "../errors.js";
 import { logActivity } from "./activity-log.js";
+import { isUuidShaped } from "./uuid-shape.js";
 import {
   authorizationService,
   type AuthorizationActor,
@@ -197,12 +198,54 @@ async function loadIssueResource(db: Db, companyId: string, issueId: string): Pr
     .then((rows) => rows[0] ? ({ type: "issue", ...rows[0] } as const) : null);
 }
 
+/**
+ * Every attention source kind points at a row with a uuid primary key, and
+ * every run id lands in a uuid column with a foreign key to heartbeat_runs.
+ * A value that is not a uuid can never match a row, so it is refused before
+ * the database sees it instead of failing the query.
+ */
+/**
+ * The run id of a mutation arrives in a request header. It lands in a uuid
+ * column with a foreign key, so it is kept only when it is a uuid that names
+ * a run of this company. Mirrors resolveCommentCreatedByRun in services/issues.ts.
+ */
+export async function resolveDecisionRunId(
+  db: Db,
+  companyId: string,
+  runId: string | null | undefined,
+): Promise<string | null> {
+  const normalized = typeof runId === "string" ? runId.trim() : "";
+  if (!normalized || !isUuidShaped(normalized)) return null;
+  const existing = await db.select({ id: heartbeatRuns.id })
+    .from(heartbeatRuns)
+    .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.id, normalized)))
+    .then((rows) => rows[0] ?? null);
+  return existing?.id ?? null;
+}
+
+/** The same actor with a run id that is safe for a uuid column. */
+async function withResolvedRunId(
+  db: Db,
+  companyId: string,
+  actor: DecisionMutationActor,
+): Promise<DecisionMutationActor> {
+  if (!actor.runId) return actor;
+  const runId = await resolveDecisionRunId(db, companyId, actor.runId);
+  return runId === actor.runId ? actor : { ...actor, runId };
+}
+
 async function sourceIssueId(
   db: Db,
   companyId: string,
   sourceKind: AttentionSourceKind,
   sourceId: string,
 ): Promise<{ exists: boolean; issueId: string | null; ownerAgentId?: string | null; agentId?: string | null }> {
+  // A short or malformed id can never match a source row. Refuse it here so
+  // the caller gets a 400 with the shape it needs instead of a database
+  // failure with a 500.
+  if (!isUuidShaped(sourceId)) {
+    throw badRequest("Invalid attention source identity: sourceId must be a uuid");
+  }
   switch (sourceKind) {
     case "approval": {
       const row = await db.select({ id: approvals.id, issueId: issueApprovals.issueId })
@@ -456,6 +499,9 @@ export function decisionQueueService(db: Db) {
       .orderBy(desc(decisionQueueItems.createdAt), desc(decisionQueueItems.id));
     const visible: DecisionQueueItem[] = [];
     for (const row of rows) {
+      // A stored source id that no uuid can match names no source row, so it
+      // is skipped instead of failing the whole list for every reader.
+      if (!isUuidShaped(row.sourceId)) continue;
       if (await canReadDecisionSource(db, authActor, companyId, row.sourceKind as AttentionSourceKind, row.sourceId)) {
         visible.push(toQueueItem(row));
       }
@@ -473,6 +519,7 @@ export function decisionQueueService(db: Db) {
       authActor: AuthorizationActor;
       actor: DecisionMutationActor;
     }) => {
+      const actor = await withResolvedRunId(db, input.companyId, input.actor);
       const result = await db.transaction(async (tx) => {
         const txDb = tx as unknown as Db;
         const inserted = await txDb.insert(decisionQueues).values({
@@ -481,7 +528,7 @@ export function decisionQueueService(db: Db) {
           title: input.title,
           description: input.description ?? null,
           retentionDays: input.retentionDays ?? null,
-          ...creatorColumns(input.actor),
+          ...creatorColumns(actor),
         }).onConflictDoNothing({ target: [decisionQueues.companyId, decisionQueues.key] }).returning();
         const row = inserted[0] ?? await txDb.select().from(decisionQueues)
           .where(and(eq(decisionQueues.companyId, input.companyId), eq(decisionQueues.key, input.key)))
@@ -492,10 +539,10 @@ export function decisionQueueService(db: Db) {
             companyId: input.companyId,
             queueId: row.id,
             action: "queue.created",
-            ...eventActorColumns(input.actor),
+            ...eventActorColumns(actor),
             details: { key: row.key },
           });
-          await recordActivity(txDb, input.actor, {
+          await recordActivity(txDb, actor, {
             companyId: input.companyId,
             action: "decision_queue.created",
             entityType: "decision_queue",
@@ -530,6 +577,7 @@ export function decisionQueueService(db: Db) {
       authActor: AuthorizationActor;
       actor: DecisionMutationActor;
     }) => {
+      const actor = await withResolvedRunId(db, input.companyId, input.actor);
       const row = await db.transaction(async (tx) => {
         const txDb = tx as unknown as Db;
         const updated = await txDb.update(decisionQueues).set({ ...input.patch, updatedAt: new Date() })
@@ -540,10 +588,10 @@ export function decisionQueueService(db: Db) {
           companyId: input.companyId,
           queueId: updated.id,
           action: "queue.updated",
-          ...eventActorColumns(input.actor),
+          ...eventActorColumns(actor),
           details: { fields: Object.keys(input.patch) },
         });
-        await recordActivity(txDb, input.actor, {
+        await recordActivity(txDb, actor, {
           companyId: input.companyId,
           action: "decision_queue.updated",
           entityType: "decision_queue",
@@ -572,6 +620,7 @@ export function decisionQueueService(db: Db) {
       const queue = await getQueue(input.companyId, input.key);
       if (!queue) throw notFound("Decision queue not found");
       await requireSourceRead(db, input.authActor, input.companyId, input.sourceKind, input.sourceId);
+      const actor = await withResolvedRunId(db, input.companyId, input.actor);
       return db.transaction(async (tx) => {
         const txDb = tx as unknown as Db;
         const inserted = await txDb.insert(decisionQueueItems).values({
@@ -579,8 +628,8 @@ export function decisionQueueService(db: Db) {
           queueId: queue.id,
           sourceKind: input.sourceKind,
           sourceId: input.sourceId,
-          responsibleUserId: input.actor.responsibleUserId,
-          ...addedByColumns(input.actor),
+          responsibleUserId: actor.responsibleUserId,
+          ...addedByColumns(actor),
         }).onConflictDoNothing({
           target: [decisionQueueItems.queueId, decisionQueueItems.sourceKind, decisionQueueItems.sourceId],
         }).returning();
@@ -599,9 +648,9 @@ export function decisionQueueService(db: Db) {
             sourceKind: input.sourceKind,
             sourceId: input.sourceId,
             action: "queue_item.added",
-            ...eventActorColumns(input.actor),
+            ...eventActorColumns(actor),
           });
-          await recordActivity(txDb, input.actor, {
+          await recordActivity(txDb, actor, {
             companyId: input.companyId,
             action: "decision_queue_item.added",
             entityType: "decision_queue",
@@ -631,6 +680,7 @@ export function decisionQueueService(db: Db) {
         input.sourceKind,
         input.sourceId,
       );
+      const actor = await withResolvedRunId(db, input.companyId, input.actor);
       // Board operators may clean up an existing sidecar after its source has
       // disappeared. Agents still need source-level read authority so removal
       // cannot be used to probe hidden membership.
@@ -655,9 +705,9 @@ export function decisionQueueService(db: Db) {
           sourceId: input.sourceId,
           action: "queue_item.removed",
           details: input.reason ? { reason: input.reason } : {},
-          ...eventActorColumns(input.actor),
+          ...eventActorColumns(actor),
         });
-        await recordActivity(txDb, input.actor, {
+        await recordActivity(txDb, actor, {
           companyId: input.companyId,
           action: "decision_queue_item.removed",
           entityType: "decision_queue",
@@ -697,6 +747,7 @@ export function decisionQueueService(db: Db) {
       actor: DecisionMutationActor;
     }) => {
       await requireSourceRead(db, input.authActor, input.companyId, input.sourceKind, input.sourceId);
+      const actor = await withResolvedRunId(db, input.companyId, input.actor);
       return db.transaction(async (tx) => {
         const txDb = tx as unknown as Db;
         const lockKey = `decision-triage:${input.companyId}:${input.sourceKind}:${input.sourceId}`;
@@ -725,7 +776,7 @@ export function decisionQueueService(db: Db) {
           setByType: input.actor.actorType as "agent" | "user",
           setByAgentId: input.actor.agentId,
           setByUserId: input.actor.userId,
-          setByRunId: input.actor.runId,
+          setByRunId: actor.runId,
           setByAgentApiKeyId: input.actor.agentApiKeyId,
           responsibleUserId: input.actor.responsibleUserId,
           version: (current?.version ?? 0) + 1,
@@ -745,7 +796,7 @@ export function decisionQueueService(db: Db) {
           sourceKind: input.sourceKind,
           sourceId: input.sourceId,
           action: "triage.updated",
-          ...eventActorColumns(input.actor),
+          ...eventActorColumns(actor),
           details: {
             previousDecideBy: current ? toTriage(current).decideBy : null,
             decideBy: toTriage(row).decideBy,
@@ -754,7 +805,7 @@ export function decisionQueueService(db: Db) {
             version: row.version,
           },
         });
-        await recordActivity(txDb, input.actor, {
+        await recordActivity(txDb, actor, {
           companyId: input.companyId,
           action: "decision_triage.updated",
           entityType: "attention_source",
