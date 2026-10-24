@@ -562,6 +562,7 @@ import {
   INTERACTION_CONTINUATION_INFRA_RETRY_REASON,
   INTERACTION_CONTINUATION_INFRA_WAKE_REASON,
   WAKE_COMMENT_IDS_KEY,
+  BOARD_KEY_COMMENT_IDS_KEY,
   isNonAssigneeWorkspaceBusyRetry,
   extractWakeCommentIds,
   deriveCommentId,
@@ -7451,6 +7452,15 @@ export function mergeCoalescedContextSnapshot(
   }
   if (existing.refreshTools === true || incoming.refreshTools === true) {
     merged.refreshTools = true;
+  }
+  const mergedBoardKeyCommentIds = mergeWakeCommentIds(
+    existing[BOARD_KEY_COMMENT_IDS_KEY],
+    incoming[BOARD_KEY_COMMENT_IDS_KEY],
+  );
+  if (mergedBoardKeyCommentIds.length > 0) {
+    merged[BOARD_KEY_COMMENT_IDS_KEY] = mergedBoardKeyCommentIds;
+  } else {
+    delete merged[BOARD_KEY_COMMENT_IDS_KEY];
   }
   const mergedCommentIds = mergeWakeCommentIds(existing, incoming);
   if (mergedCommentIds.length > 0) {

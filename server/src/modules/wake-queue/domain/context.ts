@@ -4,7 +4,11 @@
 // shape; this file holds only the small pieces that are specific to
 // building the release half's promoted-run snapshot.
 
-import { extractWakeCommentIds, WAKE_COMMENT_IDS_KEY } from "../../run-dispatch/index.js";
+import {
+  BOARD_KEY_COMMENT_IDS_KEY,
+  extractWakeCommentIds,
+  WAKE_COMMENT_IDS_KEY,
+} from "../../run-dispatch/index.js";
 import { readNonEmptyString } from "./values.js";
 
 const PAPERCLIP_WAKE_PAYLOAD_KEY = "paperclipWake";
@@ -67,6 +71,30 @@ function mergeWakeCommentIds(...values: Array<unknown>): string[] {
 
 export function hasInteractionContinuationWakeContext(contextSnapshot: Record<string, unknown>): boolean {
   return INTERACTION_CONTINUATION_CONTEXT_KEYS.some((key) => readNonEmptyString(contextSnapshot[key]));
+}
+
+/**
+ * True when every comment carried by a deferred wake was written with the
+ * board API key and had no explicit reopen/resume ask. A wake like that only
+ * carries automation output (for example a script's closing note), so
+ * releasing it must not revive a completed issue. One human comment in the
+ * merged id list turns the answer false, because that comment may be a real
+ * follow-up request.
+ */
+export function deferredCommentsAreBoardKeyAutomation(
+  contextSnapshot: Record<string, unknown> | null | undefined,
+): boolean {
+  const commentIds = extractWakeCommentIds(contextSnapshot);
+  if (commentIds.length === 0) return false;
+  const rawBoardKeyIds = contextSnapshot?.[BOARD_KEY_COMMENT_IDS_KEY];
+  if (!Array.isArray(rawBoardKeyIds)) return false;
+  const boardKeyIds = new Set(
+    rawBoardKeyIds
+      .map((value) => readNonEmptyString(value))
+      .filter((value): value is string => value !== null),
+  );
+  if (boardKeyIds.size === 0) return false;
+  return commentIds.every((commentId) => boardKeyIds.has(commentId));
 }
 
 function isInteractionResolutionWakePayload(payload: Record<string, unknown> | null | undefined): boolean {

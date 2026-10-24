@@ -8,7 +8,10 @@ import { queuedInteractionId, readQueuedInteractionResponse, hasQueuedInteractio
 import { deliverConversationComments, isConversation } from "../services/agent-conversations.js";
 import { issueRecoveryActionReadModel } from "../services/issue-recovery-actions.js";
 import { getExecutionBlocker } from "../services/execution-blocker.js";
-import { INTERACTION_PENDING_WAKE_REASON } from "../modules/run-dispatch/index.js";
+import {
+  BOARD_KEY_COMMENT_IDS_KEY,
+  INTERACTION_PENDING_WAKE_REASON,
+} from "../modules/run-dispatch/index.js";
 import { requiresExecutionReconciliation } from "@paperclipai/shared";
 import {
   validateExecutionReconciliation,
@@ -2329,11 +2332,22 @@ function isClosedIssueStatus(
   return status === "done" || status === "cancelled";
 }
 
+/**
+ * The actor sources the platform can report for a comment author.
+ *
+ * Derived from the platform helper instead of a hand-written union: when a
+ * new source is added (the public-MCP OAuth path, for example) the platform
+ * widens its own type and this signature widens with it, instead of failing
+ * to compile at the call sites.
+ */
+type CommentActorSource = ReturnType<typeof getActorInfo>["actorSource"];
+
 function shouldImplicitlyMoveCommentedIssueToTodo(input: {
   issueStatus: string | null | undefined;
   assigneeAgentId: string | null | undefined;
   actorType: "agent" | "user";
   actorId: string;
+  actorSource: CommentActorSource;
   actorRunId: string | null | undefined;
   checkoutRunId: string | null | undefined;
   executionRunId: string | null | undefined;
@@ -2359,6 +2373,15 @@ function shouldImplicitlyMoveCommentedIssueToTodo(input: {
   ) {
     return false;
   }
+  // A board API key is automation credentials, not a signed-in human. Scripts
+  // (pc.sh and similar) post closing notes and status updates with this key,
+  // often after they finished the run that closed the issue. Treating those
+  // notes as a follow-up request flipped the issue back to todo and woke the
+  // assignee, who found no new work and closed it again - a reopen loop the
+  // closing note itself could keep alive. Only an explicit `reopen`/`resume`
+  // ask, or a direct status change in the same request, may revive closed work
+  // through a board-key write.
+  if (input.actorSource === "board_key") return false;
   // Only human comments should implicitly reopen finished work.
   // Agent-authored comments remain communicative unless reopen was explicit.
   if (input.actorType !== "user") return false;
@@ -13127,6 +13150,18 @@ export function issueRoutes(
           : normalizedAssigneeAgentId;
       const explicitMoveToTodoRequested =
         reopenRequested || resumeRequested === true;
+      // Automation writes with the board API key are log-class notes unless
+      // they carry an explicit reopen/resume ask. Stamp the comment id on the
+      // wake so a deferred release does not revive the issue when the owning
+      // run closes it before the wake is promoted. The issue-update route
+      // carries the same guard as the comments route: without it, a board-key
+      // PATCH comment on an in_progress issue queues a user-requested comment
+      // wake, the heartbeat defers it while the owning run is still active,
+      // and the release reopens the finished issue.
+      const boardKeyCommentWithoutAsk =
+        actor.actorSource === "board_key" &&
+        reopenRequested !== true &&
+        resumeRequested !== true;
       const recoveryRelevantSourceMutationRequested =
         req.body.status !== undefined ||
         normalizedAssigneeAgentId !== undefined ||
@@ -13198,6 +13233,7 @@ export function issueRoutes(
               assigneeAgentId: requestedAssigneeAgentId,
               actorType: actor.actorType,
               actorId: actor.actorId,
+              actorSource: actor.actorSource,
               actorRunId: actor.runId,
               checkoutRunId: existing.checkoutRunId,
               executionRunId: existing.executionRunId,
@@ -14948,6 +14984,9 @@ export function issueRoutes(
                   ? "issue_reopened_via_comment"
                   : "issue_commented",
                 ...(reopened ? { reopenedFrom: reopenFromStatus } : {}),
+                ...(boardKeyCommentWithoutAsk
+                  ? { [BOARD_KEY_COMMENT_IDS_KEY]: [comment.id] }
+                  : {}),
                 ...(resumeRequested === true
                   ? { resumeIntent: true, followUpRequested: true }
                   : {}),
@@ -17650,6 +17689,14 @@ export function issueRoutes(
       }
       const explicitMoveToTodoRequested =
         effectiveReopenRequested || effectiveResumeRequested === true;
+      // Automation writes with the board API key are log-class notes unless
+      // they carry an explicit reopen/resume ask. Stamp the comment id on the
+      // wake so a deferred release does not revive the issue when the owning
+      // run closes it before the wake is promoted.
+      const boardKeyCommentWithoutAsk =
+        actor.actorSource === "board_key" &&
+        effectiveReopenRequested !== true &&
+        effectiveResumeRequested !== true;
       const scheduledRetryForHumanComment =
         shouldHumanCommentResumeInProgressScheduledRetry({
           hasComment: true,
@@ -17679,6 +17726,7 @@ export function issueRoutes(
             assigneeAgentId: issue.assigneeAgentId,
             actorType: actor.actorType,
             actorId: actor.actorId,
+            actorSource: actor.actorSource,
             actorRunId: actor.runId,
             checkoutRunId: issue.checkoutRunId,
             executionRunId: issue.executionRunId,
@@ -18372,6 +18420,9 @@ export function issueRoutes(
                 wakeCommentId: comment.id,
                 source: "issue.comment.reopen",
                 wakeReason: "issue_reopened_via_comment",
+                ...(boardKeyCommentWithoutAsk
+                  ? { [BOARD_KEY_COMMENT_IDS_KEY]: [comment.id] }
+                  : {}),
                 reopenedFrom: reopenFromStatus,
                 ...(resumeRequested === true
                   ? { resumeIntent: true, followUpRequested: true }
@@ -18409,6 +18460,9 @@ export function issueRoutes(
                 wakeCommentId: comment.id,
                 source: "issue.comment",
                 wakeReason: "issue_commented",
+                ...(boardKeyCommentWithoutAsk
+                  ? { [BOARD_KEY_COMMENT_IDS_KEY]: [comment.id] }
+                  : {}),
                 ...(resumeRequested === true
                   ? { resumeIntent: true, followUpRequested: true }
                   : {}),
