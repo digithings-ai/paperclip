@@ -23,6 +23,10 @@ import {
 } from "@paperclipai/shared";
 import { parseIssueExecutionState } from "./issue-execution-policy.js";
 import { isSupersededConversationRun } from "./agent-conversations.js";
+import {
+  findRunOwnedIssueStatusEvidence,
+  isRunOwnedIssueStatus,
+} from "./run-owned-issue-status.js";
 
 /** An operator records observed outcomes; this is not permission to blindly retry. */
 export async function validateExecutionReconciliation(input: {
@@ -478,14 +482,33 @@ export async function settleUnrecoverableExecutions(
           !["done", "cancelled"].includes(task.status) &&
           (!task.executionRunId || task.executionRunId === run.id) &&
           (!task.checkoutRunId || task.checkoutRunId === run.id);
-        const note = current
-          ? hasWorkspaceRestoreFailure(run.resultJson)
-            ? "Workspace repair required. Verify safe staging or repair before continuing. Saved work and approval decisions remain in force."
-            : "Automatic recovery stopped. Recorded work is preserved; actions with unverified outcomes will not be repeated."
-          : "Recovery closed because the task's owner, execution, or status changed. No work was replayed.";
+        // A run may record a review or terminal status on its own issue before
+        // it ends. Recovery preserves that status instead of writing over it:
+        // the run already told the board what the work reached.
+        const preservedIssueStatus =
+          current && isRunOwnedIssueStatus(task.status)
+            ? (
+                await findRunOwnedIssueStatusEvidence(tx as unknown as Db, {
+                  companyId: task.companyId,
+                  issueId: task.id,
+                  runId: run.id,
+                  status: task.status,
+                })
+              )?.id
+              ? task.status
+              : null
+            : null;
+        const blockable = current && !preservedIssueStatus;
+        const note = preservedIssueStatus
+          ? "Automatic recovery stopped. The run recorded this task's status; it was preserved and no action was replayed."
+          : blockable
+            ? hasWorkspaceRestoreFailure(run.resultJson)
+              ? "Workspace repair required. Verify safe staging or repair before continuing. Saved work and approval decisions remain in force."
+              : "Automatic recovery stopped. Recorded work is preserved; actions with unverified outcomes will not be repeated."
+            : "Recovery closed because the task's owner, execution, or status changed. No work was replayed.";
         let nativeFailureBlock = action.evidence.nativeFailureBlock;
         let nativeBootstrapFailureBlock = action.evidence.nativeBootstrapFailureBlock;
-        if (current) {
+        if (blockable) {
           const [projected] = await tx
             .update(issues)
             .set({
@@ -509,7 +532,7 @@ export async function settleUnrecoverableExecutions(
           .update(issueRecoveryActions)
           .set({
             status: "resolved",
-            outcome: current ? "blocked" : "cancelled",
+            outcome: blockable ? "blocked" : "cancelled",
             resolvedAt: now,
             updatedAt: now,
             nextAction: note,
@@ -520,6 +543,7 @@ export async function settleUnrecoverableExecutions(
               ...action.evidence,
               ...(nativeFailureBlock ? { nativeFailureBlock } : {}),
               ...(nativeBootstrapFailureBlock ? { nativeBootstrapFailureBlock } : {}),
+              ...(preservedIssueStatus ? { preservedIssueStatus } : {}),
               automaticRecovery: {
                 policy: "preserve_without_replay_v1",
                 runId: run.id,
@@ -540,8 +564,9 @@ export async function settleUnrecoverableExecutions(
           runId: run.id,
           details: {
             recoveryActionId: action.id,
-            outcome: current ? "blocked" : "cancelled",
+            outcome: blockable ? "blocked" : "cancelled",
             replay: "not_authorized",
+            ...(preservedIssueStatus ? { preservedIssueStatus } : {}),
           },
         });
         await tx
@@ -561,6 +586,7 @@ export async function settleUnrecoverableExecutions(
             cause: action.cause,
             automaticRecovery: "preserve_without_replay_v1",
             replay: "blocked",
+            ...(preservedIssueStatus ? { preservedIssueStatus } : {}),
           },
         });
         options.failpoint?.("persisted");

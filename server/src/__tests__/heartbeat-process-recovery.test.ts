@@ -7617,6 +7617,61 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     }
   });
 
+  it("records an exit-0 run as succeeded when the controller lease was lost", async () => {
+    const { runId, issueId } = await seedRunFixture({
+      runtimeMode: "legacy",
+      agentStatus: "idle",
+      runStatus: "queued",
+    });
+    const originalWatch = controllerLeases.watchLegacyControllerLease;
+    let controller: AbortController | null = null;
+    const watcher = vi.spyOn(controllerLeases, "watchLegacyControllerLease").mockImplementation((...args) => {
+      controller = args[2];
+      return originalWatch(...args);
+    });
+    mockAdapterExecute.mockImplementationOnce(async () => {
+      // The lease watcher aborts the controller when it cannot renew. No stop
+      // was requested, so the run keeps going and ends with exit code 0.
+      controller?.abort(new controllerLeases.LegacyControllerLeaseLostError());
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        errorMessage: null,
+        summary: "Completed the turn.",
+        provider: "test",
+        model: "test-model",
+      };
+    });
+    const heartbeat = heartbeatService(db);
+    try {
+      await heartbeat.resumeQueuedRuns();
+      await waitForRunToSettle(heartbeat, runId);
+      await heartbeat.waitForRunExecutionDrain(runId);
+    } finally {
+      watcher.mockRestore();
+    }
+
+    const run = await heartbeat.getRun(runId);
+    expect(run).toMatchObject({ status: "succeeded", error: null, errorCode: null, exitCode: 0 });
+    expect(run?.resultJson?.cancellation).toBeUndefined();
+    expect(run?.resultJson?.legacyControllerLeaseLost).toMatchObject({
+      reason: expect.stringContaining("lease lost"),
+    });
+    // A run that succeeded never needs a reconciliation receipt.
+    expect(
+      await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(
+          and(
+            eq(issueRecoveryActions.sourceIssueId, issueId),
+            eq(issueRecoveryActions.cause, "legacy_execution_requires_reconciliation"),
+          ),
+        ),
+    ).toHaveLength(0);
+  });
+
   it("dispatches interrupted CLI input after the executor releases its lease", async () => {
     const actualProcess = await vi.importActual<typeof import("../adapters/process/execute.js")>("../adapters/process/execute.js");
     const { companyId, agentId, issueId, runId } = await seedRunFixture({

@@ -10,6 +10,7 @@ import type { PaperclipTurnContext } from "@paperclipai/adapter-utils/server-uti
 import { restoreNativeWorkspaceBestEffort } from "./native-runtime/native-workspace-best-effort.js";
 import { ASSIGNED_MCP_SERVER_NAME } from "./mcp-tool-names.js";
 import { cancellationResultJson, canContinueCancelledRun, readRunCancellation, requestedRunCancellation } from "./run-cancellation.js";
+import { resolveHeartbeatRunOutcome } from "./heartbeat-run-outcome.js";
 import {
   withNativeWorkspaceFinalizationOwnership,
   NativeWorkspaceFinalizationBusyError,
@@ -31,7 +32,7 @@ import { withAdapterExecutionPhase } from "@paperclipai/adapter-utils/execution-
 import { getConversationConfirmationContext, type ConversationConfirmationContext } from "./conversation-confirmation-context.js";
 import { PROCESS_IDENTITY_RECORDED, recordNativeLocalProcessStop } from "./native-local-process-stop.js";
 import { hasAcknowledgedNativeReassignmentStopIntent, hasAcknowledgedNativeStopIntent, isAcknowledgedNativeStop, acknowledgedNativeStopExecutionHasStopped } from "./acknowledged-native-stop.js";
-import { legacyControllerBootId, legacyControllerClaim, renewLegacyControllerLease, hasLiveLegacyController, revokeExpiredLegacyController, watchLegacyControllerLease } from "./legacy-controller-lease.js";
+import { legacyControllerBootId, legacyControllerClaim, renewLegacyControllerLease, hasLiveLegacyController, revokeExpiredLegacyController, watchLegacyControllerLease, isLegacyControllerLeaseLost } from "./legacy-controller-lease.js";
 import { completeTerminatedRemoteNativeSessionCleanup } from "../vendor/paperclip-runner/index.js";
 import { hasRemoteTerminationReceipt, remoteExecutionHasStopped, remoteTerminationReceipt, stoppedRemoteCleanupScopes } from "./remote-execution-termination.js";
 import { applyConnectorSkills, prepareConnectorSkillDelivery, resolveConnectorAssignments } from "./connector-runtime.js";
@@ -25801,33 +25802,41 @@ export function heartbeatService(
         await processCancellation?.settled;
         let outcome: RunSessionOutcome;
         const latestRun = await getRun(run.id);
-        if (isHeartbeatRunTerminalStatus(latestRun?.status)) {
-          outcome = latestRun.status;
-        } else if (executionControl.controller.signal.aborted) {
-          outcome = "cancelled";
-        } else if (adapterResult.nativeFinalization) {
-          const nativeTerminal =
-            adapterResult.nativeFinalization.terminal.runTerminalState;
-          outcome =
-            nativeTerminal === "succeeded"
-              ? "succeeded"
-              : nativeTerminal === "cancelled"
-                ? "cancelled"
-                : "failed";
-        } else if (adapterResult.timedOut) {
-          outcome = "timed_out";
-        } else if (adapterResult.resultJson?.status === "cancelled") {
-          outcome = "cancelled";
-        } else if (
-          (adapterResult.exitCode ?? 0) === 0 &&
-          !adapterResult.errorMessage &&
-          !adapterResult.signal &&
-          !processCancellation?.failed
-        ) {
-          outcome = "succeeded";
-        } else {
-          outcome = "failed";
-        }
+        // A recorded cancellation is the only proof that a stop was asked for.
+        // An aborted controller without one (a lost controller lease) must not
+        // turn a healthy run into a cancellation.
+        const recordedCancellation =
+          readRunCancellation(latestRun?.resultJson) ??
+          readRunCancellation(adapterResult.resultJson);
+        const controllerAbortReason = executionControl.controller.signal.aborted
+          ? executionControl.controller.signal.reason
+          : null;
+        const legacyControllerLeaseLost = isLegacyControllerLeaseLost(
+          controllerAbortReason,
+        )
+          ? {
+              reason:
+                controllerAbortReason instanceof Error
+                  ? controllerAbortReason.message
+                  : "Legacy controller lease lost",
+              recordedAt: new Date().toISOString(),
+            }
+          : null;
+        outcome = resolveHeartbeatRunOutcome({
+          persistedStatus: latestRun?.status,
+          controllerAborted: executionControl.controller.signal.aborted,
+          recordedCancellation,
+          nativeFinalization: adapterResult.nativeFinalization,
+          timedOut: adapterResult.timedOut,
+          adapterStatus:
+            typeof adapterResult.resultJson?.status === "string"
+              ? adapterResult.resultJson.status
+              : null,
+          exitCode: adapterResult.exitCode,
+          errorMessage: adapterResult.errorMessage,
+          signal: adapterResult.signal,
+          processCancellationFailed: processCancellation?.failed,
+        });
 
         const nextSessionState = resolveNextSessionState({
           adapterType: agent.adapterType,
@@ -25975,6 +25984,9 @@ export function heartbeatService(
                 ...parseObject(adapterResult.resultJson),
                 ...(adapterResult.executionRecovery
                   ? { executionRecovery: adapterResult.executionRecovery }
+                  : {}),
+                ...(legacyControllerLeaseLost
+                  ? { legacyControllerLeaseLost }
                   : {}),
                 configFreshness: configFreshnessResultMetadata,
               },
