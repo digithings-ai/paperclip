@@ -9599,6 +9599,48 @@ export function stripNulFromHeartbeatPatch<T extends Record<string, unknown>>(pa
   return p as T;
 }
 
+// DIG-4392: after the compare-and-set loses to the reconciler, the late
+// metadata write re-binds the adapter-derived finalRunPatch. Compose the patch
+// here so the NUL strip always covers the re-written text and the derived
+// cancellation resultJson. The argument is copied because
+// stripNulFromHeartbeatPatch mutates in place and finalRunPatch is reused.
+export function buildLateFinalizationPatch(input: {
+  finalRunPatch: Partial<typeof heartbeatRuns.$inferInsert>;
+  persistedRun: Pick<
+    typeof heartbeatRuns.$inferSelect,
+    "status" | "startedAt" | "finishedAt" | "runtimeMode" | "errorCode" | "error" | "resultJson"
+  >;
+  status: string;
+  runErrorCode: string | null;
+  runErrorMessage: string | null;
+}): Partial<typeof heartbeatRuns.$inferInsert> {
+  return stripNulFromHeartbeatPatch({
+    ...input.finalRunPatch,
+    resultJson: cancellationResultJson(
+      input.persistedRun,
+      input.status,
+      input.finalRunPatch.resultJson,
+      input.runErrorCode,
+      input.runErrorMessage,
+    ),
+    finishedAt: input.persistedRun.finishedAt ?? input.finalRunPatch.finishedAt,
+    updatedAt: new Date(),
+  });
+}
+
+// DIG-4392: the presentation write re-binds the adapter resultJson. Strip NUL
+// from the composed object without mutating persistedResultJson, which is read
+// again after this write.
+export function buildPresentationResultJson(
+  persistedResultJson: Record<string, unknown> | null | undefined,
+  presentationDecision: RunPresentationDecision,
+): Record<string, unknown> {
+  return stripNulDeep({
+    ...(persistedResultJson ?? {}),
+    presentationDecision,
+  }) as Record<string, unknown>;
+}
+
 export function heartbeatService(
   db: Db,
   options: HeartbeatServiceOptions = {},
@@ -26028,13 +26070,15 @@ export function heartbeatService(
           ) {
             persistedRun = await db
               .update(heartbeatRuns)
-              .set({
-                ...finalRunPatch,
-                resultJson: cancellationResultJson(persistedRunWrite.run, status, finalRunPatch.resultJson, runErrorCode, runErrorMessage),
-                finishedAt:
-                  persistedRunWrite.run.finishedAt ?? finalRunPatch.finishedAt,
-                updatedAt: new Date(),
-              })
+              .set(
+                buildLateFinalizationPatch({
+                  finalRunPatch,
+                  persistedRun: persistedRunWrite.run,
+                  status,
+                  runErrorCode,
+                  runErrorMessage,
+                }),
+              )
               .where(
                 and(
                   eq(heartbeatRuns.id, run.id),
@@ -26248,10 +26292,10 @@ export function heartbeatService(
             await db
               .update(heartbeatRuns)
               .set({
-                resultJson: {
-                  ...persistedResultJson,
+                resultJson: buildPresentationResultJson(
+                  persistedResultJson,
                   presentationDecision,
-                },
+                ),
                 updatedAt: new Date(),
               })
               .where(eq(heartbeatRuns.id, livenessRun.id));
