@@ -333,6 +333,12 @@ export async function assertTarballEntriesConfined(
   const timer = setTimeout(() => {
     stop(new Error("Daytona syncOut tar listing validation timed out"));
   }, Math.max(1, Math.min(timeoutMs, TAR_LISTING_TIMEOUT_MS)));
+  child.stderr.on("error", (error: Error) => {
+    stop(error);
+  });
+  child.stdout.on("error", (error: Error) => {
+    stop(error);
+  });
   child.stderr.on("data", (chunk: Buffer) => {
     if (stderr.length + chunk.length > TAR_LISTING_MAX_STDERR_BYTES) {
       stop(new Error("Daytona syncOut tar listing diagnostics exceed the byte limit"));

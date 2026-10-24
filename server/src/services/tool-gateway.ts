@@ -5097,6 +5097,30 @@ export function createToolGatewayService(
     timer.unref?.();
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
+    const failClosedPipe = (err: Error) => {
+      const code = (err as NodeJS.ErrnoException).code;
+      const gatewayError = new ToolGatewayHttpError(
+        502,
+        "Local stdio MCP command closed its pipes",
+        "local_stdio_process_exited",
+        {
+          connectionId: input.connection.id,
+          catalogEntryId: input.entry?.id ?? null,
+          code: code ?? null,
+          message: err.message,
+        },
+      );
+      for (const { reject: rejectPending } of pending.values()) {
+        rejectPending(gatewayError);
+      }
+      pending.clear();
+    };
+    const onStdioError = (err: Error) => {
+      failClosedPipe(err);
+    };
+    child.stdin?.on("error", onStdioError);
+    child.stdout.on("error", onStdioError);
+    child.stderr.on("error", onStdioError);
     child.stdout.on("data", (chunk: string) => {
       stdout += chunk;
       let newline = stdout.indexOf("\n");
@@ -5194,10 +5218,47 @@ export function createToolGatewayService(
       nextId += 1;
       const promise = new Promise<unknown>((resolve, reject) => {
         pending.set(id, { resolve, reject });
+        const stdin = child.stdin;
+        if (
+          !stdin ||
+          child.killed ||
+          stdin.destroyed ||
+          child.exitCode !== null ||
+          child.signalCode !== null
+        ) {
+          pending.delete(id);
+          reject(new ToolGatewayHttpError(
+            502,
+            "Local stdio MCP command exited before the request was written",
+            "local_stdio_process_exited",
+            {
+              connectionId: input.connection.id,
+              catalogEntryId: input.entry?.id ?? null,
+              stderr,
+            },
+          ));
+          return;
+        }
+        try {
+          stdin.write(
+            `${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`,
+          );
+        } catch (err) {
+          pending.delete(id);
+          const error = err instanceof Error ? err : new Error(String(err));
+          reject(new ToolGatewayHttpError(
+            502,
+            "Local stdio MCP command closed its pipes",
+            "local_stdio_process_exited",
+            {
+              connectionId: input.connection.id,
+              catalogEntryId: input.entry?.id ?? null,
+              code: (error as NodeJS.ErrnoException).code ?? null,
+              message: error.message,
+            },
+          ));
+        }
       });
-      child.stdin.write(
-        `${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`,
-      );
       return promise;
     };
     try {
@@ -5206,9 +5267,31 @@ export function createToolGatewayService(
         capabilities: {},
         clientInfo: { name: "paperclip-tool-gateway", version: "0.3.1" },
       });
-      child.stdin.write(
-        `${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized", params: {} })}\n`,
-      );
+      if (
+        child.stdin &&
+        !child.killed &&
+        !child.stdin.destroyed &&
+        child.exitCode === null &&
+        child.signalCode === null
+      ) {
+        try {
+          child.stdin.write(
+            `${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized", params: {} })}\n`,
+          );
+        } catch (err) {
+          const error = err instanceof Error ? err : new Error(String(err));
+          throw new ToolGatewayHttpError(
+            502,
+            "Local stdio MCP command closed its pipes",
+            "local_stdio_process_exited",
+            {
+              connectionId: input.connection.id,
+              code: (error as NodeJS.ErrnoException).code ?? null,
+              message: error.message,
+            },
+          );
+        }
+      }
       return await request(
         input.protocolMethod ?? "tools/call",
         input.protocolParams ?? {
@@ -5218,7 +5301,13 @@ export function createToolGatewayService(
       );
     } finally {
       clearTimeout(timer);
-      child.stdin.end();
+      if (child.stdin && !child.stdin.destroyed && child.exitCode === null && child.signalCode === null) {
+        try {
+          child.stdin.end();
+        } catch {
+          // The process is already gone; exit handling owns the failure.
+        }
+      }
       child.kill("SIGTERM");
       await exitPromise.catch(() => undefined);
     }
