@@ -111,12 +111,42 @@ async function handleMcpGatewayProtocol(
       return;
     }
     if (body.method === "tools/list") {
-      const tools = await discoveryRequest(req, res, (signal) => toolGateway.listToolsForNamedGateway({
-        ...locator,
-        bearerToken: token,
-        callerHeaders: headers,
-        signal,
-      }));
+      const { tools, contextToolNames } = await discoveryRequest(req, res, async (signal) => {
+        const tools = await toolGateway.listToolsForNamedGateway({
+          ...locator,
+          bearerToken: token,
+          callerHeaders: headers,
+          signal,
+        });
+        const contextToolNames = await toolGateway.offeredContextToolNamesForNamedGateway({
+          ...locator,
+          bearerToken: token,
+          callerHeaders: headers,
+        });
+        return { tools, contextToolNames };
+      });
+      const contextTools = [
+        {
+          name: "paperclip_list_resources",
+          description: "List resources from fully assigned MCP connections.",
+          inputSchema: { type: "object", properties: {}, additionalProperties: false },
+        },
+        {
+          name: "paperclip_read_resource",
+          description: "Read a resource URI returned by paperclip_list_resources.",
+          inputSchema: { type: "object", required: ["uri"], properties: { uri: { type: "string" } }, additionalProperties: false },
+        },
+        {
+          name: "paperclip_list_prompts",
+          description: "List prompts from fully assigned MCP connections.",
+          inputSchema: { type: "object", properties: {}, additionalProperties: false },
+        },
+        {
+          name: "paperclip_get_prompt",
+          description: "Get a prompt returned by paperclip_list_prompts.",
+          inputSchema: { type: "object", required: ["name"], properties: { name: { type: "string" }, arguments: { type: "object" } }, additionalProperties: false },
+        },
+      ].filter((tool) => contextToolNames.includes(tool.name));
       res.json({
         jsonrpc: "2.0",
         id,
@@ -128,26 +158,7 @@ async function handleMcpGatewayProtocol(
             description: tool.description,
             inputSchema: tool.parametersSchema ?? { type: "object", properties: {} },
             })),
-            {
-              name: "paperclip_list_resources",
-              description: "List resources from fully assigned MCP connections.",
-              inputSchema: { type: "object", properties: {}, additionalProperties: false },
-            },
-            {
-              name: "paperclip_read_resource",
-              description: "Read a resource URI returned by paperclip_list_resources.",
-              inputSchema: { type: "object", required: ["uri"], properties: { uri: { type: "string" } }, additionalProperties: false },
-            },
-            {
-              name: "paperclip_list_prompts",
-              description: "List prompts from fully assigned MCP connections.",
-              inputSchema: { type: "object", properties: {}, additionalProperties: false },
-            },
-            {
-              name: "paperclip_get_prompt",
-              description: "Get a prompt returned by paperclip_list_prompts.",
-              inputSchema: { type: "object", required: ["name"], properties: { name: { type: "string" }, arguments: { type: "object" } }, additionalProperties: false },
-            },
+            ...contextTools,
           ],
         },
       });

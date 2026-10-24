@@ -137,6 +137,7 @@ type Opened = {
   applicationId: string;
   applicationKey: string;
   gatewayProfileId: string;
+  switchProfileId: string;
   remote: {
     requests: FakeMcpRequest[];
     close: () => Promise<void>;
@@ -255,6 +256,17 @@ async function insertCatalogTool(db: Db, companyId: string, applicationId: strin
   return entry!;
 }
 
+async function enableBrakeSwitch(db: Db, companyId: string, enabled = true) {
+  const [profile] = await db.insert(toolProfiles).values({
+    companyId,
+    profileKey: `brake-switch-${randomUUID()}`,
+    name: `Brake switch ${randomUUID()}`,
+    defaultAction: "deny",
+    metadata: { [BRAKE.switchKey]: enabled },
+  }).returning();
+  return profile!;
+}
+
 async function insertBrake(
   db: Db,
   companyId: string,
@@ -296,9 +308,14 @@ async function openCatalogue(
     companyAllowlist?: Allowlist;
     applicationKey?: string;
     connectionId?: string;
+    /** The one global switch. It defaults on in this suite so a brake case is explicit. */
+    switchOn?: boolean;
   } = {},
 ): Promise<Opened> {
   const company = await createCompany(db);
+  // The switch ships off. Keep its profile present in both states so a test can
+  // flip it exactly as a board PATCH would, without creating a row first.
+  const switchProfile = await enableBrakeSwitch(db, company.id, options.switchOn !== false);
   const remote = await startFakeRemoteMcpServer();
   const applicationKey = options.applicationKey ?? "atlassian";
   const [application] = await db.insert(toolApplications).values({
@@ -396,6 +413,7 @@ async function openCatalogue(
     applicationId: application!.id,
     applicationKey,
     gatewayProfileId: gatewayProfile!.id,
+    switchProfileId: switchProfile.id,
     remote,
     gateway,
     app,
@@ -869,10 +887,101 @@ describeEmbeddedPostgres("connection gateway tool brake", () => {
     expect(denied.upstreamDelta).toBe(0);
   });
 
-  it("keeps today's behaviour when the connection has no brake profile", async () => {
+  it("keeps today's behaviour when the switch is off and no brake profile names the connection", async () => {
+    const catalogue = [...ATLASSIAN_RAW_TOOL_NAMES, ...META_TOOL_NAMES];
+    const opened = await open(catalogue, { seats: [{}], switchOn: false });
+    expect(await upstreamNames(opened)).toEqual([...catalogue].sort());
+    const response = await request(opened.app)
+      .post(opened.seats[0]!.endpointPath)
+      .set("authorization", `Bearer ${opened.seats[0]!.token}`)
+      .send({ jsonrpc: "2.0", id: 1, method: "tools/list" });
+    expect(response.status).toBe(200);
+    const names = (response.body.result.tools as Array<{ name: string }>).map((tool) => tool.name);
+    for (const contextTool of BRAKE.gatewayContextTools) expect(names).toContain(contextTool);
+  });
+
+  it("does not enforce the allowlist while the switch is off", async () => {
+    const opened = await open([ALLOWED_TOOL, OTHER_TOOL], {
+      seats: [{ allowlist: [ALLOWED_TOOL] }],
+      switchOn: false,
+    });
+    expect(await upstreamNames(opened)).toEqual([ALLOWED_TOOL, OTHER_TOOL].sort());
+  });
+
+  it("fails closed when the switch is on and no brake profile names the connection", async () => {
     const catalogue = [...ATLASSIAN_RAW_TOOL_NAMES, ...META_TOOL_NAMES];
     const opened = await open(catalogue, { seats: [{}] });
-    expect(await upstreamNames(opened)).toEqual([...catalogue].sort());
+    const response = await request(opened.app)
+      .post(opened.seats[0]!.endpointPath)
+      .set("authorization", `Bearer ${opened.seats[0]!.token}`)
+      .send({ jsonrpc: "2.0", id: 1, method: "tools/list" });
+    expect(response.status).toBe(403);
+    expect(response.body.error.data.reasonCode).toBe(BRAKE.reasonProfileAbsent);
+    expect(response.body.result?.tools).toBeUndefined();
+    expect(await reasonCount(db, opened.companyId, BRAKE.reasonProfileAbsent)).toBe(ATLASSIAN_RAW_TOOL_NAMES.length);
+    expect(await reasonCount(db, opened.companyId, BRAKE.reasonAllowlistAbsent)).toBe(0);
+    expect(await reasonCount(db, opened.companyId, BRAKE.reasonAllowlistEmpty)).toBe(0);
+  });
+
+  it("refuses a call on a connection that no brake profile names while the switch is on", async () => {
+    const opened = await open([ALLOWED_TOOL, OTHER_TOOL], { seats: [{}] });
+    const denied = await callTool(opened, ALLOWED_TOOL, { message: "unbraked" });
+    expect(denied.status).toBe(403);
+    expect(denied.reasonCode).toBe(BRAKE.reasonProfileAbsent);
+    expect(denied.upstreamDelta).toBe(0);
+  });
+
+  it("flips the switch at runtime from off to on and back without a restart", async () => {
+    const opened = await open([ALLOWED_TOOL, OTHER_TOOL], { seats: [{}], switchOn: false });
+    const list = async () => request(opened.app)
+      .post(opened.seats[0]!.endpointPath)
+      .set("authorization", `Bearer ${opened.seats[0]!.token}`)
+      .send({ jsonrpc: "2.0", id: 1, method: "tools/list" });
+    expect(await upstreamNames(opened)).toEqual([ALLOWED_TOOL, OTHER_TOOL].sort());
+    expect((await list()).status).toBe(200);
+
+    // The board act is PATCH /tool-profiles/:profileId. The service reads it on
+    // the next request; the same process and the same gateway serve both states.
+    await db.update(toolProfiles).set({
+      metadata: { [BRAKE.switchKey]: true },
+    }).where(eq(toolProfiles.id, opened.switchProfileId));
+    const braked = await list();
+    expect(braked.status).toBe(403);
+    expect(braked.body.error.data.reasonCode).toBe(BRAKE.reasonProfileAbsent);
+
+    await db.update(toolProfiles).set({
+      metadata: { [BRAKE.switchKey]: false },
+    }).where(eq(toolProfiles.id, opened.switchProfileId));
+    expect((await list()).status).toBe(200);
+    expect(await upstreamNames(opened)).toEqual([ALLOWED_TOOL, OTHER_TOOL].sort());
+  });
+
+  it("does not offer the gateway resource or prompt tools on a braked connection", async () => {
+    const opened = await open([ALLOWED_TOOL], { seats: [{ allowlist: [ALLOWED_TOOL] }] });
+    const response = await request(opened.app)
+      .post(opened.seats[0]!.endpointPath)
+      .set("authorization", `Bearer ${opened.seats[0]!.token}`)
+      .send({ jsonrpc: "2.0", id: 1, method: "tools/list" });
+    expect(response.status).toBe(200);
+    const names = (response.body.result.tools as Array<{ name: string }>).map((tool) => tool.name);
+    expect(names).toEqual([mangled(opened, ALLOWED_TOOL)]);
+    for (const contextTool of BRAKE.gatewayContextTools) expect(names).not.toContain(contextTool);
+  });
+
+  it("offers only the gateway context tool the allowlist names", async () => {
+    const opened = await open([ALLOWED_TOOL], {
+      seats: [{ allowlist: [ALLOWED_TOOL, "paperclip_list_resources"] }],
+    });
+    const response = await request(opened.app)
+      .post(opened.seats[0]!.endpointPath)
+      .set("authorization", `Bearer ${opened.seats[0]!.token}`)
+      .send({ jsonrpc: "2.0", id: 1, method: "tools/list" });
+    expect(response.status).toBe(200);
+    const names = (response.body.result.tools as Array<{ name: string }>).map((tool) => tool.name);
+    expect(names).toContain("paperclip_list_resources");
+    expect(names).not.toContain("paperclip_read_resource");
+    expect(names).not.toContain("paperclip_list_prompts");
+    expect(names).not.toContain("paperclip_get_prompt");
   });
 
   it("refuses a catalogue tool that was not on the allowlist when the catalogue grew", async () => {

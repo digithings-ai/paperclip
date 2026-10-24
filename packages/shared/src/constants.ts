@@ -1740,13 +1740,28 @@ export type PluginBridgeErrorCode = (typeof PLUGIN_BRIDGE_ERROR_CODES)[number];
 /**
  * Ceiling for a connection governed by a deny-default brake profile.
  * Precedence of ordinary profiles is unchanged. DIG-5190.
+ *
+ * The one global switch is `switchKey` on `tool_profiles.metadata`. It ships
+ * off. A board `PATCH /tool-profiles/:profileId` flips it without a restart or
+ * a migration. With it off the gateway keeps today's behaviour. With it on a
+ * connection that no brake profile names fails closed.
  */
 export const CONNECTION_GATEWAY_TOOL_BRAKE = {
   profileFlag: "connectionToolBrake",
   allowlistKey: "connectionToolAllowlist",
+  switchKey: "connectionToolBrakeEnabled",
   metaSegments: ["discover", "executeRead", "executeWrite", "executeDestructive"],
+  /** Gateway-owned tools appended after the service listing. */
+  gatewayContextTools: [
+    "paperclip_list_resources",
+    "paperclip_read_resource",
+    "paperclip_list_prompts",
+    "paperclip_get_prompt",
+  ],
   reasonAllowlistAbsent: "allowlist_absent",
   reasonAllowlistEmpty: "allowlist_empty",
+  /** No brake profile names this connection while the switch is on. */
+  reasonProfileAbsent: "allowlist_profile_absent",
   reasonAllowlistDenied: "allowlist_denied",
   reasonMetaTool: "meta_tool_refused",
 } as const;

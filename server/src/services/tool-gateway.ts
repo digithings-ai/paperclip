@@ -2766,6 +2766,7 @@ export function createToolGatewayService(
     const reasonCode = String(accessDecision.reasonCode);
     const refused = reasonCode === CONNECTION_GATEWAY_TOOL_BRAKE.reasonAllowlistAbsent
       || reasonCode === CONNECTION_GATEWAY_TOOL_BRAKE.reasonAllowlistEmpty
+      || reasonCode === CONNECTION_GATEWAY_TOOL_BRAKE.reasonProfileAbsent
       || reasonCode === CONNECTION_GATEWAY_TOOL_BRAKE.reasonAllowlistDenied
       || reasonCode === CONNECTION_GATEWAY_TOOL_BRAKE.reasonMetaTool;
     if (!refused) return;
@@ -3090,7 +3091,8 @@ export function createToolGatewayService(
     const loudDenial = considered.find(({ decision }) => {
       const reasonCode = String(decision.reasonCode);
       return reasonCode === CONNECTION_GATEWAY_TOOL_BRAKE.reasonAllowlistAbsent
-        || reasonCode === CONNECTION_GATEWAY_TOOL_BRAKE.reasonAllowlistEmpty;
+        || reasonCode === CONNECTION_GATEWAY_TOOL_BRAKE.reasonAllowlistEmpty
+        || reasonCode === CONNECTION_GATEWAY_TOOL_BRAKE.reasonProfileAbsent;
     });
     if (loudDenial && visibleTools.length === 0) {
       throw new ToolGatewayHttpError(
@@ -8947,6 +8949,38 @@ export function createToolGatewayService(
         },
       });
       return tools;
+    },
+
+    /**
+     * The gateway-owned resource and prompt tools are appended by the HTTP
+     * `tools/list` handler after this service returns, so they bypass the
+     * per-tool decision above. Gate them here: on a braked connection they are
+     * not offered unless the allowlist names them. DIG-5190.
+     */
+    async offeredContextToolNamesForNamedGateway(input: {
+      gatewayId?: string | null;
+      gatewayPublicId?: string | null;
+      bearerToken: string;
+      callerHeaders?: Record<string, string | string[] | undefined>;
+    }): Promise<string[]> {
+      const session = await namedGatewaySessionFromBearer({
+        gatewayId: input.gatewayId ?? null,
+        gatewayPublicId: input.gatewayPublicId ?? null,
+        bearerToken: input.bearerToken,
+        protocolMethod: "tools/list",
+        callerHeaders: input.callerHeaders,
+      });
+      await assertGatewayTokenAction(session, "tools/list");
+      const offered = await policyService.connectionBrakedContextTools({
+        companyId: session.companyId,
+        agentId: session.agentId,
+        issueId: session.issueId,
+        projectId: session.projectId,
+        routineId: null,
+        gatewayId: session.gatewayId ?? null,
+        toolNames: CONNECTION_GATEWAY_TOOL_BRAKE.gatewayContextTools,
+      });
+      return CONNECTION_GATEWAY_TOOL_BRAKE.gatewayContextTools.filter((name) => offered.has(name));
     },
 
     async executeContextForNamedGateway(input: {

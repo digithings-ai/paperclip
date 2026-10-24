@@ -602,7 +602,12 @@ function profileEntryMatches(entry: typeof toolProfileEntries.$inferSelect, ctx:
   return false;
 }
 
-function targetMatches(binding: typeof toolProfileBindings.$inferSelect, ctx: ToolAccessContext): boolean {
+type ToolProfileTargetContext = Pick<
+  ToolAccessContext,
+  "companyId" | "agentId" | "projectId" | "routineId" | "issueId" | "gatewayId"
+>;
+
+function targetMatches(binding: typeof toolProfileBindings.$inferSelect, ctx: ToolProfileTargetContext): boolean {
   if (binding.targetType === "company") return binding.targetId === ctx.companyId;
   if (binding.targetType === "agent") return binding.targetId === ctx.agentId;
   if (binding.targetType === "project") return binding.targetId === ctx.projectId;
@@ -1373,69 +1378,131 @@ export function toolAccessPolicyService(db: Db) {
     };
   }
 
-  type ConnectionToolCeiling =
-    | { governed: false }
-    | { governed: true; kind: "absent" }
-    | { governed: true; kind: "empty" }
-    | { governed: true; kind: "names"; names: ReadonlySet<string> };
+  type BrakeAllowlist =
+    | { kind: "absent" }
+    | { kind: "empty" }
+    | { kind: "names"; names: ReadonlySet<string> };
 
-  async function connectionToolCeiling(
-    ctx: ToolAccessContext,
+  /**
+   * The ceiling of several brake profiles is their intersection. An absent or
+   * empty list anywhere empties the result: narrowing is never a union.
+   */
+  function intersectAllowlists(lists: readonly BrakeAllowlist[]): BrakeAllowlist {
+    if (lists.some((list) => list.kind === "absent")) return { kind: "absent" };
+    if (lists.some((list) => list.kind === "empty")) return { kind: "empty" };
+    let names: Set<string> | null = null;
+    for (const list of lists) {
+      if (list.kind !== "names") continue;
+      const next = list.names;
+      if (names === null) {
+        names = new Set<string>(next);
+        continue;
+      }
+      const current: Set<string> = names;
+      names = new Set<string>([...current].filter((name) => next.has(name)));
+    }
+    return { kind: "names", names: names ?? new Set<string>() };
+  }
+
+  function readAllowlistSet(metadata: unknown): BrakeAllowlist {
+    const list = readConnectionAllowlist(metadata);
+    return list.kind === "names" ? { kind: "names", names: new Set(list.names) } : list;
+  }
+
+  /**
+   * The one global switch. It ships off. A board PATCH of one profile's
+   * `metadata.connectionToolBrakeEnabled` flips it for the company without a
+   * restart and without a schema change.
+   */
+  async function connectionToolBrakeSwitchOn(
+    companyId: string,
     cache: ToolAccessDecisionCache | undefined,
-  ): Promise<ConnectionToolCeiling> {
-    if (!ctx.connectionId) return { governed: false };
+  ): Promise<boolean> {
+    const key = ["connection-tool-brake-switch", companyId].join(":");
+    return cachedRead(cache, key, async () => {
+      const rows = await db
+        .select({ metadata: toolProfiles.metadata })
+        .from(toolProfiles)
+        .where(and(eq(toolProfiles.companyId, companyId), eq(toolProfiles.status, "active")));
+      return rows.some(
+        (row) => isRecord(row.metadata)
+          && row.metadata[CONNECTION_GATEWAY_TOOL_BRAKE.switchKey] === true,
+      );
+    });
+  }
+
+  type BrakeProfile = {
+    profile: typeof toolProfiles.$inferSelect;
+    entries: Array<typeof toolProfileEntries.$inferSelect>;
+  };
+
+  /**
+   * Every active deny-default brake profile bound to this actor, regardless of
+   * which connection its entries name. Connection scoping happens per pair.
+   */
+  async function brakeProfilesForActor(
+    ctx: ToolProfileTargetContext,
+    cache: ToolAccessDecisionCache | undefined,
+  ): Promise<BrakeProfile[]> {
     const key = [
-      "connection-tool-brake",
+      "connection-tool-brake-profiles",
       ctx.companyId,
       ctx.agentId,
       ctx.gatewayId,
       ctx.issueId,
       ctx.projectId,
       ctx.routineId,
-      ctx.connectionId,
     ].join(":");
-    return cachedRead(cache, key, async (): Promise<ConnectionToolCeiling> => {
+    return cachedRead(cache, key, async (): Promise<BrakeProfile[]> => {
       const bindings = await db.select().from(toolProfileBindings).where(
         eq(toolProfileBindings.companyId, ctx.companyId),
       );
       const matching = bindings.filter((binding) => targetMatches(binding, ctx));
-      if (matching.length === 0) return { governed: false };
+      if (matching.length === 0) return [];
       const profiles = await db.select().from(toolProfiles).where(
         inArray(toolProfiles.id, matching.map((binding) => binding.profileId)),
       );
-      if (profiles.length === 0) return { governed: false };
-      const entries = await db.select().from(toolProfileEntries).where(
-        inArray(toolProfileEntries.profileId, profiles.map((profile) => profile.id)),
-      );
       const governing = profiles.filter((profile) => {
         if (profile.status !== "active" || profile.defaultAction !== "deny") return false;
-        if (!isRecord(profile.metadata)) return false;
-        if (profile.metadata[CONNECTION_GATEWAY_TOOL_BRAKE.profileFlag] !== true) return false;
-        // A profile participates only for the connection its include entry names.
-        // No connection entry, or an entry for another connection, is a different pair.
-        return entries.some(
-          (entry) => entry.profileId === profile.id
-            && entry.selectorType === "connection"
-            && entry.effect === "include"
-            && entry.connectionId === ctx.connectionId,
-        );
+        return isRecord(profile.metadata)
+          && profile.metadata[CONNECTION_GATEWAY_TOOL_BRAKE.profileFlag] === true;
       });
-      if (governing.length === 0) return { governed: false };
-      const lists = governing.map((profile) => readConnectionAllowlist(profile.metadata));
-      if (lists.some((list) => list.kind === "absent")) return { governed: true, kind: "absent" };
-      if (lists.some((list) => list.kind === "empty")) return { governed: true, kind: "empty" };
-      let names: Set<string> | null = null;
-      for (const list of lists) {
-        if (list.kind !== "names") continue;
-        const next = new Set(list.names);
-        if (names === null) {
-          names = next;
-          continue;
-        }
-        names = new Set([...names].filter((name) => next.has(name)));
-      }
-      return { governed: true, kind: "names", names: names ?? new Set<string>() };
+      if (governing.length === 0) return [];
+      const entries = await db.select().from(toolProfileEntries).where(
+        inArray(toolProfileEntries.profileId, governing.map((profile) => profile.id)),
+      );
+      return governing.map((profile) => ({
+        profile,
+        entries: entries.filter((entry) => entry.profileId === profile.id),
+      }));
     });
+  }
+
+  type ConnectionToolCeiling =
+    | { governed: false }
+    | { governed: true; list: BrakeAllowlist };
+
+  /**
+   * The effective allowlist for one (seat, connection) pair. A brake profile
+   * participates only when an include entry names the connection being decided,
+   * so a second connection on the same seat keeps its own list.
+   */
+  async function connectionToolCeiling(
+    ctx: ToolAccessContext,
+    cache: ToolAccessDecisionCache | undefined,
+  ): Promise<ConnectionToolCeiling> {
+    if (!ctx.connectionId) return { governed: false };
+    const profiles = await brakeProfilesForActor(ctx, cache);
+    const scoped = profiles.filter(({ entries }) => entries.some(
+      (entry) => entry.selectorType === "connection"
+        && entry.effect === "include"
+        && entry.connectionId === ctx.connectionId,
+    ));
+    if (scoped.length === 0) return { governed: false };
+    return {
+      governed: true,
+      list: intersectAllowlists(scoped.map(({ profile }) => readAllowlistSet(profile.metadata))),
+    };
   }
 
   async function applyConnectionToolBrake(
@@ -1444,8 +1511,9 @@ export function toolAccessPolicyService(db: Db) {
     ordinary: ToolAccessDecision,
     cache: ToolAccessDecisionCache | undefined,
   ): Promise<ToolAccessDecision> {
-    const ceiling = await connectionToolCeiling(ctx, cache);
-    if (!ceiling.governed) return ordinary;
+    // Only connection-scoped tools are braked. Built-in tools have no connection.
+    if (!ctx.connectionId) return ordinary;
+    if (!(await connectionToolBrakeSwitchOn(ctx.companyId, cache))) return ordinary;
     const rawName = ctx.upstreamToolName;
     if (typeof rawName === "string" && connectionGatewayMetaTool(rawName)) {
       const denied = brakeDecision(
@@ -1456,8 +1524,18 @@ export function toolAccessPolicyService(db: Db) {
       await writeAudit(input, denied);
       return denied;
     }
-    if (ceiling.kind === "absent" || ceiling.kind === "empty") {
-      const absent = ceiling.kind === "absent";
+    const ceiling = await connectionToolCeiling(ctx, cache);
+    if (!ceiling.governed) {
+      const denied = brakeDecision(
+        ordinary,
+        CONNECTION_GATEWAY_TOOL_BRAKE.reasonProfileAbsent,
+        "No connection tool brake profile names this connection.",
+      );
+      await writeAudit(input, denied);
+      return denied;
+    }
+    if (ceiling.list.kind === "absent" || ceiling.list.kind === "empty") {
+      const absent = ceiling.list.kind === "absent";
       const denied = brakeDecision(
         ordinary,
         absent
@@ -1471,7 +1549,7 @@ export function toolAccessPolicyService(db: Db) {
       return denied;
     }
     if (ordinary.decision !== "allow" && ordinary.decision !== "require_approval") return ordinary;
-    if (typeof rawName === "string" && ceiling.names.has(rawName)) return ordinary;
+    if (typeof rawName === "string" && ceiling.list.names.has(rawName)) return ordinary;
     const denied = brakeDecision(
       ordinary,
       CONNECTION_GATEWAY_TOOL_BRAKE.reasonAllowlistDenied,
@@ -1479,6 +1557,26 @@ export function toolAccessPolicyService(db: Db) {
     );
     await writeAudit(input, denied);
     return denied;
+  }
+
+  /**
+   * The gateway-owned resource and prompt tools are not catalogue entries and
+   * have no single connection, so they are braked at the gateway scope: the
+   * intersection of every brake profile bound to this actor. With the switch
+   * off they are offered as they are today.
+   */
+  async function connectionBrakedContextTools(
+    input: ToolProfileTargetContext & { toolNames: readonly string[] },
+  ): Promise<Set<string>> {
+    if (!(await connectionToolBrakeSwitchOn(input.companyId, undefined))) {
+      return new Set(input.toolNames);
+    }
+    const profiles = await brakeProfilesForActor(input, undefined);
+    const ceiling: BrakeAllowlist = profiles.length === 0
+      ? { kind: "absent" }
+      : intersectAllowlists(profiles.map(({ profile }) => readAllowlistSet(profile.metadata)));
+    if (ceiling.kind !== "names") return new Set<string>();
+    return new Set(input.toolNames.filter((name) => ceiling.names.has(name)));
   }
 
   /**
@@ -2175,6 +2273,7 @@ export function toolAccessPolicyService(db: Db) {
 
   return {
     decide,
+    connectionBrakedContextTools,
     writeAudit,
     recordInvocation,
     summarizeAndRedact,
