@@ -122,9 +122,11 @@ import {
   parseIssueExecutionWorkspaceSettings,
   parseProjectExecutionWorkspacePolicy,
   resolvePinnedIssueWorkspaceStrategyType,
+  resolveIssueExecutionWorkspacePreferenceForCreate,
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_CODE,
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_MESSAGE,
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_REMEDIATION,
+  shouldMergeExecutionWorkspaceConfigIntoWorkspace,
   type ParsedExecutionWorkspaceMode,
 } from "./execution-workspace-policy.js";
 import { mergeExecutionWorkspaceConfig } from "./execution-workspaces.js";
@@ -10194,6 +10196,16 @@ export function issueService(db: Db) {
               ),
             ) as Record<string, unknown> | null;
         }
+        executionWorkspacePreference =
+          resolveIssueExecutionWorkspacePreferenceForCreate({
+            effectivePreference: executionWorkspacePreference,
+            requestNamedPreference:
+              issueData.executionWorkspacePreference !== undefined,
+            hasBoundWorkspace: executionWorkspaceId != null,
+            resolvedMode: (
+              executionWorkspaceSettings as Record<string, unknown> | null
+            )?.mode,
+          }) ?? executionWorkspacePreference;
         if (!projectWorkspaceId && issueData.projectId) {
           const project = await tx
             .select({
@@ -11292,13 +11304,13 @@ export function issueService(db: Db) {
         }
         if (
           issueData.executionWorkspaceSettings !== undefined &&
-          nextExecutionWorkspaceId &&
-          nextExecutionWorkspacePreference === "reuse_existing"
+          nextExecutionWorkspaceId
         ) {
           const workspace = await tx
             .select({
               id: executionWorkspaces.id,
               metadata: executionWorkspaces.metadata,
+              sourceIssueId: executionWorkspaces.sourceIssueId,
             })
             .from(executionWorkspaces)
             .where(
@@ -11311,7 +11323,21 @@ export function issueService(db: Db) {
               (rows: Array<{ id: string; metadata: unknown }>) =>
                 rows[0] ?? null,
             );
-          if (workspace) {
+          // The workspace row carries the config of the checkout it points at.
+          // A workspace the issue owns tracks the settings of the issue, and a
+          // reuse binding keeps the behaviour the platform had before the
+          // write-back wrote a preference of its own: the settings of the
+          // issue that shares the checkout are merged into it. A workspace
+          // owned by another issue is left alone: its config belongs to that
+          // other issue.
+          if (
+            workspace &&
+            shouldMergeExecutionWorkspaceConfigIntoWorkspace({
+              nextExecutionWorkspacePreference,
+              workspaceSourceIssueId: workspace.sourceIssueId,
+              issueId: existing.id,
+            })
+          ) {
             await tx
               .update(executionWorkspaces)
               .set({
