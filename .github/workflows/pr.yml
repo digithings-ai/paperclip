@@ -1,15 +1,320 @@
 name: PR
 
+# Fork-owned pull-request CI.
+#
+# This fork used to call upstream's reusable workflow
+# (`paperclipai/paperclip/.github/workflows/pr-trusted.yml@master`). Two things
+# were wrong with that:
+#
+#   1. Upstream routes every job after its gate to the AWS RunsOn fleet label
+#      `runs-on/fleet=paperclip-public-pr-x64/env=public-ci`. The label is not
+#      ours and this fork has no such runner.
+#   2. Upstream resolves that workflow from its own `master` at run time, so the
+#      fork's lanes are defined by code the fork does not carry. On 14 Oct 2026
+#      that shipped a `general-workspaces-c` lane the fork's
+#      `scripts/run-vitest-stable.mjs` did not know, and every run failed with
+#      "Unknown group \"general-workspaces-c\"" before a single test ran
+#      (run 38646433342).
+#
+# This file is versioned with the fork's tree instead, and runs on
+# GitHub-hosted `ubuntu-latest` runners — no upstream runner label and no
+# dependency on another repository's `master`.
+#
+# Lanes: `policy` (migrations, lockfile, repository guards), `typecheck`, and
+# `tests` (serialized server suites plus the general groups, sharded). `verify`
+# aggregates them into the single status a pull request reports.
+
 on:
   pull_request:
 
 permissions:
-  actions: read
   contents: read
   pull-requests: read
 
+concurrency:
+  group: pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 jobs:
-  ci:
-    # Master requires CODEOWNERS review for .github/**, including this workflow.
-    # The AWS runner group permits pr-trusted.yml@refs/heads/master.
-    uses: paperclipai/paperclip/.github/workflows/pr-trusted.yml@master
+  policy:
+    name: policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Setup Node.js for pnpm bootstrap
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 24
+          package-manager-cache: false
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+        env:
+          NPM_CONFIG_AUDIT: "false"
+          NPM_CONFIG_FUND: "false"
+          NPM_CONFIG_UPDATE_NOTIFIER: "false"
+        with:
+          version: 9.15.4
+          run_install: false
+
+      # The fork carries its own copy of this script (patched on master in
+      # a35ee69e) so an upstream release import may rename or renumber a fork
+      # migration without the gate rejecting the import. Keep the fork's copy.
+      - name: Validate migration ordering against the target branch
+        run: >-
+          node .github/scripts/check-pr-migration-order.mjs
+          "${{ github.event.pull_request.base.sha }}"
+          "${{ github.event.pull_request.head.sha }}"
+
+      - name: Validate Dockerfile deps stage
+        run: node ./scripts/check-docker-deps-stage.mjs
+
+      - name: Validate Node version policy
+        run: pnpm check:node-version
+
+      - name: Reject git push in adapter/runtime code
+        run: node ./scripts/check-no-git-push.mjs
+
+      - name: Validate feature module boundaries
+        run: pnpm check:module-boundaries
+
+      - name: Validate the brand denylist
+        run: pnpm check:tokens
+
+      # Upstream's reusable workflow ran these repository guard suites in its
+      # policy job. This fork owns its pull-request CI now, so the fork runs
+      # them here instead: without this the fork would silently lose the
+      # guard coverage pr-trusted.yml provided. Verified green in this fork's
+      # own CI on 14 Oct 2026 (run 38646433342, job "ci / policy").
+      - name: Run the repository guard suites
+        run: |
+          node --test ./scripts/check-no-git-push.test.mjs
+          node --test ./scripts/check-module-boundaries.test.mjs
+          for f in .github/scripts/tests/*.test.mjs; do
+            node --test "$f"
+          done
+          node --test ./scripts/__tests__/run-vitest-stable-shard.test.mjs
+          node --test ./scripts/__tests__/e2e-shard.test.mjs
+          node --test ./scripts/__tests__/release-verify-workflow.test.mjs ./scripts/cloud-source-verification.test.mjs ./scripts/standard-image-contract.test.mjs
+          node --test ./scripts/__tests__/build-standalone-concurrency.test.mjs
+
+      - name: Block manual lockfile edits
+        if: >-
+          github.head_ref != 'chore/refresh-lockfile' &&
+          github.event.pull_request.user.login != 'dependabot[bot]'
+        run: |
+          # Diff the PR branch against its merge base so recent base-branch
+          # commits do not masquerade as changes made by the PR itself.
+          changed="$(git diff --name-only "${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}")"
+          if printf '%s\n' "$changed" | grep -qx 'pnpm-lock.yaml'; then
+            echo "Do not commit pnpm-lock.yaml in pull requests. CI owns lockfile updates."
+            exit 1
+          fi
+
+      # Each test lane resolves a stale lockfile inline; this early check still
+      # fails fast when the merge tree cannot resolve at all.
+      - name: Validate dependency resolution
+        run: pnpm install --resolution-only --ignore-scripts --no-frozen-lockfile
+
+  typecheck:
+    name: typecheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js for pnpm bootstrap
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 24
+          package-manager-cache: false
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+        env:
+          NPM_CONFIG_AUDIT: "false"
+          NPM_CONFIG_FUND: "false"
+          NPM_CONFIG_UPDATE_NOTIFIER: "false"
+        with:
+          version: 9.15.4
+
+      - name: Install dependencies
+        # A manifest-changing or upstream-sync pull request can hold a
+        # pnpm-lock.yaml that is stale for the merge tree. Resolve it inline.
+        run: |
+          if ! pnpm install --frozen-lockfile; then
+            echo '::notice title=Lockfile::checked-in lockfile is stale for this merge tree; resolving it inline'
+            pnpm install --resolution-only --ignore-scripts --no-frozen-lockfile
+            pnpm install --frozen-lockfile
+          fi
+
+      - name: Typecheck every workspace
+        run: pnpm run typecheck
+
+  tests:
+    name: tests (${{ matrix.label }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Serialized server suites (route and authz tests) run one worker at
+          # a time, so they can only be parallelized across runners.
+          - label: serialized (1/4)
+            mode: serialized
+            shard_index: 0
+            shard_count: 4
+          - label: serialized (2/4)
+            mode: serialized
+            shard_index: 1
+            shard_count: 4
+          - label: serialized (3/4)
+            mode: serialized
+            shard_index: 2
+            shard_count: 4
+          - label: serialized (4/4)
+            mode: serialized
+            shard_index: 3
+            shard_count: 4
+          # `general-server` is the whole server group, chat and native-runner
+          # suites included, sharded by measured suite duration. It is the one
+          # group the fork's runner keeps whole, so nothing is silently dropped
+          # by naming this workflow `PR`.
+          - label: server (1/8)
+            mode: general
+            group: general-server
+            shard_index: 0
+            shard_count: 8
+          - label: server (2/8)
+            mode: general
+            group: general-server
+            shard_index: 1
+            shard_count: 8
+          - label: server (3/8)
+            mode: general
+            group: general-server
+            shard_index: 2
+            shard_count: 8
+          - label: server (4/8)
+            mode: general
+            group: general-server
+            shard_index: 3
+            shard_count: 8
+          - label: server (5/8)
+            mode: general
+            group: general-server
+            shard_index: 4
+            shard_count: 8
+          - label: server (6/8)
+            mode: general
+            group: general-server
+            shard_index: 5
+            shard_count: 8
+          - label: server (7/8)
+            mode: general
+            group: general-server
+            shard_index: 6
+            shard_count: 8
+          - label: server (8/8)
+            mode: general
+            group: general-server
+            shard_index: 7
+            shard_count: 8
+          # The ui and paperclipai CLI projects split with Vitest's native
+          # --shard on each project's own file list.
+          - label: workspaces-a (1/2)
+            mode: general
+            group: general-workspaces-a
+            shard_index: 0
+            shard_count: 2
+          - label: workspaces-a (2/2)
+            mode: general
+            group: general-workspaces-a
+            shard_index: 1
+            shard_count: 2
+          - label: workspaces-b
+            mode: general
+            group: general-workspaces-b
+          - label: workspaces-c
+            mode: general
+            group: general-workspaces-c
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js for pnpm bootstrap
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 24
+          package-manager-cache: false
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+        env:
+          NPM_CONFIG_AUDIT: "false"
+          NPM_CONFIG_FUND: "false"
+          NPM_CONFIG_UPDATE_NOTIFIER: "false"
+        with:
+          version: 9.15.4
+
+      - name: Install dependencies
+        run: |
+          if ! pnpm install --frozen-lockfile; then
+            echo '::notice title=Lockfile::checked-in lockfile is stale for this merge tree; resolving it inline'
+            pnpm install --resolution-only --ignore-scripts --no-frozen-lockfile
+            pnpm install --frozen-lockfile
+          fi
+
+      - name: Run the test group
+        run: |
+          set -euo pipefail
+          if [ '${{ matrix.mode }}' = 'serialized' ]; then
+            echo "::notice title=Test lane::serialized shard ${{ matrix.shard_index }}/${{ matrix.shard_count }}"
+            pnpm test:run:serialized -- \
+              --shard-index ${{ matrix.shard_index }} \
+              --shard-count ${{ matrix.shard_count }}
+          elif [ -n '${{ matrix.shard_count }}' ]; then
+            echo "::notice title=Test lane::${{ matrix.group }} shard ${{ matrix.shard_index }}/${{ matrix.shard_count }}"
+            pnpm test:run:general -- \
+              --group '${{ matrix.group }}' \
+              --shard-index ${{ matrix.shard_index }} \
+              --shard-count ${{ matrix.shard_count }}
+          else
+            echo "::notice title=Test lane::${{ matrix.group }}"
+            pnpm test:run:general -- --group '${{ matrix.group }}'
+          fi
+
+  verify:
+    # The single status a pull request reports. Every lane above must succeed.
+    name: verify
+    if: ${{ always() }}
+    needs: [policy, typecheck, tests]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Fail if any lane failed
+        env:
+          POLICY_RESULT: ${{ needs.policy.result }}
+          TYPECHECK_RESULT: ${{ needs.typecheck.result }}
+          TESTS_RESULT: ${{ needs.tests.result }}
+        run: |
+          echo "policy=$POLICY_RESULT typecheck=$TYPECHECK_RESULT tests=$TESTS_RESULT"
+          test "$POLICY_RESULT" = "success"
+          test "$TYPECHECK_RESULT" = "success"
+          test "$TESTS_RESULT" = "success"
