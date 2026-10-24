@@ -262,7 +262,11 @@ export function deriveExecutionWorkspaceDeliveryState(input: {
   mergedPullRequest: boolean;
   pullRequestStateUnknown: boolean;
   isMergedIntoBase: boolean | null;
+  worktreeMissing?: boolean;
 }): ExecutionWorkspaceDeliveryState {
+  // A missing worktree has no HEAD, so mergedPullRequest can never be true and
+  // ancestry stays null. That is a dead row, not an unknown delivery.
+  if (input.worktreeMissing) return "worktree_missing";
   if (input.sourceIssueTerminal && input.mergedPullRequest) return "merged_via_pr";
   if (input.isMergedIntoBase === true) return "merged_by_ancestry";
   if (input.isMergedIntoBase === false && !input.pullRequestStateUnknown) return "unmerged";
@@ -397,6 +401,18 @@ async function pathExists(value: string | null | undefined) {
   } catch {
     return false;
   }
+}
+
+async function recordedWorkspacePathIsMissing(
+  workspace: Pick<ExecutionWorkspaceRow, "providerType" | "providerRef" | "cwd">,
+): Promise<boolean> {
+  // Only a git worktree with a recorded path can be dead. A shared local
+  // session may name a path this process cannot see, and that is not a
+  // missing worktree.
+  if (workspace.providerType !== "git_worktree") return false;
+  const workspacePath = readNullableString(workspace.providerRef) ?? readNullableString(workspace.cwd);
+  if (!workspacePath) return false;
+  return !(await pathExists(workspacePath));
 }
 
 async function runGit(args: string[], cwd: string) {
@@ -1398,13 +1414,14 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
     }
     let mergedPullRequest = false;
     let pullRequestStateUnknown = false;
-    const workspaceHeadSha = git?.repoRoot && git.workspacePath
+    const worktreeMissing = await recordedWorkspacePathIsMissing(workspace);
+    const workspaceHeadSha = !worktreeMissing && git?.repoRoot && git.workspacePath
       ? await runGit(["rev-parse", "HEAD"], git.workspacePath)
         .then((result) => result.stdout.trim() || null)
         .catch(() => null)
       : null;
 
-    if (sourceIssueTerminal) {
+    if (sourceIssueTerminal && !worktreeMissing) {
       const products = await listDeliveryPullRequestProducts(workspace);
       for (const product of products) {
         const references = extractGitHubPullRequestReferences([
@@ -1456,6 +1473,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         mergedPullRequest,
         pullRequestStateUnknown,
         isMergedIntoBase: git?.isMergedIntoBase ?? null,
+        worktreeMissing,
       }),
       sourceIssueTerminal,
       subtreeTerminal,
@@ -1471,6 +1489,11 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
   ) {
     if (workspace.providerType !== "git_worktree") return;
     const workspacePath = readNullableString(workspace.providerRef) ?? readNullableString(workspace.cwd);
+    // A dead row has no HEAD to compare. Skip the check and let branch cleanup
+    // use `git branch -d`. A refusal (unmerged, or still checked out in a
+    // prunable worktree) is a skip, not a cleanup failure. A live row keeps
+    // every existing check, including the unknown-HEAD refusal.
+    if (workspacePath && !(await pathExists(workspacePath))) return;
     if (!workspacePath || !expectedHeadSha) {
       throw new Error("Refusing terminal workspace cleanup because the expected git HEAD is unknown");
     }
@@ -1727,8 +1750,14 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
     ]);
     const config = readExecutionWorkspaceConfig((workspace.metadata as Record<string, unknown> | null) ?? null);
 
-    const cleanupLock = workspace.providerType === "git_worktree" && (workspace.providerRef ?? workspace.cwd)
-      ? await acquireGitWorktreeCleanupLock(workspace.providerRef ?? workspace.cwd!)
+    const cleanupWorkspacePath = readNullableString(workspace.providerRef) ?? readNullableString(workspace.cwd);
+    const deadWorktree = workspace.providerType === "git_worktree"
+      && Boolean(cleanupWorkspacePath)
+      && !(await pathExists(cleanupWorkspacePath));
+    // The cleanup lock reads the worktree. A dead row has no tree to lock, and
+    // taking the lock would throw before branch cleanup can run.
+    const cleanupLock = workspace.providerType === "git_worktree" && cleanupWorkspacePath && !deadWorktree
+      ? await acquireGitWorktreeCleanupLock(cleanupWorkspacePath)
       : null;
     try {
       await assertTerminalCleanupGitStateUnchanged(workspace, expectedHeadSha);
@@ -2644,8 +2673,13 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           result.skippedUndelivered += 1;
           continue;
         }
+        // A dead row is archivable: the missing tree makes workspaceHeadSha
+        // null, so merged_via_pr and merged_by_ancestry can never be true.
+        // Every other delivery state is still skipped.
+        const deadWorktree = assessment.deliveryState === "worktree_missing";
         if (
-          assessment.deliveryState !== "merged_via_pr"
+          !deadWorktree
+          && assessment.deliveryState !== "merged_via_pr"
           && assessment.deliveryState !== "merged_by_ancestry"
         ) {
           result.skippedUndelivered += 1;
@@ -2657,7 +2691,10 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         // reaper archives the workspace on the same sweep. The archive statement
         // below re-checks the same cutoff under the lifecycle lock, so the loop
         // check and the guarded statement agree.
-        const cooldownCutoff = workspaceReaperCooldownMs > 0
+        // A dead row bypasses the cooldown. The window protects a tree that
+        // still holds the seat's work. A missing tree holds nothing, and a
+        // reopened issue is no longer terminal so this sweep skips it anyway.
+        const cooldownCutoff = !deadWorktree && workspaceReaperCooldownMs > 0
           ? new Date(now().getTime() - workspaceReaperCooldownMs)
           : null;
         if (
@@ -2742,6 +2779,9 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         // lock, so it never archives a workspace that a reopen just restored.
         const archived = await db.transaction(async (tx) => {
           await acquireExecutionWorkspaceLifecycleLock(tx, workspace.id);
+          // Re-verify under the lifecycle lock. A path that was only
+          // transiently missing must not be archived.
+          if (deadWorktree && !(await recordedWorkspacePathIsMissing(workspace))) return null;
           return tx
             .update(executionWorkspaces)
             .set({
