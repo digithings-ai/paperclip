@@ -247,6 +247,112 @@ describe("OpenCode local skill injection", () => {
   });
 });
 
+describe("OpenCode session recovery", () => {
+  let configHome: string;
+
+  // The error OpenCode prints when a stored session holds a message row it cannot
+  // decode: the storage read of `session_message` fails and the client reports the
+  // reason as UnsupportedContentType.
+  const sessionReadFailure =
+    'UnsupportedContentType: Failed query: select "id", "session_id", "type", "seq", "time_created", "time_updated", "data" from "session_message" where "session_message"."session_id" = ? order by "session_message"."seq" asc';
+
+  beforeEach(async () => {
+    configHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-session-test-"));
+    vi.stubEnv("XDG_CONFIG_HOME", configHome);
+  });
+
+  afterEach(async () => {
+    vi.unstubAllEnvs();
+    await fs.rm(configHome, { recursive: true, force: true });
+  });
+
+  async function runWithSession(runId: string, sessionId: string | null) {
+    const commandPath = path.join(configHome, `fake-opencode-${runId}`);
+    await fs.writeFile(commandPath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    return await execute({
+      runId,
+      agent: { id: "agent-1", companyId: "company-1", name: "OpenCode", adapterType: "opencode_local", adapterConfig: {} },
+      runtime: { sessionId, sessionParams: null, sessionDisplayId: null, taskKey: null },
+      config: { command: commandPath, cwd: configHome, model: "openai/gpt-5", env: { OPENCODE_ALLOW_ALL_MODELS: "1" } },
+      context: createPromptContextFixture(),
+      onLog: async () => {},
+    });
+  }
+
+  it("starts a fresh session when the stored session cannot be read back", async () => {
+    runProcessMock.mockReset();
+    runProcessMock
+      .mockResolvedValueOnce(probeResult({
+        exitCode: 1,
+        stdout: JSON.stringify({ type: "error", sessionID: "poisoned", error: sessionReadFailure }),
+      }))
+      .mockResolvedValueOnce(probeResult({
+        stdout: JSON.stringify({ type: "text", sessionID: "fresh", part: { text: "done" } }),
+      }));
+
+    const result = await runWithSession("run-session-read-fallback", "poisoned");
+
+    expect(runProcessMock).toHaveBeenCalledTimes(2);
+    expect(runProcessMock.mock.calls.at(0)![3]).toContain("--session");
+    expect(runProcessMock.mock.calls.at(1)![3]).not.toContain("--session");
+    expect(result.exitCode).toBe(0);
+    expect(result.sessionId).toBe("fresh");
+    expect(result.sessionParams?.sessionId).toBe("fresh");
+    expect(result.clearSession).toBe(false);
+  });
+
+  it("drops the session id when the fresh session fails with the same read error", async () => {
+    runProcessMock.mockReset();
+    runProcessMock
+      .mockResolvedValueOnce(probeResult({
+        exitCode: 1,
+        stdout: JSON.stringify({ type: "error", sessionID: "poisoned", error: sessionReadFailure }),
+      }))
+      .mockResolvedValueOnce(probeResult({
+        exitCode: 1,
+        stdout: JSON.stringify({ type: "error", sessionID: "fresh-broken", error: sessionReadFailure }),
+      }));
+
+    const result = await runWithSession("run-session-read-drop", "poisoned");
+
+    expect(runProcessMock).toHaveBeenCalledTimes(2);
+    expect(result.exitCode).toBe(1);
+    expect(result.clearSession).toBe(true);
+    expect(result.sessionId).toBeNull();
+    expect(result.sessionParams).toBeNull();
+  });
+
+  it("drops the session id when a fresh attempt cannot read the session it created", async () => {
+    runProcessMock.mockReset();
+    runProcessMock.mockResolvedValueOnce(probeResult({
+      exitCode: 1,
+      stdout: JSON.stringify({ type: "error", sessionID: "fresh-broken", error: sessionReadFailure }),
+    }));
+
+    const result = await runWithSession("run-session-read-fresh", null);
+
+    expect(runProcessMock).toHaveBeenCalledTimes(1);
+    expect(result.exitCode).toBe(1);
+    expect(result.clearSession).toBe(true);
+    expect(result.sessionId).toBeNull();
+  });
+
+  it("keeps a normal failure on the same session", async () => {
+    runProcessMock.mockReset();
+    runProcessMock.mockResolvedValueOnce(probeResult({
+      exitCode: 1,
+      stdout: JSON.stringify({ type: "error", sessionID: "poisoned", error: "model unavailable" }),
+    }));
+
+    const result = await runWithSession("run-session-other-error", "poisoned");
+
+    expect(runProcessMock).toHaveBeenCalledTimes(1);
+    expect(result.exitCode).toBe(1);
+    expect(result.clearSession).toBeFalsy();
+    expect(result.sessionId).toBe("poisoned");
+  });
+});
+
 describe("ensureRemoteOpenCodeModelConfiguredAndAvailable", () => {
   afterEach(() => {
     delete process.env.OPENCODE_ALLOW_ALL_MODELS;
