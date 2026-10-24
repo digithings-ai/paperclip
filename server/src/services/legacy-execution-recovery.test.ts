@@ -1,6 +1,11 @@
 import { isPreDispatchReviewWait } from "./pre-dispatch-review-wait.js";
 import { expect, it } from "vitest";
-import { legacyExecutionNeedsReconciliation } from "./legacy-execution-recovery.js";
+import {
+  legacyExecutionNeedsReconciliation,
+  ROUTINE_EXECUTION_OWNED_SKIP_REASONS,
+  routineExecutionSkipNeedsBlockedEscalation,
+} from "./legacy-execution-recovery.js";
+import { isRecoveryBudgetExhausted } from "./issue-recovery-actions.js";
 
 const stopped = {
   runtimeMode: "legacy", status: "cancelled", errorCode: "cancelled",
@@ -106,4 +111,103 @@ it("recognizes only an unclaimed pre-dispatch review wait receipt", () => {
     { resultJson: { ...run.resultJson, stopReason: "cancelled" } },
     { resultJson: { ...run.resultJson, workspaceRestoreFailure: "restore_unsafe_archive" } },
   ]) expect(isPreDispatchReviewWait({ ...run, ...patch })).toBe(false);
+});
+
+// DIG-4075 / DIG-2152 design item 4: the skip-reason allowlist for
+// `routine_execution`. A reason that means "somebody competent owns this" keeps
+// its existing skip; every other reason is a silent abandonment and must resolve
+// to `blocked`.
+
+it("treats only owner reasons as a correct skip for a routine_execution issue", () => {
+  const owned = [
+    "active_execution_path",
+    "pending_wake_interaction",
+    "board_owned_recovery_action",
+    "durable_goal_owns_continuation",
+    "waiting_conversation",
+    "chat_channel_waiting_for_settlement",
+    "conversation_publication_window",
+    "chat_control_recovery_stop",
+    "paused_with_native_passive_wait",
+    "persisted_durable_wait_path",
+    "provider_quota_monitor_pending",
+    "plugin_managed_handoff",
+    "shared_workspace_child_waiting",
+    "review_participant_waiting_nonterminal",
+    "handoff_not_exhausted",
+    "handoff_already_escalated",
+    "pause_hold_suppresses_recovery",
+    "accepted_continuation_wake_queued",
+    "review_participant_wake_queued",
+    "todo_initial_wake_queued",
+    "backoff_delay_not_elapsed",
+  ] as const;
+  for (const reason of owned) {
+    expect(ROUTINE_EXECUTION_OWNED_SKIP_REASONS.has(reason)).toBe(true);
+    expect(
+      routineExecutionSkipNeedsBlockedEscalation({
+        originKind: "routine_execution",
+        skipReason: reason,
+      }),
+    ).toBe(false);
+  }
+});
+
+it("resolves every non-owner routine_execution skip reason to blocked", () => {
+  const abandoned = [
+    "missing_assignee_agent",
+    "legacy_continuation_no_action",
+    "escalation_declined_uninvokable",
+    "escalation_declined_over_budget",
+    "adapter_failure_target_mismatch",
+    "adapter_monitor_not_scheduled",
+    "review_participant_or_state_missing",
+    "review_participant_requeue_declined",
+    "review_participant_quota_monitor_declined",
+    "todo_succeeded_no_handback",
+    "assignment_dispatch_declined",
+    "no_run_no_checkout",
+    "continuation_not_productive",
+    "continuation_budget_blocked",
+    "backoff_not_a_reason_we_invented",
+  ] as const;
+  for (const reason of abandoned) {
+    expect(ROUTINE_EXECUTION_OWNED_SKIP_REASONS.has(reason)).toBe(false);
+    expect(
+      routineExecutionSkipNeedsBlockedEscalation({
+        originKind: "routine_execution",
+        skipReason: reason,
+      }),
+    ).toBe(true);
+  }
+});
+
+it("leaves every non-routine_execution origin on its existing skip behaviour", () => {
+  for (const originKind of ["manual", "chat_channel", "harness_liveness_escalation", null, undefined]) {
+    for (const skipReason of [
+      "active_execution_path",
+      "board_owned_recovery_action",
+      "missing_assignee_agent",
+      "no_run_no_checkout",
+    ]) {
+      expect(
+        routineExecutionSkipNeedsBlockedEscalation({ originKind, skipReason }),
+      ).toBe(false);
+    }
+  }
+});
+
+it("recognizes maxAttempts exhaustion only from the recorded recovery budget", () => {
+  expect(
+    isRecoveryBudgetExhausted({
+      recoveryBudget: { state: "exhausted", attemptsUsed: 3, maxAttempts: 3 },
+    }),
+  ).toBe(true);
+  expect(
+    isRecoveryBudgetExhausted({
+      recoveryBudget: { state: "spent", attemptsUsed: 3, maxAttempts: 3 },
+    }),
+  ).toBe(false);
+  expect(isRecoveryBudgetExhausted({})).toBe(false);
+  expect(isRecoveryBudgetExhausted({ recoveryBudget: "exhausted" })).toBe(false);
 });
