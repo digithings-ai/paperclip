@@ -622,7 +622,12 @@ describeEmbeddedPostgres("accepted plan workspace refresh", () => {
       .where(eq(issues.id, childIssueId!))
       .then((rows) => rows[0] ?? null);
     expect(childBeforeRun?.executionWorkspaceId).toBeNull();
-    expect(childBeforeRun?.executionWorkspacePreference).toBeNull();
+    // The child stays strategy-only: no workspace is realized for it. The
+    // resolved mode now also lands as the preference, so the two fields can
+    // never read as a conflict.
+    expect(childBeforeRun?.executionWorkspacePreference).toBe(
+      "isolated_workspace",
+    );
     expect(childBeforeRun?.executionWorkspaceSettings).toMatchObject({
       mode: "isolated_workspace",
       workspaceStrategy: {
