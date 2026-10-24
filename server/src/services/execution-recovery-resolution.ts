@@ -16,6 +16,7 @@ import {
 } from "@paperclipai/db";
 import { conflict } from "../errors.js";
 import { buildExecutionContinuation } from "./execution-continuation.js";
+import { assessRecordedExecutionLiveness } from "./process-identity.js";
 import {
   EXECUTION_RECONCILIATION_CAUSES,
   type ExecutionReconciliation,
@@ -75,19 +76,21 @@ export async function validateExecutionReconciliation(input: {
       (!decision.workspaceRepairEvidence || decision.workspaceRepairEvidence.trim().length < 20)) {
     throw conflict("Verify safe workspace staging or repair and record workspaceRepairEvidence before continuing this run.");
   }
-  for (const pid of [
-    run.processPid,
-    run.processGroupId ? -run.processGroupId : null,
-  ]) {
-    if (!pid) continue;
-    try {
-      process.kill(pid, 0);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ESRCH") continue;
-      throw conflict(
-        "The previous provider's process ownership cannot be verified.",
-      );
-    }
+  // Pids are reused. A recycled pid answers every liveness probe while the
+  // unrelated process that took it over is alive, so the recorded identity
+  // decides whether the provider of this run still runs.
+  const assessment = await assessRecordedExecutionLiveness({
+    processPid: run.processPid,
+    processGroupId: run.processGroupId,
+    processStartedAt: run.processStartedAt,
+    finishedAt: run.finishedAt,
+  });
+  if (assessment.pid === "unknown" || assessment.group === "unknown") {
+    throw conflict(
+      "The previous provider's process ownership cannot be verified.",
+    );
+  }
+  if (assessment.alive) {
     throw conflict(
       "The previous provider is still running. Stop it before continuing.",
     );

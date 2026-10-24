@@ -1,6 +1,6 @@
-import { and, desc, eq, inArray, isNotNull, or, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, isNotNull, isNull, or, sql } from "drizzle-orm";
 import { environmentLeases, heartbeatRunEvents, heartbeatRuns, issueRecoveryActions, type Db } from "@paperclipai/db";
-import { readProcessStartedAt } from "./hot-restart.js";
+import { assessRecordedExecutionLiveness } from "./process-identity.js";
 
 // These adapters accept a conversation turn. Retrying a process or webhook can
 // replay the action itself, so those adapters retain their recovery contract.
@@ -84,16 +84,6 @@ export function conversationRecoveryActionPredicate() {
   );
 }
 
-/** OS liveness probes do not signal or stop the process. Unknown ownership holds. */
-function processMayBeAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code !== "ESRCH";
-  }
-}
-
 /** A terminal conversation row does not prove that its execution authority ended.
  * Other adapters keep their existing bootstrap and ownership protocols.
  */
@@ -113,24 +103,68 @@ export async function getConversationOwnershipBlocker(db: Db, companyId: string,
       or(isNotNull(heartbeatRuns.processPid), isNotNull(heartbeatRuns.processGroupId), activeLease),
     )).orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id));
   for (const { run, activeLease: leaseHeld } of candidates) {
-    let pidAlive = run.processPid !== null && processMayBeAlive(run.processPid);
-    if (pidAlive && run.processStartedAt) {
-      // A recycled PID cannot keep an old task blocked. An unreadable identity
-      // stays conservative; the original process may still own execution.
-      const observed = await readProcessStartedAt(run.processPid!).catch(() => null);
-      if (observed && new Date(observed).getTime() !== run.processStartedAt.getTime()) pidAlive = false;
-    }
-    const groupAlive = run.processGroupId !== null && processMayBeAlive(-run.processGroupId);
-    if (pidAlive || groupAlive || leaseHeld) {
+    // Pids are reused. The recorded start time and the process group decide
+    // whether the provider of this run still holds execution authority.
+    const assessment = await assessRecordedExecutionLiveness({
+      processPid: run.processPid,
+      processGroupId: run.processGroupId,
+      processStartedAt: run.processStartedAt,
+      finishedAt: run.finishedAt,
+    });
+    if (assessment.alive || leaseHeld) {
       return {
         runId: run.id,
         agentId: run.agentId,
         cause: "execution_owner_active",
-        nextAction: pidAlive || groupAlive
+        nextAction: assessment.alive
           ? "The previous provider process is still running. Stop it before continuing this task."
           : "The previous execution has not released its environment lease. Wait for cleanup before continuing this task.",
       };
     }
+    // The recorded provider is provably gone. Dropping the identity keeps a
+    // reused pid from holding this issue again.
+    await clearStaleProcessIdentity(db, run);
   }
   return null;
+}
+
+/** The recorded provider is gone: drop the identity that a reused pid could revive. */
+async function clearStaleProcessIdentity(
+  db: Db,
+  run: Pick<
+    typeof heartbeatRuns.$inferSelect,
+    "id" | "processPid" | "processGroupId" | "processStartedAt"
+  >,
+) {
+  if (
+    run.processPid === null &&
+    run.processGroupId === null &&
+    run.processStartedAt === null
+  )
+    return;
+  try {
+    await db
+      .update(heartbeatRuns)
+      .set({
+        processPid: null,
+        processGroupId: null,
+        processStartedAt: null,
+        updatedAt: new Date(),
+      })
+      .where(
+        and(
+          eq(heartbeatRuns.id, run.id),
+          eq(heartbeatRuns.runtimeMode, "legacy"),
+          run.processPid === null
+            ? isNull(heartbeatRuns.processPid)
+            : eq(heartbeatRuns.processPid, run.processPid),
+          run.processGroupId === null
+            ? isNull(heartbeatRuns.processGroupId)
+            : eq(heartbeatRuns.processGroupId, run.processGroupId),
+        ),
+      );
+  } catch {
+    // The hold is already released by the assessment. The next assessment
+    // repairs a failed cleanup.
+  }
 }
