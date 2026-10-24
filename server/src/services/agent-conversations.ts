@@ -17,6 +17,7 @@ import {
 } from "@paperclipai/db";
 
 import { sanitizeQuarantinedCommentForHigherTrust } from "./source-trust.js";
+import { redactContextSnapshotForPersistence } from "./run-output-redaction.js";
 
 export type ConversationIdentity = {
   conversationAgentId?: string | null;
@@ -270,7 +271,7 @@ export async function prepareConversationTurn(
     };
     await tx
       .update(heartbeatRuns)
-      .set({ contextSnapshot: next })
+      .set({ contextSnapshot: redactContextSnapshotForPersistence(next) })
       .where(eq(heartbeatRuns.id, run.id));
     return { context: next, reset, conversation: true };
   });

@@ -989,6 +989,16 @@ export function redactAgentAdapterConfig(
   return { ...(redactEventPayload(rest) ?? {}), env: redactedEnv };
 }
 
+/**
+ * Whether a key of a record names a secret. A value under such a key is a
+ * credential, whatever shape the value has. A reader of a stored document
+ * uses this to redact the value of the key itself and not only the text that
+ * the value looks like.
+ */
+export function isSecretPayloadKey(key: string): boolean {
+  return SECRET_PAYLOAD_KEY_RE.test(key);
+}
+
 export function redactSensitiveText(input: string): string {
   if (!maybeContainsSecretText(input)) return input;
   return redactCommandText(

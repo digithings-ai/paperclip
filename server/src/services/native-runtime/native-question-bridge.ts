@@ -22,6 +22,7 @@ import { questionResponseDeliveryService } from "../question-response-delivery.j
 import type { NativeRunStoreBinding } from "./native-run-coordinator-store.js";
 
 import { parseQuestionInteractionAnswers, parseSavedQuestionInteractionAnswers } from "../question-interaction-answers.js";
+import { redactPersistedRunText } from "../run-output-redaction.js";
 
 const QUESTION_KEY_PREFIX = "paperclip-runner-question:";
 const REQUEST_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$/;
@@ -342,12 +343,12 @@ export async function requestNativeQuestionRunCancellation(
 ): Promise<string | null> {
   const run = await authorizedNativeRun(db, interaction);
   if (!run || !["queued", "running"].includes(run.status)) return null;
-  const marker = JSON.stringify({
+  const marker = redactPersistedRunText(JSON.stringify({
     version: 1,
     issueId: interaction.issueId,
     ...cause,
     requestedAt: new Date().toISOString(),
-  });
+  }));
   return db.update(heartbeatRuns).set({
     contextSnapshot: sql`jsonb_set(
       case

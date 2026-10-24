@@ -1,6 +1,7 @@
 import { and, eq, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { heartbeatRuns } from "@paperclipai/db";
+import { redactPersistedRunText } from "./run-output-redaction.js";
 
 /**
  * The issue a run is working on, read from its admission context.
@@ -44,7 +45,7 @@ export async function bindRunSourceIssueToCheckout(
         when nullif(btrim(coalesce(${heartbeatRuns.contextSnapshot}, '{}'::jsonb) ->> 'issueId'), '') is not null
           or nullif(btrim(coalesce(${heartbeatRuns.contextSnapshot}, '{}'::jsonb) ->> 'taskId'), '') is not null
         then coalesce(${heartbeatRuns.contextSnapshot}, '{}'::jsonb)
-        else coalesce(${heartbeatRuns.contextSnapshot}, '{}'::jsonb) || ${JSON.stringify({ issueId: input.issueId })}::jsonb
+        else coalesce(${heartbeatRuns.contextSnapshot}, '{}'::jsonb) || ${redactPersistedRunText(JSON.stringify({ issueId: input.issueId }))}::jsonb
       end`,
       updatedAt: new Date(),
     })

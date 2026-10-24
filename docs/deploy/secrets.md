@@ -487,6 +487,101 @@ Use the CLI command for normal operations because it goes through the Paperclip
 API, creates or rotates secret records, and updates agent env bindings with
 audit logging.
 
+## Redacted Run Output
+
+The board stores the output of every run. Paperclip removes a credential-shaped
+value from that output before it stores the output. The name of the secret and
+the text around it stay.
+
+One rule covers the sinks of a run:
+
+- The result JSON, the error column, and the error text of a failed run.
+- The run log, the stdout excerpt, and the stderr excerpt.
+- The message and the payload of a run event.
+- The context snapshot of the run, which carries the issue, the wake comment
+  and the task markdown of the run.
+
+The shape check is the one of the runner redactor. A value that follows a JSON
+escape sequence, or that a seat glued to a word, is removed as well. The stored
+output is the JSON event stream of the provider, so a newline in it is still
+the two characters `\` and `n`.
+
+Two sinks of the board are digest-anchored, and the rule does not reach them.
+The stored value of a native run result, and the stored payload of a run event
+that carries a source digest, are hashed, and the hash is compared with the
+stored value on every read. Redacting the stored value would break that
+check. The write path of those sinks keeps the rule; the cleanup script below
+counts the rows it leaves alone and reports them.
+
+If a board already stored run output that holds a credential value, redact the
+stored rows in place:
+
+```sh
+# dry run: prints counts only
+DATABASE_URL=postgres://... pnpm --filter @paperclipai/server exec tsx \
+  scripts/redact-persisted-run-secrets.ts --dry-run
+
+# apply: updates the rows in place
+DATABASE_URL=postgres://... pnpm --filter @paperclipai/server exec tsx \
+  scripts/redact-persisted-run-secrets.ts
+```
+
+The script works in place. It does not copy the database. It prints counts
+only. It walks the rows with a keyset cursor on the creation time and the id,
+so a row that is written while the script runs is picked up by a later pass.
+Take a backup of the database before you run the script, because a backup
+of the database holds the old value.
+
+## Redacted Seat Session Stores
+
+A seat keeps its own copy of the run in the session store of the seat, an
+OpenCode database under the data home of the seat. A seat that printed its
+environment wrote the raw value into that copy. The board does not read that
+copy, and a backup of the seat home copies it. The server redacts it at the end
+of the run of the seat, and the script below does the same for a seat that
+never runs again.
+
+The rules of the scrub keep it from breaking a store that a seat reads:
+
+- A column that holds a JSON document is never changed by a substitution in the
+  raw text. The document is read, the values inside it are redacted, and the
+  document is written back. A substitution can take the escape of the next
+  quote with it, and the document would stop being a document.
+- A write lands only when the row still holds the value that the scrub read. A
+  seat that writes the same row at the same time keeps its value.
+- The store of a seat that is running is left alone. The seat writes to that
+  store while it runs.
+- A row that an earlier redaction broke is repaired, and a row that the repair
+  cannot fix is counted.
+- The scrub that the server runs at the end of a run never removes a row. It
+  redacts in place. A row that the repair cannot fix is left in place and
+  counted, and the seat that owns the store is reported as not scrubbed.
+- The store of a seat whose store path the server cannot resolve is left
+  alone, and the seat is reported as not scrubbed. A silent pass is not a
+  scrub.
+
+```sh
+# dry run: prints counts only
+DATABASE_URL=postgres://... pnpm --filter @paperclipai/server exec tsx \
+  scripts/redact-seat-store-secrets.ts --dry-run
+
+# apply: repairs the broken rows and redacts the values in place
+DATABASE_URL=postgres://... pnpm --filter @paperclipai/server exec tsx \
+  scripts/redact-seat-store-secrets.ts --repair
+
+# also remove the rows that the repair could not fix, so that the seat reads
+# the session again. This is a manual repair run only. The count of the
+# removed rows is in the report.
+DATABASE_URL=postgres://... pnpm --filter @paperclipai/server exec tsx \
+  scripts/redact-seat-store-secrets.ts --repair --drop-unrepairable
+```
+
+The script reads the seat homes from the board database, works in place, and
+prints counts only. It never copies a store, so a backup of the seat home
+before the run holds the old value. The script keeps the state of its last
+pass next to each store, so a later pass reads only the rows that changed
+since then. The option `--full` reads every row again.
+
 ## Portable Declarations
 
 Company exports include only environment declarations. They do not include

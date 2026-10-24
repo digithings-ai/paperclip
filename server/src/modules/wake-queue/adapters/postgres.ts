@@ -25,6 +25,7 @@ import {
   FailedChatRunRetryAuthorizationError,
 } from "../../../services/durable-chat-wakeup.js";
 import { isRetiredExternalChatQuestionSource } from "../../../services/question-response-delivery.js";
+import { redactContextSnapshotForPersistence } from "../../../services/run-output-redaction.js";
 import { HttpError } from "../../../errors.js";
 import { evaluateAgentInvokabilityFromDb } from "../../../services/agent-invokability.js";
 import { issueTreeControlService, isVerifiedIssueTreeControlInteractionWake } from "../../../services/issue-tree-control.js";
@@ -458,7 +459,7 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
           retryOfRunId: input.authorizedFailedChatRetry
             ? readNonEmptyString(input.contextSnapshot.retryOfRunId)
             : null,
-          contextSnapshot: input.contextSnapshot,
+          contextSnapshot: redactContextSnapshotForPersistence(input.contextSnapshot),
           responsibleUserId: input.responsibleUserId,
           sessionIdBefore: input.sessionBefore,
           continuationAttempt: readContinuationAttempt(input.contextSnapshot.livenessContinuationAttempt),
@@ -611,20 +612,22 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
           triggerDetail: "system",
           status: "queued",
           wakeupRequestId: wakeupRequest.id,
-          contextSnapshot: withRecoveryContext(
-            {
-              issueId: issue.id,
-              taskId: issue.id,
-              wakeReason: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_RETRY_REASON,
-              retryReason: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_RETRY_REASON,
-              source: "issue.execution_review_recovery",
-              retryOfRunId: finishingRun.id,
-              currentStageId: executionState?.currentStageId ?? null,
-              currentStageType: executionState?.currentStageType ?? null,
-              reviewRecoveryInstruction:
-                "The previous reviewer run ended while this execution-review stage was still pending. Submit the review decision now, or mark the issue blocked with the exact unblock action.",
-            },
-            "normal_model",
+          contextSnapshot: redactContextSnapshotForPersistence(
+            withRecoveryContext(
+              {
+                issueId: issue.id,
+                taskId: issue.id,
+                wakeReason: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_RETRY_REASON,
+                retryReason: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_RETRY_REASON,
+                source: "issue.execution_review_recovery",
+                retryOfRunId: finishingRun.id,
+                currentStageId: executionState?.currentStageId ?? null,
+                currentStageType: executionState?.currentStageType ?? null,
+                reviewRecoveryInstruction:
+                  "The previous reviewer run ended while this execution-review stage was still pending. Submit the review decision now, or mark the issue blocked with the exact unblock action.",
+              },
+              "normal_model",
+            ),
           ),
           sessionIdBefore: sessionBefore,
           retryOfRunId: finishingRun.id,
@@ -688,7 +691,7 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
           triggerDetail: "system",
           status: "queued",
           wakeupRequestId: wakeupRequest.id,
-          contextSnapshot,
+          contextSnapshot: redactContextSnapshotForPersistence(contextSnapshot),
           responsibleUserId,
           sessionIdBefore: sessionBefore,
           retryOfRunId: finishingRun.id,
@@ -919,7 +922,10 @@ export function createWakeAdmissionWriter(): WakeAdmissionWriter {
       const now = new Date();
       const mergedRun = await tx
         .update(heartbeatRuns)
-        .set({ contextSnapshot: input.mergedContextSnapshot, updatedAt: now })
+        .set({
+          contextSnapshot: redactContextSnapshotForPersistence(input.mergedContextSnapshot),
+          updatedAt: now,
+        })
         .where(
           and(
             eq(heartbeatRuns.id, input.activeExecutionRunId),

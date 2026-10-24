@@ -6,6 +6,7 @@ import {
   resolveCoreTrustPreset,
   type ResolveCoreTrustPresetInput,
 } from "./trust-preset-resolver.js";
+import { redactPersistedRunText } from "./run-output-redaction.js";
 
 function asRecord(value: unknown): Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value)
@@ -58,7 +59,7 @@ export async function resolveAndRetainRunTrustPreset(
     await tx
       .update(heartbeatRuns)
       .set({
-        contextSnapshot: sql`jsonb_set(coalesce(${heartbeatRuns.contextSnapshot}, '{}'::jsonb), '{executionPolicy}', ${JSON.stringify(executionPolicy)}::jsonb, true)`,
+        contextSnapshot: sql`jsonb_set(coalesce(${heartbeatRuns.contextSnapshot}, '{}'::jsonb), '{executionPolicy}', ${redactPersistedRunText(JSON.stringify(executionPolicy))}::jsonb, true)`,
         updatedAt: new Date(),
       })
       .where(scope);
