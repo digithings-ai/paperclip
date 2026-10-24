@@ -710,18 +710,27 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         parsedError ||
         stderrLine ||
         `OpenCode exited with code ${synthesizedExitCode ?? -1}`;
+      // A run that produced assistant output after its last error frame recovered. The
+      // CLI still exits non-zero because the session saw an error, but the work is
+      // done, so the run must not be filed as a failure. A signal or a fatal error
+      // keeps the run failed.
+      const recoveredErrorCount = Array.isArray(attempt.parsed.recoveredErrors)
+        ? attempt.parsed.recoveredErrors.length
+        : 0;
+      const recoveredRun = recoveredErrorCount > 0 && !parsedError && !attempt.proc.signal;
+      const effectiveExitCode = recoveredRun ? 0 : synthesizedExitCode;
       const modelId = model || null;
-      const failed = (synthesizedExitCode ?? 0) !== 0;
+      const failed = (effectiveExitCode ?? 0) !== 0;
       // Opt-in: classify provider limit text so the server retries after the reset.
       const limit = failed && isOpenCodeQuotaClassificationEnabled(process.env)
         ? classifyOpenCodeLimitError(`${fallbackErrorMessage}\n${attempt.proc.stderr}\n${attempt.proc.stdout.slice(-8_000)}`)
         : null;
 
       return {
-        exitCode: synthesizedExitCode,
+        exitCode: effectiveExitCode,
         signal: attempt.proc.signal,
         timedOut: false,
-        errorMessage: (synthesizedExitCode ?? 0) === 0 ? null : fallbackErrorMessage,
+        errorMessage: (effectiveExitCode ?? 0) === 0 ? null : fallbackErrorMessage,
         // Forward the transport-level error code from the run-disposition seam.
         // A lost duplex control channel surfaces the typed `duplex_channel_lost`
         // code; every other result carries no code here.
