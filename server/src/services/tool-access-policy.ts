@@ -1566,12 +1566,22 @@ export function toolAccessPolicyService(db: Db) {
    * off they are offered as they are today.
    */
   async function connectionBrakedContextTools(
-    input: ToolProfileTargetContext & { toolNames: readonly string[] },
+    input: ToolProfileTargetContext & { toolNames: readonly string[]; runId?: string | null },
   ): Promise<Set<string>> {
     if (!(await connectionToolBrakeSwitchOn(input.companyId, undefined))) {
       return new Set(input.toolNames);
     }
-    const profiles = await brakeProfilesForActor(input, undefined);
+    // A routine-bound brake profile joins only when the run names that routine.
+    // Resolve it the same way decide() does, from the run context snapshot.
+    let routineId = input.routineId;
+    if (!routineId && input.runId) {
+      const [run] = await db.select({ routineId: runContextSnapshotString("routineId") })
+        .from(heartbeatRuns)
+        .where(and(eq(heartbeatRuns.id, input.runId), eq(heartbeatRuns.companyId, input.companyId)))
+        .limit(1);
+      routineId = nonBlankString(run?.routineId);
+    }
+    const profiles = await brakeProfilesForActor({ ...input, routineId }, undefined);
     const ceiling: BrakeAllowlist = profiles.length === 0
       ? { kind: "absent" }
       : intersectAllowlists(profiles.map(({ profile }) => readAllowlistSet(profile.metadata)));

@@ -8977,6 +8977,7 @@ export function createToolGatewayService(
         issueId: session.issueId,
         projectId: session.projectId,
         routineId: null,
+        runId: session.runId,
         gatewayId: session.gatewayId ?? null,
         toolNames: CONNECTION_GATEWAY_TOOL_BRAKE.gatewayContextTools,
       });
