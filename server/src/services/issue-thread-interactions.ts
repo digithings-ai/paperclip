@@ -3560,7 +3560,7 @@ export function issueThreadInteractionService(
           snapshot.issueId,
           snapshot.taskId,
         ].filter((value): value is string => typeof value === "string" && value.length > 0);
-        if (boundIssueIds.some((boundIssueId) => boundIssueId !== issue.id)) {
+        if (boundIssueIds.length === 0 || boundIssueIds.some((boundIssueId) => boundIssueId !== issue.id)) {
           throw unprocessable("sourceRunId must belong to the same issue");
         }
         if (data.kind === "ask_user_questions" && actor.agentId && sourceRun.agentId !== actor.agentId) {
