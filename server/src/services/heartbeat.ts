@@ -643,6 +643,11 @@ import {
   touchHeartbeatRunRuntimeStatus,
 } from "./heartbeat-run-runtime-status.js";
 import {
+  assessRecordedProcessLiveness,
+  readProcessTable,
+  type ProcessTable,
+} from "./process-identity.js";
+import {
   findMissingHotRestartSnapshotRunIds,
   readHotRestartIntent,
   readProcessStartedAt,
@@ -714,6 +719,7 @@ const PAPERCLIP_HARNESS_CHECKOUT_KEY = "paperclipHarnessCheckedOut";
 const PAPERCLIP_EXTERNAL_CHAT_EXECUTION_BOUND_KEY =
   "paperclipExternalChatExecutionBound";
 const DETACHED_PROCESS_ERROR_CODE = "process_detached";
+const DETACHED_PROCESS_REAPED_ERROR_CODE = "process_detached_reaped";
 const NATIVE_OWNERSHIP_UNVERIFIED_MESSAGE =
   "Native execution ownership could not be verified; automatic recovery is blocked";
 // The reaper sweeps at most this many pending_cleanup leases per tick.
@@ -19445,6 +19451,107 @@ export function heartbeatService(
     );
 
     const reaped: string[] = [];
+    // Read the process table at most once per sweep, and only when a run
+    // actually needs an identity check.
+    let sweepProcessTable: ProcessTable | null | undefined;
+    const readSweepProcessTable = async () => {
+      if (sweepProcessTable === undefined) {
+        sweepProcessTable = await readProcessTable();
+      }
+      return sweepProcessTable;
+    };
+    // A detached child has no in-memory handle, so the sweep cannot read its
+    // output or wait for it. Close the run the same way a graceful shutdown
+    // does, then let the agent dispatch fresh work (DIG-4200).
+    const finalizeReapedDetachedRun = async (input: {
+      run: typeof heartbeatRuns.$inferSelect;
+      adapterType: string;
+      adapterConfig: Record<string, unknown>;
+      message: string;
+      errorCode: string;
+      clearProcessIdentity: boolean;
+    }) => {
+      const { run } = input;
+      const interrupted = await setRunStatusFromLive(
+        run.id,
+        "interrupted",
+        ["running"],
+        {
+          error: input.message,
+          errorCode: input.errorCode,
+          finishedAt: now,
+          resultJson: mergeRunStopMetadataForAgent(
+            { adapterType: input.adapterType, adapterConfig: input.adapterConfig },
+            "interrupted",
+            {
+              conversationContinuationEligible:
+                await runUsedConversationAdapter(db, run),
+              resultJson: parseObject(run.resultJson),
+              errorCode: input.errorCode,
+              errorMessage: input.message,
+            },
+          ),
+        },
+      );
+      if (!interrupted.updated || !interrupted.run) return null;
+      let finalizedRun = interrupted.run;
+      await setWakeupStatus(run.wakeupRequestId, "cancelled", {
+        finishedAt: now,
+        error: input.message,
+      });
+      finalizedRun =
+        (await classifyAndPersistRunLiveness(
+          finalizedRun,
+          parseObject(finalizedRun.resultJson),
+        )) ?? finalizedRun;
+      if (input.clearProcessIdentity) {
+        // The recorded provider is gone, or was just stopped, so its stale
+        // pid/group must not answer a later liveness probe.
+        await db
+          .update(heartbeatRuns)
+          .set({
+            processPid: null,
+            processGroupId: null,
+            processStartedAt: null,
+          })
+          .where(
+            and(
+              eq(heartbeatRuns.id, run.id),
+              run.processPid === null
+                ? isNull(heartbeatRuns.processPid)
+                : eq(heartbeatRuns.processPid, run.processPid),
+              run.processGroupId === null
+                ? isNull(heartbeatRuns.processGroupId)
+                : eq(heartbeatRuns.processGroupId, run.processGroupId),
+            ),
+          );
+      }
+      await releaseEnvironmentLeasesForRun({
+        runId: finalizedRun.id,
+        companyId: finalizedRun.companyId,
+        agentId: finalizedRun.agentId,
+        status: finalizedRun.status,
+        failureReason: finalizedRun.error ?? undefined,
+      });
+      await releaseIssueExecutionAndPromote(finalizedRun);
+      await appendRunEvent(finalizedRun, {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "warn",
+        message: input.message,
+        payload: {
+          processPid: run.processPid ?? null,
+          processGroupId: run.processGroupId ?? null,
+          processIdentityCleared: input.clearProcessIdentity,
+        },
+      });
+      await finalizeAgentStatus(run.agentId, "interrupted", input.message, {
+        wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
+      });
+      await startNextQueuedRunForAgent(run.agentId);
+      reaped.push(run.id);
+      return finalizedRun;
+    };
     const currentNativeController = await currentNativeControllerIdentity();
 
     for (const {
@@ -19557,6 +19664,75 @@ export function heartbeatService(
         continue;
       }
       if (processPidAlive || processGroupAlive) {
+        // A stored pid can be reused, so liveness alone is not ownership. The
+        // identity verdict compares the recorded start time with the process
+        // table: only a verified "alive" pid may be signalled. An unreadable
+        // table keeps the run detached.
+        const processTable = await readSweepProcessTable();
+        const detachedLiveness = processTable
+          ? assessRecordedProcessLiveness(
+              {
+                processPid: run.processPid,
+                processGroupId: run.processGroupId,
+                processStartedAt: run.processStartedAt,
+                finishedAt: run.finishedAt,
+              },
+              processTable,
+            )
+          : null;
+        const verifiedDetachedChild =
+          !nativeRun &&
+          run.processStartedAt instanceof Date &&
+          detachedLiveness?.pid === "alive";
+        if (verifiedDetachedChild) {
+          // Re-check controller ownership immediately before signalling: a
+          // controller that renewed its lease after the checks above still owns
+          // the child and must not be reaped by this sweep.
+          if (!(await revokeExpiredLegacyController(db, run))) continue;
+          const detachedPid = run.processPid!;
+          const detachedProcessGroupId = run.processGroupId;
+          let stopped = false;
+          try {
+            await terminateHeartbeatRunProcess({
+              pid: detachedPid,
+              processGroupId: detachedProcessGroupId,
+              graceMs: 2_000,
+            });
+            stopped =
+              !isProcessAlive(detachedPid) &&
+              !isProcessGroupAlive(detachedProcessGroupId);
+          } catch (err) {
+            logger.warn(
+              { err, runId: run.id, processPid: detachedPid },
+              "failed to terminate a detached child process; the run stays detached",
+            );
+          }
+          if (stopped) {
+            await finalizeReapedDetachedRun({
+              run,
+              adapterType,
+              adapterConfig,
+              message: `Reaped detached child pid ${detachedPid} left by a previous server boot`,
+              errorCode: DETACHED_PROCESS_REAPED_ERROR_CODE,
+              clearProcessIdentity: true,
+            });
+            continue;
+          }
+        } else if (detachedLiveness?.gone) {
+          if (!(await revokeExpiredLegacyController(db, run))) continue;
+          // The pid answers a liveness probe but now belongs to a later
+          // process. Nothing of the recorded provider is left to signal, so
+          // free the seat and clear the reused identity without touching it.
+          await finalizeReapedDetachedRun({
+            run,
+            adapterType,
+            adapterConfig,
+            message: `Reaped detached run whose recorded process identity is gone (pid ${run.processPid ?? "unknown"})`,
+            errorCode: DETACHED_PROCESS_REAPED_ERROR_CODE,
+            clearProcessIdentity: true,
+          });
+          continue;
+        }
         if (run.errorCode !== DETACHED_PROCESS_ERROR_CODE) {
           const detachedMessage = processPidAlive
             ? `Lost in-memory process handle, but child pid ${run.processPid} is still alive`
