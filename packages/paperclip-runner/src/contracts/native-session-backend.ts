@@ -63,6 +63,10 @@ export interface PersistedNativeSession {
   terminal?: PrpTerminalState | null;
   activeTurnId?: string | null;
   terminalTurns?: PersistedHarnessTurnTerminal[];
+  /** Control-plane disposition bound to the exact committed tool event. It is
+   * independent of the interaction's later answer and proves no provider terminal. */
+  governedWait?: { sourceEvent: PrpEvent; result: PrpStructuredRunResult };
+
   /** At-most-once marker for resultless disposition repair or restart continuation. */
   dispositionOnlyRecoveryConsumed?: boolean;
   dispositionOnlyRecoveryTurnId?: string | null;
@@ -189,6 +193,8 @@ export interface NativeSession {
     /** Set by orchestration only after successful provider-session recovery. */
     continuation?: true;
     requestedCollaborationMode?: "default" | "plan";
+    /** OpenCode/OpenRouter only. Applies to this turn, never subsequent turns. */
+    reasoningMode?: "default" | "disabled";
   }): Promise<{
     turnId: string;
     effectiveCollaborationMode?: "default" | "plan";
@@ -200,6 +206,9 @@ export interface NativeSession {
     correlationId?: string;
   }): Promise<void>;
   interrupt?(input: { turnId?: string; reason?: string }): Promise<void>;
+  /** Revoke publication synchronously while the control plane journals a wait.
+   * Does not interrupt the provider; cancel owns the subsequent passive cleanup. */
+  revokeTurnPublication?(): void;
   /** Commit cancellation synchronously; the returned promise owns cleanup only. */
   cancel?(input: {
     reason: string;

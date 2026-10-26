@@ -158,7 +158,10 @@ export function isResolvedInteractionContinuationWakeContext(contextSnapshot: un
   const interactionId = readNonEmptyString(context.interactionId);
   const interactionStatus = readNonEmptyString(context.interactionStatus);
   if (!interactionId || !interactionStatus) return false;
-  if (!RESOLVED_INTERACTION_CONTINUATION_STATUSES.has(interactionStatus)) return false;
+  const retiredConnection = interactionStatus === "expired"
+    && context.interactionKind === "connection_intent"
+    && context.connectionIntentResolution === "existing_connection";
+  if (!retiredConnection && !RESOLVED_INTERACTION_CONTINUATION_STATUSES.has(interactionStatus)) return false;
 
   const mutation = readNonEmptyString(context.mutation);
   const wakeReason = readNonEmptyString(context.wakeReason);

@@ -227,6 +227,35 @@ describe("runAdapterExecutionTargetProcess", () => {
     vi.unstubAllEnvs();
   });
 
+  it.each([true, false, undefined])("preserves the sandbox session choice %s and command outcome", async (useSession) => {
+    const stopped = vi.fn();
+    const onLog = vi.fn(async (_stream: "stdout" | "stderr", _chunk: string) => {});
+    const completed = {
+      exitCode: 7, signal: null, timedOut: false, stdout: "partial output",
+      stderr: "fixture failure", pid: null, startedAt: "2020-01-01T00:00:00.000Z",
+    };
+    const execute = vi.fn(async (input: { onLog?: (stream: "stdout" | "stderr", chunk: string) => Promise<void> }) => {
+      await input.onLog?.("stdout", completed.stdout);
+      return completed;
+    });
+    const result = await runAdapterExecutionTargetProcess("run-fixture", {
+      kind: "remote", transport: "sandbox", remoteCwd: "/workspace", runner: { execute },
+    }, "opencode", ["run"], {
+      cwd: "/local", env: {}, timeoutSec: 14400, graceSec: 20,
+      onLog, onProcessStopped: stopped, ...(useSession === undefined ? {} : { useSession }),
+    });
+    const call = execute.mock.calls[0]![0];
+    expect(call).toMatchObject({ command: "opencode", args: ["run"], cwd: "/workspace", timeoutMs: 14400000 });
+    if (useSession === undefined) expect(call).not.toHaveProperty("useSession");
+    else expect(call).toHaveProperty("useSession", useSession);
+    if (useSession === true) expect(call).toHaveProperty("commandTimeoutMs", 14400000);
+    else expect(call).not.toHaveProperty("commandTimeoutMs");
+    expect(result).toEqual(completed);
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(onLog.mock.calls).toEqual([["stdout", "partial output"]]);
+    expect(stopped).toHaveBeenCalledTimes(1);
+  });
+
   it("sanitizes inherited host env before SSH process execution", async () => {
     vi.stubEnv("PATH", "/host/bin:/usr/bin");
     vi.stubEnv("HOME", "/Users/local");
@@ -269,6 +298,7 @@ describe("runAdapterExecutionTargetProcess", () => {
         },
         timeoutSec: 5,
         graceSec: 1,
+        useSession: true,
         onLog: async () => {},
       },
     );
@@ -283,6 +313,7 @@ describe("runAdapterExecutionTargetProcess", () => {
         },
       }),
     );
+    expect(runChildProcessSpy.mock.calls[0]![3]).not.toHaveProperty("useSession");
   });
 });
 
@@ -431,7 +462,7 @@ describe("GitHub launcher lifecycle", () => {
       providerKey: "e2b", remoteCwd: "/remote/workspace", runner };
     await cleanupGitHubOperationLaunchers({ runId: "finished-run", target });
     expect(runner.execute).toHaveBeenCalledWith({ command: "sh",
-      args: ["-c", "rm -rf -- '/remote/workspace/.paperclip-runtime/github/finished-run'"],
+      args: ["-c", "rm -rf -- '/remote/workspace/.paperclip-runtime/paperclip-runner/github/finished-run'"],
       cwd: "/remote/workspace", timeoutMs: 5_000 });
     await expect(cleanupGitHubOperationLaunchers({ runId: "../other", target })).rejects.toThrow("Invalid GitHub launcher run ID");
     expect(runner.execute).toHaveBeenCalledTimes(1);
