@@ -19,6 +19,7 @@ import { buildExecutionContinuation } from "./execution-continuation.js";
 import {
   EXECUTION_RECONCILIATION_CAUSES,
   type ExecutionReconciliation,
+  type IssueUnblockDescriptor,
 } from "@paperclipai/shared";
 import { parseIssueExecutionState } from "./issue-execution-policy.js";
 import { isSupersededConversationRun } from "./agent-conversations.js";
@@ -496,16 +497,29 @@ export async function settleUnrecoverableExecutions(
               : null
             : null;
         const blockable = current && !preservedIssueStatus;
+        const workspaceRestoreFailure = hasWorkspaceRestoreFailure(run.resultJson);
         const note = preservedIssueStatus
           ? "Automatic recovery stopped. The run recorded this task's status; it was preserved and no action was replayed."
           : blockable
-            ? hasWorkspaceRestoreFailure(run.resultJson)
+            ? workspaceRestoreFailure
               ? "Workspace repair required. Verify safe staging or repair before continuing. Saved work and approval decisions remain in force."
               : "Automatic recovery stopped. Recorded work is preserved; actions with unverified outcomes will not be repeated."
             : "Recovery closed because the task's owner, execution, or status changed. No work was replayed.";
         let nativeFailureBlock = action.evidence.nativeFailureBlock;
         let nativeBootstrapFailureBlock = action.evidence.nativeBootstrapFailureBlock;
         if (blockable) {
+          // A recovery block must carry the disposition the API requires, or
+          // nobody can wake the issue. Name the owner the work returns to and
+          // the action that clears it. An already-blocked task keeps the
+          // descriptor it has: that hold may belong to a different failure.
+          const blockOwner: IssueUnblockDescriptor["owner"] = task.assigneeAgentId
+            ? { agentId: task.assigneeAgentId }
+            : task.assigneeUserId
+              ? { userId: task.assigneeUserId }
+              : "board";
+          const blockAction = workspaceRestoreFailure
+            ? "Verify staging or repair the workspace, then continue. Saved work and approval decisions remain in force."
+            : "Review the recorded work from the stopped run, then continue or close. Recovery did not replay any unverified action.";
           const [projected] = await tx
             .update(issues)
             .set({
@@ -513,6 +527,13 @@ export async function settleUnrecoverableExecutions(
               executionRunId: null,
               checkoutRunId: null,
               updatedAt: now,
+              ...(task.status !== "blocked"
+                ? {
+                    unblockDescriptor: { owner: blockOwner, action: blockAction },
+                    blockedTransitionAt: now,
+                    blockedOwnerNotifiedAt: null,
+                  }
+                : {}),
             })
             .where(eq(issues.id, task.id)).returning();
           // Only a transition owned by this failure grants a recovery receipt.

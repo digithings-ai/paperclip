@@ -211,6 +211,14 @@ describeEmbeddedPostgres("execution recovery resolution", () => {
 
     const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
     expect(issue?.status).toBe("blocked");
+    // The block names who can clear it and what clears it. Without this the
+    // API's own blocked invariant is bypassed and the issue cannot be woken.
+    expect(issue?.unblockDescriptor).toEqual({
+      owner: { agentId },
+      action: expect.stringContaining("Review the recorded work"),
+    });
+    expect(issue?.blockedTransitionAt).toBeInstanceOf(Date);
+    expect(issue?.blockedOwnerNotifiedAt).toBeNull();
     const [action] = await db
       .select()
       .from(issueRecoveryActions)
@@ -257,6 +265,43 @@ describeEmbeddedPostgres("execution recovery resolution", () => {
 
     const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
     expect(issue?.status).toBe("blocked");
+    expect(issue?.unblockDescriptor).toEqual({
+      owner: { agentId },
+      action: expect.stringContaining("Review the recorded work"),
+    });
+    const [action] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, actionId));
+    expect(action).toMatchObject({ status: "resolved", outcome: "blocked" });
+  });
+
+  it("keeps the unblock descriptor an already-blocked issue carries", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const issueId = randomUUID();
+    const existingDescriptor = {
+      owner: { userId: "responsible-user" },
+      action: "Approve the exception",
+    };
+    const { actionId } = await seedLegacyRunRequiringReconciliation({
+      companyId,
+      agentId,
+      issueId,
+      issueStatus: "in_progress",
+      statusWrittenByRun: null,
+    });
+    await db.update(issues).set({
+      status: "blocked",
+      unblockDescriptor: existingDescriptor,
+      blockedTransitionAt: new Date("2026-10-01T00:00:00.000Z"),
+    }).where(eq(issues.id, issueId));
+
+    await settleUnrecoverableExecutions(db);
+
+    const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(issue?.status).toBe("blocked");
+    expect(issue?.unblockDescriptor).toEqual(existingDescriptor);
+    expect(issue?.blockedTransitionAt).toEqual(new Date("2026-10-01T00:00:00.000Z"));
     const [action] = await db
       .select()
       .from(issueRecoveryActions)
