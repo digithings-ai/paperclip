@@ -1,4 +1,4 @@
-import { asNumber, asString, parseJson, parseObject } from "@paperclipai/adapter-utils/server-utils";
+import { asString, parseJson, parseObject } from "@paperclipai/adapter-utils/server-utils";
 
 function errorText(value: unknown): string {
   if (typeof value === "string") return value;
@@ -33,6 +33,11 @@ export function stripDcpSystemReminders(text: string): string {
 }
 
 export function parseOpenCodeJsonl(stdout: string) {
+  return createOpenCodeJsonlParser()(stdout);
+}
+
+/** Consume complete JSONL records once, retaining protocol accounting state. */
+export function createOpenCodeJsonlParser() {
   let sessionId: string | null = null;
   const messages: string[] = [];
   const errors: string[] = [];
@@ -50,73 +55,86 @@ export function parseOpenCodeJsonl(stdout: string) {
     cachedInputTokens: 0,
     outputTokens: 0,
   };
-  let costUsd = 0;
+  let costUsd: number | null = null;
+  let missingCost = false;
+  let usageReported = false;
+  let missingUsage = false;
 
-  for (const rawLine of stdout.split(/\r?\n/)) {
-    const line = rawLine.trim();
-    if (!line) continue;
+  return (stdout: string) => {
+    for (const rawLine of stdout.split(/\r?\n/)) {
+      const line = rawLine.trim();
+      if (!line) continue;
 
-    const event = parseJson(line);
-    if (!event) continue;
+      const event = parseJson(line);
+      if (!event) continue;
 
-    const currentSessionId = asString(event.sessionID, "").trim();
-    if (currentSessionId) sessionId = currentSessionId;
+      const currentSessionId = asString(event.sessionID, "").trim();
+      if (currentSessionId) sessionId = currentSessionId;
 
-    const type = asString(event.type, "");
+      const type = asString(event.type, "");
 
-    if (type === "text") {
-      const part = parseObject(event.part);
-      const text = asString(part.text, "").trim();
-      if (text) {
-        messages.push(text);
+      if (type === "text") {
+        const part = parseObject(event.part);
+        const text = asString(part.text, "").trim();
+        if (text) {
+          messages.push(text);
+          if (errors.length > 0) outputAfterError = true;
+        }
+        continue;
+      }
+
+      if (type === "step_finish") {
+        const part = parseObject(event.part);
+        const tokens = parseObject(part.tokens);
+        const cache = parseObject(tokens.cache);
+        const counts = [tokens.input, tokens.output, cache.read === undefined ? 0 : cache.read, cache.write === undefined ? 0 : cache.write, tokens.reasoning === undefined ? 0 : tokens.reasoning];
+        if (counts.every(value => typeof value === "number" && Number.isSafeInteger(value) && value >= 0)) {
+          const [input, output, cached, written, reasoning] = counts as number[];
+          const next = { inputTokens: usage.inputTokens + input + written,
+            outputTokens: usage.outputTokens + output + reasoning, cachedInputTokens: usage.cachedInputTokens + cached };
+          if (Object.values(next).every(Number.isSafeInteger)) { Object.assign(usage, next); usageReported = true; }
+          else missingUsage = true;
+        } else missingUsage = true;
+        if (typeof part.cost === "number" && Number.isFinite(part.cost) && part.cost >= 0) costUsd = (costUsd ?? 0) + part.cost;
+        else missingCost = true;
         if (errors.length > 0) outputAfterError = true;
+        continue;
       }
-      continue;
-    }
 
-    if (type === "step_finish") {
-      const part = parseObject(event.part);
-      const tokens = parseObject(part.tokens);
-      const cache = parseObject(tokens.cache);
-      usage.inputTokens += asNumber(tokens.input, 0);
-      usage.cachedInputTokens += asNumber(cache.read, 0);
-      usage.outputTokens += asNumber(tokens.output, 0) + asNumber(tokens.reasoning, 0);
-      costUsd += asNumber(part.cost, 0);
-      if (errors.length > 0) outputAfterError = true;
-      continue;
-    }
-
-    if (type === "tool_use") {
-      const part = parseObject(event.part);
-      const state = parseObject(part.state);
-      if (asString(state.status, "") === "error") {
-        const text = asString(state.error, "").trim();
-        if (text) toolErrors.push(text);
+      if (type === "tool_use") {
+        const part = parseObject(event.part);
+        const state = parseObject(part.state);
+        if (asString(state.status, "") === "error") {
+          const text = asString(state.error, "").trim();
+          if (text) toolErrors.push(text);
+        }
+        continue;
       }
-      continue;
-    }
 
-    if (type === "error") {
-      const text = errorText(event.error ?? event.message).trim();
-      if (text) {
-        errors.push(text);
-        // A fresh error after recovered output is the last word: re-arm the fatal state.
-        outputAfterError = false;
+      if (type === "error") {
+        const text = errorText(event.error ?? event.message).trim();
+        if (text) {
+          errors.push(text);
+          // A fresh error after recovered output is the last word: re-arm the fatal state.
+          outputAfterError = false;
+        }
+        continue;
       }
-      continue;
     }
-  }
 
-  if (outputAfterError) recoveredErrors.push(...errors);
+    if (outputAfterError) recoveredErrors.push(...errors);
 
-  return {
-    sessionId,
-    summary: stripDcpSystemReminders(messages.join("\n\n")),
-    usage,
-    costUsd,
-    errorMessage: errors.length > 0 && !outputAfterError ? errors.join("\n") : null,
-    recoveredErrors,
-    toolErrors,
+    return {
+      sessionId,
+      summary: stripDcpSystemReminders(messages.join("\n\n")),
+      usage: { ...usage },
+      usageReported,
+      usageComplete: usageReported && !missingUsage,
+      costUsd: missingCost ? null : costUsd,
+      errorMessage: errors.length > 0 && !outputAfterError ? errors.join("\n") : null,
+      recoveredErrors,
+      toolErrors,
+    };
   };
 }
 

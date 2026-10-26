@@ -189,7 +189,7 @@ describe("Connectors landing page", () => {
     manageComposioAppAccountMock.mockReset();
     listAgentsMock.mockResolvedValue([{ id: "default-agent", name: "Default agent", role: "ceo", reportsTo: null, status: "active", createdAt: new Date(0) }]);
     aggregatorCatalogMock.splice(0);
-    experimentalMock.mockResolvedValue({ enableChatConnectors: true });
+    experimentalMock.mockResolvedValue({ enableChatConnectors: true, enableGitHubReviewBots: true });
     chatListMock.mockResolvedValue([]);
     chatSetupMock.mockReset().mockResolvedValue({ status: "archived" });
     emailControlMock.mockReset().mockResolvedValue({ status: "archived" });
@@ -250,6 +250,29 @@ describe("Connectors landing page", () => {
     }
     return client;
   }
+
+  it("shows provider catalog rows and splits legacy gateway accounts by API format", async () => {
+    const slugs = ["notion", "openrouter", "bedrock", "google", "responses-api", "messages-api", "chat-completions-api", "local"];
+    listGalleryMock.mockResolvedValue({ apps: slugs.map(slug => getAppStoreDefinition(slug)) });
+    listApplicationsMock.mockResolvedValue({ applications: [application({ id: "gateway-app", name: "Model gateway", applicationKey: "app-gallery:gateway", metadata: { sourceTemplateKey: "gateway" } })] });
+    listConnectionsMock.mockResolvedValue({ connections: ["responses", "messages"].map(protocol => connection({
+      id: protocol, name: `${protocol} account`, applicationId: "gateway-app", connectionPurpose: "ai",
+      config: { sourceTemplateKey: "gateway", ai: { provider: protocol === "messages" ? "anthropic" : "openai", method: "api_key", routing: { kind: "gateway", protocol, auth: "bearer", baseUrl: "https://models.example.com/v1", models: [] } } },
+    })) });
+    await renderBrowse();
+    expect(container.textContent).not.toContain("Connect a model provider");
+    expect(container.textContent).not.toContain("Model gateway");
+    for (const slug of slugs) expect(container.querySelector(`[data-app-slug="${slug}"]`)).not.toBeNull();
+    const responses = container.querySelector('[data-app-slug="responses-api"]')!;
+    const messages = container.querySelector('[data-app-slug="messages-api"]')!;
+    expect(responses.textContent).toContain("responses account");
+    expect(responses.textContent).not.toContain("messages account");
+    expect(messages.textContent).toContain("messages account");
+    const bedrock = container.querySelector('[data-app-slug="bedrock"]')!;
+    const connect = Array.from(bedrock.querySelectorAll('button')).find(button => button.textContent?.includes("Connect"))!;
+    await act(() => connect.click());
+    expect(navigateMock).toHaveBeenCalledWith("/apps/connect?source=bedrock");
+  });
 
   it("offers assistant setup from Connections without choosing an agent", async () => {
     await renderBrowse();
@@ -970,7 +993,7 @@ describe("Connectors landing page", () => {
     expect(container.querySelector('button[aria-label="Add key GitHub"]')).toBeNull();
   });
 
-  it("separates tools and saved bots and hides only bots when chat connectors are disabled", async () => {
+  it("separates tools and saved bots and gates bots independently of chat connectors", async () => {
     listGalleryMock.mockResolvedValue({ apps: ["github", "github-code-review-bot"].map(getAppStoreDefinition) });
     listApplicationsMock.mockResolvedValue({ applications: [
       application({ id: "github-tools", name: "GitHub", metadata: { sourceTemplateKey: "github" } }),
@@ -1000,7 +1023,10 @@ describe("Connectors landing page", () => {
     const finish = [...bots.querySelectorAll("button")].find((button) => button.textContent === "Finish setup")!;
     await act(() => finish.click());
     expect(navigateMock).toHaveBeenLastCalledWith("/apps/chat/connect?provider=github&purpose=chat&resume=endpoint-2");
-    await act(() => { client.setQueryData(queryKeys.instance.experimentalSettings, { enableChatConnectors: false }); });
+    await act(() => { client.setQueryData(queryKeys.instance.experimentalSettings, { enableChatConnectors: false, enableGitHubReviewBots: true }); });
+    await flushReact();
+    expect(container.querySelector('[data-app-slug="github-code-review-bot"]')).not.toBeNull();
+    await act(() => { client.setQueryData(queryKeys.instance.experimentalSettings, { enableChatConnectors: true, enableGitHubReviewBots: false }); });
     await flushReact();
     expect(container.querySelector('[data-app-slug="github-code-review-bot"]')).toBeNull();
     expect(container.textContent).not.toContain("Review agent");
@@ -1133,7 +1159,7 @@ describe("Connectors landing page", () => {
     const notion = providers[0]!;
     expect(notion.textContent).toContain("devinfoley@gmail.com");
     expect(notion.textContent).toContain("ops@example.com");
-    expect(notion.textContent).toContain("Connected by");
+    expect(notion.textContent).not.toContain("Connected by");
     expect(notion.textContent).toContain("Dotta");
     expect(notion.textContent).toContain("The saved sign-in expired.");
     expect(
@@ -1291,6 +1317,20 @@ describe("Connectors landing page", () => {
     },
   );
 
+  it.each(["slack", "agentmail", "discord", "telegram", "microsoft-teams", "github"])("shows agent and connector-owner identities without routine status labels for %s", async provider => {
+    listAgentsMock.mockResolvedValue([{ id: "maya", name: "Maya", appearance: { schemaVersion: 1, characterVersion: "cap-v1", paletteId: "cherry-pop" } }]);
+    listUserDirectoryMock.mockResolvedValue({ users: [{ principalId: "user-1", status: "active", user: { id: "user-1", name: "Dotta", email: "dotta@example.com", image: null } }] });
+    chatListMock.mockResolvedValue([{ id: "chat-avatar", provider, status: "verifying", assignedAgentId: "maya", assignedAgentName: "Maya", sponsorUserId: "user-1", setup: { webhookVerifiedAt: "2026-10-07T12:00:00Z" } }]);
+    await renderBrowse();
+    const avatar = container.querySelector('[aria-label="Maya avatar"]');
+    expect(avatar).not.toBeNull();
+    const row = avatar!.parentElement!.parentElement!;
+    expect(row.textContent).toContain("Dotta");
+    expect(row.textContent).not.toContain("Connected by");
+    expect(row.textContent).not.toContain("verifying");
+    expect(row.querySelector('[data-slot="avatar"]')).not.toBeNull();
+  });
+
   it.each([
     ["slack", "Slack", "active"], ["slack", "Slack", "draft"],
     ["agentmail", "AgentMail", "active"], ["agentmail", "AgentMail", "draft"],
@@ -1365,6 +1405,38 @@ describe("Connectors landing page", () => {
     expect(navigateMock).toHaveBeenCalledWith(
       "/apps/connect?source=notion&resume=conn-draft",
     );
+  });
+
+  it("resumes a hidden provider only from its existing draft account row", async () => {
+    listApplicationsMock.mockResolvedValue({ applications: [application({
+      id: "app-clickup",
+      name: "ClickUp",
+      applicationKey: "app-gallery:clickup:one",
+      metadata: { sourceTemplateKey: "clickup" },
+    })] });
+    listConnectionsMock.mockResolvedValue({ connections: [connection({
+      id: "conn-clickup-draft",
+      applicationId: "app-clickup",
+      name: "ClickUp",
+      status: "draft",
+      config: { sourceTemplateKey: "clickup" },
+    })] });
+
+    await renderBrowse();
+
+    const row = container.querySelector('[data-app-slug="clickup"]');
+    expect(row).not.toBeNull();
+    expect(row?.textContent).toContain("Setup incomplete");
+    const finish = Array.from(row!.querySelectorAll("button")).find(
+      (button) => button.textContent === "Finish setup",
+    );
+    await act(async () => {
+      finish?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    expect(navigateMock).toHaveBeenCalledWith(
+      "/apps/connect?source=clickup&resume=conn-clickup-draft",
+    );
+    expect(getAppStoreDefinition("clickup")).toBeNull();
   });
 
   it("filters the single list without restoring section chrome", async () => {

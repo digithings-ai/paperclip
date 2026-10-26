@@ -32,6 +32,11 @@ const WARM_ATTACHMENT_TAIL_DRAIN_LIMIT: usize = 256;
 const WARM_ATTACHMENT_QUIET_WINDOW: Duration = Duration::from_millis(10);
 const WARM_ATTACHMENT_DRAIN_DEADLINE: Duration = Duration::from_millis(100);
 const OPENCODE_PROVIDER_ENVIRONMENT_KEYS: &[&str] = &[
+    "PAPERCLIP_AI_PROVIDER_KEY",
+    "PAPERCLIP_AI_PROVIDER_URL",
+    "PAPERCLIP_AGENT_KEY_ID",
+    "PAPERCLIP_AGENT_PUBLIC_KEY",
+    "PAPERCLIP_AGENT_PRIVATE_KEY",
     "OPENROUTER_API_KEY",
     "PAPERCLIP_NATIVE_MCP_NAME",
     "PAPERCLIP_NATIVE_MCP_URL",
@@ -242,6 +247,15 @@ impl ProviderTraceSink {
     }
 
     fn frame(&mut self, direction: &str, raw: &[u8]) -> Option<u64> {
+        // Raw protocol frames can contain arbitrary private-key fragments.
+        // Preserve trace metadata without retaining raw content for identity runs.
+        let redacted =
+            if std::env::var("PAPERCLIP_AGENT_PRIVATE_KEY").is_ok_and(|key| !key.is_empty()) {
+                "[REDACTED: agent identity runtime]".to_owned()
+            } else {
+                String::from_utf8_lossy(raw).into_owned()
+            };
+        let raw = redacted.as_bytes();
         if self.captured_bytes.saturating_add(raw.len()) > self.max_bytes {
             self.truncated = true;
             return None;
@@ -370,6 +384,13 @@ pub struct CodexSkillInput {
     pub input_type: String,
     pub name: String,
     pub path: String,
+}
+
+/// Optional inputs for one turn; omitted fields preserve provider defaults.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CodexTurnOptions<'a> {
+    pub skills: &'a [CodexSkillInput],
+    pub reasoning_mode: Option<&'a str>,
 }
 
 impl CodexSkillInput {
@@ -792,6 +813,10 @@ const GITHUB_CREDENTIAL_ENVIRONMENT_KEYS: &[&str] = &[
 ];
 
 const CODEX_PROVIDER_ENVIRONMENT_KEYS: &[&str] = &[
+    "PAPERCLIP_AI_PROVIDER_KEY",
+    "PAPERCLIP_AGENT_KEY_ID",
+    "PAPERCLIP_AGENT_PUBLIC_KEY",
+    "PAPERCLIP_AGENT_PRIVATE_KEY",
     "CODEX_HOME",
     "OPENAI_API_KEY",
     "CODEX_API_KEY",
@@ -1652,15 +1677,26 @@ impl CodexProvider {
     }
 
     pub fn start_turn(&mut self, message: &str, cwd: &str) -> Result<Value, LocalRunnerError> {
-        self.start_turn_with_skills(message, cwd, &[])
+        self.start_turn_with_options(message, cwd, CodexTurnOptions::default())
     }
 
-    pub fn start_turn_with_skills(
+    pub fn start_turn_with_options(
         &mut self,
         message: &str,
         cwd: &str,
-        skills: &[CodexSkillInput],
+        options: CodexTurnOptions<'_>,
     ) -> Result<Value, LocalRunnerError> {
+        let CodexTurnOptions {
+            skills,
+            reasoning_mode,
+        } = options;
+        if reasoning_mode.is_some_and(|mode| {
+            self.config.provider != "opencode" || !matches!(mode, "default" | "disabled")
+        }) {
+            return Err(LocalRunnerError::invalid(
+                "turn.reasoningMode requires OpenCode and must be default or disabled",
+            ));
+        }
         if skills.len() > 64 || (self.config.provider != "codex" && !skills.is_empty()) {
             return Err(LocalRunnerError::invalid(
                 "explicit skills require Codex and at most 64 selections",
@@ -1709,6 +1745,9 @@ impl CodexProvider {
         let turn_params_object = turn_params
             .as_object_mut()
             .expect("Codex turn parameters are an object");
+        if let Some(mode) = reasoning_mode {
+            turn_params_object.insert("reasoningMode".to_owned(), json!(mode));
+        }
         if self.permission_profile == "paperclip-runner-external-sandbox" {
             turn_params_object.insert(
                 "sandboxPolicy".to_owned(),

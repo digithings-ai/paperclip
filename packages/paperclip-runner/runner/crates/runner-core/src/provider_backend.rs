@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use crate::codex_provider::{
-    CodexProvider, CodexProviderConfig, CodexProviderEvent, CodexSkillInput,
+    CodexProvider, CodexProviderConfig, CodexProviderEvent, CodexSkillInput, CodexTurnOptions,
     ProviderStartupObservation, ProviderStartupStage, RejectedAcceptedTurn,
     MAX_SETTLED_PROVIDER_TURN_IDS,
 };
@@ -538,11 +538,13 @@ fn admit_terminal_tool_authority(
         "paperclip_finish" => {
             matches!(disposition.as_str(), "done" | "needs_review")
                 || (disposition == "yielded"
-                    && input
-                        .get("continuation")
-                        .and_then(|continuation| continuation.get("kind"))
-                        .and_then(Value::as_str)
-                        == Some("response_wake"))
+                    && matches!(
+                        input
+                            .get("continuation")
+                            .and_then(|continuation| continuation.get("kind"))
+                            .and_then(Value::as_str),
+                        Some("response_wake" | "monitor")
+                    ))
         }
         "paperclip_block" => disposition == "blocked",
         _ => false,
@@ -2901,7 +2903,24 @@ impl CodexCommandExecutor {
                 .validate()
                 .map_err(|error| DurableRunnerError::invalid(error.to_string()))?;
         }
+        let reasoning_mode = match payload.get("reasoningMode") {
+            None => None,
+            Some(Value::String(mode)) if matches!(mode.as_str(), "default" | "disabled") => {
+                Some(mode.as_str())
+            }
+            Some(_) => return Err(DurableRunnerError::invalid("invalid turn.reasoningMode")),
+        };
         self.restore_provider_if_needed()?;
+        if reasoning_mode.is_some()
+            && self
+                .state
+                .as_ref()
+                .is_none_or(|state| state.config.provider != "opencode")
+        {
+            return Err(DurableRunnerError::invalid(
+                "turn.reasoningMode requires OpenCode",
+            ));
+        }
         if self
             .state
             .as_ref()
@@ -2984,7 +3003,14 @@ impl CodexCommandExecutor {
             rejected_accepted_turn,
         ) = {
             let provider = self.ensure_provider()?;
-            let result = provider.start_turn_with_skills(text, &cwd, &skills);
+            let result = provider.start_turn_with_options(
+                text,
+                &cwd,
+                CodexTurnOptions {
+                    skills: &skills,
+                    reasoning_mode,
+                },
+            );
             (
                 result,
                 provider.completed_turn_authority().is_some(),
@@ -3592,7 +3618,9 @@ impl CodexCommandExecutor {
         state.receipt_limit_interrupt_accepted = false;
         state.receipt_limit_interrupt_attempts = 0;
         state.receipt_limit_interrupt_deadline_unix_ms = None;
-        state.lifecycle = "provider_exited".to_owned();
+        // Deadline settlement retires this run permanently. Polling its terminal
+        // outbox must not reopen a provider that still reports the stopped turn.
+        state.lifecycle = "closed".to_owned();
         let terminal_event_type = if interrupt_accepted {
             "turn.interrupted"
         } else {
@@ -4900,8 +4928,9 @@ mod tests {
         assert_eq!(finish_result.result["error"]["code"], "invalid_tool_call");
         assert_eq!(finish_result.result["error"]["retryable"], false);
         let finish_message = finish_result.result["error"]["message"].as_str().unwrap();
-        assert!(finish_message
-            .contains("continuation must include kind=response_wake, summary, and idempotencyKey"));
+        assert!(finish_message.contains(
+            "continuation must include kind=response_wake or monitor, summary, and idempotencyKey"
+        ));
         assert!(finish_message.contains("/required (missing \"requiredField\")"));
         assert!(finish_message.contains("/additionalProperties"));
         assert!(!finish_message.contains("secretSubmittedValue"));
@@ -4915,6 +4944,18 @@ mod tests {
             .contains("blocker must include reasonCode, owner, unblockAction, and scope"));
         assert!(block_message.len() <= 512);
         assert!(!block_message.chars().any(char::is_control));
+
+        let question_result = schema_rejection(
+            "request_human_input",
+            json!({"PRIVATE_FIELD": "PRIVATE_VALUE"}),
+        );
+        let question_message = question_result.result["error"]["message"].as_str().unwrap();
+        assert!(question_message.contains("payload.questionSet"));
+        assert!(question_message.contains("/required (missing \"requiredField\")"));
+        assert!(!question_message.contains("PRIVATE_FIELD"));
+        assert!(!question_result.result.to_string().contains("PRIVATE_VALUE"));
+        assert!(question_message.len() <= 512);
+        assert_eq!(question_result.result["error"]["retryable"], false);
 
         let ordinary_result = schema_rejection("get_task_context", json!({}));
         assert_eq!(
@@ -5146,6 +5187,25 @@ mod tests {
             "kind": "response_wake",
             "summary": "Wait for the next response.",
             "idempotencyKey": "response-wake-1"
+        });
+
+        admit_terminal_tool_authority(&mut state, "paperclip_finish", &result, false).unwrap();
+        let terminal = terminal_events(&state, "turn.completed", None);
+
+        assert_eq!(terminal.len(), 1);
+        assert_eq!(terminal[0].payload["reportedWorkDisposition"], "yielded");
+        assert!(state.validate().is_ok());
+    }
+
+    #[test]
+    fn accepted_terminal_tool_preserves_an_explicit_monitor_wait() {
+        let mut state = opencode_result_state();
+        let mut result = valid_opencode_result();
+        result["reportedWorkDisposition"] = json!("yielded");
+        result["continuation"] = json!({
+            "kind": "monitor",
+            "summary": "Wait for the scheduled check.",
+            "idempotencyKey": "monitor-1"
         });
 
         admit_terminal_tool_authority(&mut state, "paperclip_finish", &result, false).unwrap();
@@ -6032,6 +6092,27 @@ mod tests {
         executor.state = Some(state);
         executor.restore_checked = true;
 
+        for mode in [
+            json!(null),
+            json!(false),
+            json!("bad"),
+            json!("disabled"),
+            json!("default"),
+        ] {
+            let error = executor
+                .start_turn(&json!({"text": "must not reach the provider", "reasoningMode": mode}))
+                .unwrap_err();
+            assert!(error.to_string().contains("reasoningMode"));
+            assert!(executor.provider.is_none());
+            assert!(
+                !executor
+                    .state
+                    .as_ref()
+                    .unwrap()
+                    .ambiguous_turn_start_pending
+            );
+        }
+
         let error = executor
             .start_turn(&json!({"text": "must not reach the provider"}))
             .expect_err("the exact regular backlog limit must reject admission");
@@ -6274,7 +6355,7 @@ mod tests {
                 provider: "codex".to_owned(),
                 driver: "codex_app_server".to_owned(),
                 provider_version: "test".to_owned(),
-                command: PathBuf::from("codex"),
+                command: PathBuf::from("/definitely-missing-receipt-deadline-provider"),
                 args: vec!["app-server".to_owned()],
                 cwd: std::env::current_dir()
                     .unwrap()
@@ -6321,7 +6402,7 @@ mod tests {
         executor.maintain_backpressured_provider().unwrap();
 
         let state = executor.state.as_ref().unwrap();
-        assert_eq!(state.lifecycle, "provider_exited");
+        assert_eq!(state.lifecycle, "closed");
         assert!(state.active_provider_turn_id.is_none());
         assert!(!state.receipt_limit_interrupt_pending);
         assert!(state.pending_events.iter().any(|event| {
@@ -6339,6 +6420,13 @@ mod tests {
             settled
         );
         assert!(executor.provider.is_none());
+        // Reading terminal evidence must not restart work whose interruption
+        // exhausted its deadline, even after a controller reconnects.
+        assert!(!executor.poll_events().unwrap().is_empty());
+        assert!(executor.provider.is_none());
+        let mut restarted = CodexCommandExecutor::new(&directory);
+        assert!(!restarted.poll_events().unwrap().is_empty());
+        assert!(restarted.provider.is_none());
         fs::remove_dir_all(directory).unwrap();
     }
 }

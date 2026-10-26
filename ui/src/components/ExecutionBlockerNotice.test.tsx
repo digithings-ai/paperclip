@@ -36,8 +36,7 @@ describe("stopped task recovery notice", () => {
     const notice = container.querySelector('[role="status"][aria-label="Task recovery"]')!;
     expect(notice.textContent).toContain("Recorded work is preserved");
     expect(notice.textContent).toContain("Retry");
-    expect(notice.classList.contains("border")).toBe(true);
-    expect(notice.classList.contains("bg-muted")).toBe(true);
+    expect(notice.classList.contains("task-context-notice")).toBe(true);
     expect(notice.querySelector("a")?.getAttribute("href")).toBe("/agents/agent/runs/failed-run");
   });
   it.each([false, true])("explains cancelled runs and saved input; continue eligibility %s", async canContinue => {
@@ -99,6 +98,25 @@ describe("stopped task recovery notice", () => {
     expect(link.getAttribute("href")).toBe("/agents/agent/runs/failed-run");
     expect(agentsApi.retryFailedRun).not.toHaveBeenCalled();
   });
+  it("keeps workspace repair guidance and inspection without offering the legacy Retry fallback", async () => {
+    await act(async () => root.render(<QueryClientProvider client={client}>
+      <ExecutionBlockerNotice companyId="company" issueId="task" onRetried={onRetried} blocker={{
+        recoveryActionId: "repair", runId: "failed-run", agentId: "agent", cause: "legacy_execution_requires_reconciliation",
+        workspaceRepairRequired: true, canRetry: false, canContinue: false,
+        nextAction: "The original sandbox is retained. Recover the missing files and record workspace repair evidence.",
+      }} />
+    </QueryClientProvider>));
+    expect(container.textContent).toContain("could not restore the agent's workspace files");
+    expect(container.textContent).toContain("A board operator must recover the files");
+    // The hold also covers unsafe archives and local runs, so the notice must not promise retries or a kept sandbox.
+    expect(container.textContent).not.toContain("retrying");
+    expect(container.textContent).not.toContain("no work is lost");
+    expect(container.querySelector("details")?.textContent).toContain("Recover the missing files");
+    expect(container.querySelector("button")).toBeNull();
+    expect(container.querySelector("a")?.textContent).toBe("Inspect run");
+    expect(agentsApi.retryFailedRun).not.toHaveBeenCalled();
+  });
+
   it("retries the exact failed run and refreshes the task", async () => {
     vi.mocked(agentsApi.retryFailedRun).mockResolvedValue({} as never);
     await act(async () => container.querySelector<HTMLButtonElement>("button")!.click());

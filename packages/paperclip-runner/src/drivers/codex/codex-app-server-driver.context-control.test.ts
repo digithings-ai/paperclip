@@ -42,8 +42,43 @@ import {
   type PrpEvent,
   type PrpStructuredRunResult,
 } from "./codex-app-server-driver.test-support.js";
+import { rehydrateRunnerdItemNotification } from "../../live/runnerd-codex-transport.js";
 
 describe("Codex app-server Codex driver", () => {
+  it.each(["default", "disabled"] as const)("rejects unsupported reasoning %s without sending a turn RPC", async reasoningMode => {
+    const transport = new FakeCodexTransport();
+    const session = await makeDriver([transport]).openSession({
+      runId: "run-reasoning", normalizedSessionId: "normalized-reasoning", workingDirectory: WORKSPACE,
+    });
+    const message = { role: "user" as const, text: "Hi" };
+    await expect(session.startTurn({ message, reasoningMode })).rejects.toThrow("Per-turn reasoning is not supported");
+    expect(transport.calls.filter(call => call.method === "turn/start")).toHaveLength(0);
+    await session.startTurn({ message });
+    expect(transport.calls.filter(call => call.method === "turn/start")).toHaveLength(1);
+    await session.close({ reason: "fixture complete" });
+  });
+
+  it("retains one correlation-bound steering acknowledgement after the rehydrated runnerd echo", async () => {
+    const transport = new FakeCodexTransport("thread-root");
+    const session = await makeDriver([transport]).openSession({
+      runId: "run-steering-echo", normalizedSessionId: "normalized-steering-echo", workingDirectory: WORKSPACE,
+    });
+    const { turnId } = await session.startTurn({ message: { role: "user", text: "Start." } });
+    await session.steer?.({ turnId, message: { role: "user", text: "Stay concise." }, correlationId: "queued-comment-1" });
+    transport.push("item/completed", rehydrateRunnerdItemNotification({
+      provider: "acpx", providerTurnId: turnId, itemId: `acpx-control-${"a".repeat(64)}`,
+      kind: "steering_acknowledgement", mode: "steer", status: "acknowledged",
+      text: "Steering acknowledged for the active turn.",
+    }, "thread-root", turnId));
+    await new Promise(resolve => setTimeout(resolve, 0));
+    await session.close({ reason: "fixture complete" });
+    const events: PrpEvent[] = [];
+    for await (const event of session.events()) events.push(event);
+    expect(events.filter(event => event.eventType === "item.completed" && event.payload.kind === "steering_acknowledgement"))
+      .toEqual([expect.objectContaining({ turnId, itemId: `${turnId}:steer:queued-comment-1`,
+        payload: expect.objectContaining({ kind: "steering_acknowledgement", status: "acknowledged" }) })]);
+  });
+
   it("captures an exact skillless model/environment snapshot with credentials absent", async () => {
     const transport = new FakeCodexTransport();
     const session = await makeDriver([transport]).openSession({

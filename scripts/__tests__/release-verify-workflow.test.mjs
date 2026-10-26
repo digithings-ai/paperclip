@@ -1,9 +1,13 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
+import { createServer } from "node:http";
+import { canaryStartup } from "./canary-startup-fixture.mjs";
+import { canRetryPublishedTarball404, TARBALL_METADATA_TIMEOUT_MS } from "../../tests/canary-onboarding/start-published-canary.mjs";
 
 const repoRoot = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -14,6 +18,45 @@ const repoRoot = path.resolve(
 function readWorkflow(name) {
   return readFileSync(path.join(repoRoot, ".github/workflows", name), "utf8");
 }
+
+test("Docker Hub mirrors apply to both image builders without widening publication access", () => {
+  const dockerWorkflow = readWorkflow("docker.yml");
+  const releaseWorkflow = readWorkflow("release.yml");
+  const docker = dockerWorkflow.split("  build-and-push:\n")[1].split("\n  merge-and-push:")[0];
+  const preview = releaseWorkflow.split("  image_preview:\n")[1].split("\n  publish_image_preview:")[0];
+
+  for (const job of [docker, preview]) {
+    const steps = job.split(/\n(?=      - )/);
+    const builder = steps.find((step) => /uses: docker\/setup-buildx-action@/.test(step));
+    const build = steps.find((step) => /uses: docker\/build-push-action@/.test(step));
+    assert.ok(builder && build, "the mirror must configure the builder that runs the image build");
+    assert.ok(steps.indexOf(builder) < steps.indexOf(build));
+    const config = builder.match(/buildkitd-config-inline: \|\n((?: {12,}[^\n]*(?:\n|$))+)/)?.[1];
+    assert.ok(config, "configure the BuildKit container, not only the host Docker daemon");
+    assert.deepEqual([...config.matchAll(/^\s*\[registry\."([^"]+)"\]/gm)].map((match) => match[1]), ["docker.io"],
+      "GHCR publishing and cache traffic must not use the pull mirror");
+    const mirrors = config.match(/^\s*mirrors = (\[[^\n]+\])$/m)?.[1];
+    assert.ok(mirrors);
+    assert.deepEqual(JSON.parse(mirrors), ["mirror.gcr.io"]);
+    assert.doesNotMatch(config, /^\s*(?:http|insecure|ca|keypair)\s*=/m,
+      "keep verified HTTPS and anonymous public-image pulls");
+    assert.doesNotMatch(builder, /driver-opts:|buildkitd-flags:|secrets\./,
+      "do not change bootstrap images, entitlements, or credentials");
+  }
+
+  assert.match(docker, /platform: linux\/amd64/);
+  assert.match(docker, /platform: linux\/arm64/);
+  assert.match(docker, /permissions:\n\s+contents: read\n\s+packages: write/);
+  assert.match(docker, /outputs: type=image,name=ghcr\.io\/\$\{\{ github\.repository \}\},push-by-digest=true,name-canonical=true,push=true/);
+  assert.match(docker, /cache-to: type=registry,ref=ghcr\.io\/\$\{\{ github\.repository \}\}:buildcache-\$\{\{ matrix\.arch \}\},mode=max/);
+  assert.match(preview, /permissions:\n\s+contents: read\n\s+steps:/);
+  assert.match(preview, /platforms: linux\/amd64\n\s+push: false/);
+  assert.match(preview, /outputs: type=docker,dest=\$\{\{ runner\.temp \}\}\/preview-image\.tar/);
+  assert.doesNotMatch(preview, /docker\/login-action|secrets\.|packages: write|id-token: write/);
+  assert.match(releaseWorkflow, /publish_image_preview:\n[\s\S]*?needs: \[plan_preview, image_preview\]/);
+  assert.doesNotMatch(dockerWorkflow.split("  merge-and-push:\n")[1], /buildkitd-config-inline/,
+    "the registry-only manifest merge does not need a Docker Hub mirror");
+});
 
 test("chaos verification isolates callers that verify the same source commit", () => {
   const chaosWorkflow = readWorkflow("runner-chaos-evals.yml");
@@ -59,6 +102,131 @@ test("canary reuses exact-source proof while stable keeps full verification", ()
     releaseWorkflow,
     /verify_(?:canary|stable):[\s\S]*?pnpm test:run(?:\n|$)/,
   );
+});
+
+function canaryAttachmentScript() {
+  const publish = readWorkflow("release.yml").split("  publish_canary:\n")[1].split("  smoke_canary_onboarding:\n")[0];
+  const step = publish.split("      - name: Attach verified canary source to local master\n")[1]?.split("\n      - ")[0];
+  assert.ok(step, "the trusted publisher must attach its pinned checkout before releasing");
+  assert.match(step, /SOURCE_SHA: \$\{\{ github\.sha \}\}/);
+  const script = step.match(/run: \|\n((?: {10}[^\n]*\n)+)/)?.[1];
+  assert.ok(script, "missing inline canary branch attachment shell");
+  return script.replace(/^ {10}/gm, "");
+}
+
+function withCanaryGitFixture(check) {
+  const root = mkdtempSync(path.join(os.tmpdir(), "canary-publisher-git-"));
+  const cwd = path.join(root, "repository with spaces");
+  mkdirSync(cwd);
+  const git = (...args) => {
+    const result = spawnSync("git", args, { cwd, encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr);
+    return result.stdout.trim();
+  };
+  try {
+    git("init", "--initial-branch=master");
+    git("config", "user.name", "Release fixture");
+    git("config", "user.email", "release-fixture@example.invalid");
+    git("config", "commit.gpgsign", "false");
+    git("config", "core.hooksPath", "/dev/null");
+    writeFileSync(path.join(cwd, "source.txt"), "pinned source\n");
+    git("add", "source.txt");
+    git("commit", "-m", "Create pinned source");
+    const pinned = git("rev-parse", "HEAD");
+    writeFileSync(path.join(cwd, "source.txt"), "newer master source\n");
+    git("commit", "-am", "Advance master");
+    const newer = git("rev-parse", "HEAD");
+    git("update-ref", "refs/remotes/origin/master", newer);
+    git("checkout", "--detach", pinned);
+    const env = {
+      ...process.env, REPO_ROOT: cwd, SOURCE_SHA: pinned,
+      GITHUB_ACTIONS: "true", GITHUB_REPOSITORY: "paperclipai/paperclip",
+      GITHUB_EVENT_NAME: "push", GITHUB_REF: "refs/heads/master",
+    };
+    const attach = (overrides = {}) => spawnSync("bash", ["--noprofile", "--norc", "-c", canaryAttachmentScript()], {
+      cwd, env: { ...env, ...overrides }, encoding: "utf8", timeout: 5_000,
+    });
+    // Run the original release guard without running release.sh, npm, or a publisher.
+    const guard = () => spawnSync("bash", ["-c", 'source "$1"; require_on_master_branch', "guard", path.join(repoRoot, "scripts/release-lib.sh")], {
+      cwd, env, encoding: "utf8", timeout: 5_000,
+    });
+    check({ cwd, git, pinned, newer, attach, guard });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+test("canary publisher attaches the exact source while local and remote master are newer", () => {
+  withCanaryGitFixture(({ cwd, git, pinned, newer, attach, guard }) => {
+    assert.equal(guard().status, 1, "the unchanged release guard must reject detached HEAD even in Actions");
+    assert.equal(git("rev-parse", "master"), newer);
+    const result = attach();
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(git("symbolic-ref", "--short", "HEAD"), "master");
+    assert.equal(git("rev-parse", "HEAD"), pinned);
+    assert.equal(git("rev-parse", "master"), pinned);
+    assert.equal(git("rev-parse", "origin/master"), newer, "do not fetch or follow floating remote master");
+    assert.equal(readFileSync(path.join(cwd, "source.txt"), "utf8"), "pinned source\n");
+    assert.equal(git("status", "--porcelain"), "");
+    assert.equal(guard().status, 0, "the real release guard must accept the pinned local master");
+  });
+});
+
+for (const [name, overrides] of [
+  ["fork repository", { GITHUB_REPOSITORY: "example/paperclip" }],
+  ["manual dispatch", { GITHUB_EVENT_NAME: "workflow_dispatch" }],
+  ["scheduled release", { GITHUB_EVENT_NAME: "schedule" }],
+  ["non-master push", { GITHUB_REF: "refs/heads/topic" }],
+  ["tag push", { GITHUB_REF: "refs/tags/canary/v1" }],
+  ["missing source SHA", { SOURCE_SHA: "" }],
+  ["abbreviated source SHA", { SOURCE_SHA: "a".repeat(12) }],
+  ["malformed source SHA", { SOURCE_SHA: "z".repeat(40) }],
+]) {
+  test(`canary publisher rejects ${name} before changing any Git reference`, () => {
+    withCanaryGitFixture(({ git, pinned, attach, guard }) => {
+      const refs = git("show-ref");
+      const result = attach(overrides);
+      assert.equal(result.status, 1, result.stderr);
+      assert.equal(git("show-ref"), refs);
+      assert.equal(git("rev-parse", "HEAD"), pinned);
+      assert.equal(guard().status, 1, "the rejected checkout must remain detached");
+    });
+  });
+}
+
+test("canary publisher rejects a different valid source SHA before changing Git references", () => {
+  withCanaryGitFixture(({ git, pinned, newer, attach, guard }) => {
+    const refs = git("show-ref");
+    const result = attach({ SOURCE_SHA: newer });
+    assert.equal(result.status, 1, result.stderr);
+    assert.equal(git("show-ref"), refs);
+    assert.equal(git("rev-parse", "HEAD"), pinned);
+    assert.equal(guard().status, 1);
+  });
+});
+
+test("the original canary release guard still rejects a non-master local branch in Actions", () => {
+  withCanaryGitFixture(({ git, pinned, guard }) => {
+    git("checkout", "-b", "topic", pinned);
+    const refs = git("show-ref");
+    assert.equal(guard().status, 1);
+    assert.equal(git("symbolic-ref", "--short", "HEAD"), "topic");
+    assert.equal(git("show-ref"), refs);
+  });
+});
+
+test("canary branch attachment keeps exact-source checkout and artifact order in its publishing lane", () => {
+  const workflow = readWorkflow("release.yml");
+  const publish = workflow.split("  publish_canary:\n")[1].split("  smoke_canary_onboarding:\n")[0];
+  assert.equal(workflow.split("name: Attach verified canary source to local master").length, 2);
+  assert.match(publish, /ref: \$\{\{ github\.sha \}\}/);
+  assert.match(publish, /name: canary-smoke-lockfile-\$\{\{ github\.sha \}\}/);
+  const steps = ["Checkout repository", "Attach verified canary source to local master", "Install dependencies", "Save canary smoke lockfile", "Restore tracked install-time changes", "Publish canary"];
+  for (let i = 1; i < steps.length; i++) {
+    assert.ok(publish.indexOf(`name: ${steps[i - 1]}`) < publish.indexOf(`name: ${steps[i]}`));
+  }
+  assert.match(publish, /run: \.\/scripts\/release\.sh canary --skip-verify/);
+  assert.doesNotMatch(canaryAttachmentScript(), /git fetch|git pull|checkout (?:master|origin\/master)(?:\s|$)/);
 });
 
 test("source proof requires every source check and does not wait on image publication", () => {
@@ -170,6 +338,99 @@ test("published canaries are gated by the exact-version onboarding browser smoke
   assert.match(releaseWorkflow, /tests\/canary-onboarding\/playwright-report/);
 });
 
+test("canary smoke consumes its publisher's source-bound lockfile before frozen installation", () => {
+  const workflow = readWorkflow("release.yml");
+  const publish = workflow.split("  publish_canary:\n")[1].split("  smoke_canary_onboarding:\n")[0];
+  const smoke = workflow.split("  smoke_canary_onboarding:\n")[1].split("  # ----- Nightly lane")[0];
+  for (const job of [publish, smoke]) {
+    assert.match(job, /name: Checkout repository\n\s+uses: actions\/checkout@[^\n]+\n\s+with:\n\s+ref: \$\{\{ github\.sha \}\}/);
+    assert.match(job, /name: canary-smoke-lockfile-\$\{\{ github\.sha \}\}/);
+    assert.match(job, /version: 9\.15\.4/);
+  }
+  assert.match(publish, /name: Save canary smoke lockfile\n\s+uses: actions\/upload-artifact@[0-9a-f]{40} # v4\n\s+with:\n\s+name: canary-smoke-lockfile-\$\{\{ github\.sha \}\}\n\s+path: pnpm-lock\.yaml\n\s+if-no-files-found: error\n\s+overwrite: true\n\s+retention-days: 14/);
+  assert.ok(publish.indexOf("name: Install dependencies") < publish.indexOf("name: Save canary smoke lockfile"));
+  assert.ok(publish.indexOf("name: Save canary smoke lockfile") < publish.indexOf("name: Restore tracked install-time changes"));
+  assert.ok(publish.indexOf("name: Restore tracked install-time changes") < publish.indexOf("name: Publish canary"));
+  assert.match(smoke, /name: Restore canary smoke lockfile\n\s+uses: actions\/download-artifact@[0-9a-f]{40} # v4\n\s+with:\n\s+name: canary-smoke-lockfile-\$\{\{ github\.sha \}\}/);
+  assert.ok(smoke.indexOf("name: Restore canary smoke lockfile") < smoke.indexOf("name: Install test dependencies"));
+  assert.doesNotMatch(smoke, /run-id:|github-token:|repository:|continue-on-error|--no-frozen-lockfile/);
+});
+
+for (const drift of ["patch", "manifest"]) {
+  test(`a publisher lockfile lets a fresh smoke install retain validation after ${drift} drift`, (t) => {
+    const root = mkdtempSync(path.join(os.tmpdir(), "canary-smoke-lockfile-test-"));
+    t.after(() => rmSync(root, { recursive: true, force: true }));
+    const source = path.join(root, "package");
+    mkdirSync(source);
+    writeFileSync(path.join(source, "package.json"), JSON.stringify({ name: "smoke-fixture-dependency", version: "1.0.0" }));
+    writeFileSync(path.join(source, "index.js"), 'module.exports = "original";\n');
+    const pack = spawnSync("npm", ["pack", "--ignore-scripts", "--pack-destination", root], { cwd: source, encoding: "utf8" });
+    assert.equal(pack.status, 0, pack.stderr);
+    const manifest = {
+      name: "canary-smoke-fixture", private: true,
+      packageManager: "pnpm@9.15.4",
+      dependencies: { "smoke-fixture-dependency": "file:smoke-fixture-dependency-1.0.0.tgz" },
+      pnpm: { patchedDependencies: { "smoke-fixture-dependency@1.0.0": "fixture.patch" } },
+    };
+    writeFileSync(path.join(root, "package.json"), JSON.stringify(manifest));
+    writeFileSync(path.join(root, "pnpm-workspace.yaml"), "packages: []\n");
+    const patch = (value) => writeFileSync(path.join(root, "fixture.patch"), [
+      "diff --git a/index.js b/index.js", "index 1111111..2222222 100644",
+      "--- a/index.js", "+++ b/index.js", "@@ -1 +1 @@",
+      '-module.exports = "original";', `+module.exports = "${value}";`, "",
+    ].join("\n"));
+    const workflow = readWorkflow("release.yml");
+    const publish = workflow.split("  publish_canary:\n")[1].split("  smoke_canary_onboarding:\n")[0];
+    const smoke = workflow.split("  smoke_canary_onboarding:\n")[1].split("  # ----- Nightly lane")[0];
+    const installArgs = (name) => {
+      const job = name === "Install dependencies" ? publish : smoke;
+      const command = job.match(new RegExp(`name: ${name}\\n\\s+run: (pnpm install[^\\n]+)`))?.[1];
+      assert.ok(command, `missing ${name}`);
+      return [...command.split(" ").slice(1), "--offline", "--ignore-scripts"];
+    };
+    const install = (args) => spawnSync("pnpm", args, {
+      cwd: root, encoding: "utf8", env: { ...process.env, CI: "true" },
+    });
+    const success = (result) => assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+    patch(drift === "patch" ? "old-patch" : "published-patch");
+    success(install(installArgs("Install dependencies")));
+    const staleLock = readFileSync(path.join(root, "pnpm-lock.yaml"));
+    if (drift === "patch") {
+      patch("published-patch");
+    } else {
+      copyFileSync(path.join(root, "smoke-fixture-dependency-1.0.0.tgz"), path.join(root, "updated-dependency.tgz"));
+      manifest.dependencies["smoke-fixture-dependency"] = "file:updated-dependency.tgz";
+      writeFileSync(path.join(root, "package.json"), JSON.stringify(manifest));
+    }
+    const before = install(installArgs("Install test dependencies"));
+    assert.notEqual(before.status, 0);
+    assert.match(before.stdout + before.stderr, drift === "patch" ? /ERR_PNPM_LOCKFILE_CONFIG_MISMATCH/ : /ERR_PNPM_OUTDATED_LOCKFILE/);
+
+    // Capture the publisher's resolution, then reproduce its tracked-file restore
+    // and a fresh smoke runner with no installed workspace dependencies.
+    success(install(installArgs("Install dependencies")));
+    const artifact = path.join(root, "publisher-lock.yaml");
+    if (publish.includes("name: Save canary smoke lockfile")) {
+      copyFileSync(path.join(root, "pnpm-lock.yaml"), artifact);
+    }
+    writeFileSync(path.join(root, "pnpm-lock.yaml"), staleLock);
+    rmSync(path.join(root, "node_modules"), { recursive: true, force: true });
+    if (smoke.includes("name: Restore canary smoke lockfile")) {
+      copyFileSync(artifact, path.join(root, "pnpm-lock.yaml"));
+    }
+    success(install(installArgs("Install test dependencies")));
+    assert.equal(readFileSync(path.join(root, "node_modules/smoke-fixture-dependency/index.js"), "utf8"), 'module.exports = "published-patch";\n');
+    assert.deepEqual(readFileSync(path.join(root, "pnpm-lock.yaml")), readFileSync(artifact));
+
+    // A lockfile from the wrong source still fails closed; restoring an artifact
+    // must not disable hash validation or resolve another version in the smoke job.
+    patch("different-source");
+    const wrongSource = install(installArgs("Install test dependencies"));
+    assert.notEqual(wrongSource.status, 0);
+    assert.match(wrongSource.stdout + wrongSource.stderr, /ERR_PNPM_LOCKFILE_CONFIG_MISMATCH/);
+  });
+}
+
 test("every lane's tag push degrades to recovery instructions when rejected", () => {
   const releaseWorkflow = readWorkflow("release.yml");
 
@@ -244,10 +505,10 @@ test("release verify workflow covers the same split test surface as stable PR ve
   assert.match(buildJob, /persist-credentials: false/);
   assert.doesNotMatch(buildJob, /cache: pnpm/);
 
-  for (const group of ["general-server-without-chat", "general-chat", "general-workspaces-a", "general-workspaces-b"]) {
+  for (const group of ["general-server-without-chat-or-native-runner", "general-chat", "general-workspaces-a", "general-workspaces-b", "general-workspaces-c"]) {
     assert.match(verifyWorkflow, new RegExp(`group: ${group}`));
   }
-  for (const [group, count] of [["general-server-without-chat", 10], ["general-chat", 3]]) {
+  for (const [group, count] of [["general-server-without-chat-or-native-runner", 10], ["general-chat", 3]]) {
     const rows = [...verifyWorkflow.matchAll(new RegExp(`group: ${group}\\n\\s+group_label: [^\\n]+\\n\\s+shard_index: (\\d+)\\n\\s+shard_count: (\\d+)`, "g"))];
     assert.deepEqual(rows.map((row) => [Number(row[1]), Number(row[2])]),
       Array.from({ length: count }, (_, index) => [index, count]));
@@ -269,6 +530,30 @@ test("release verify workflow covers the same split test surface as stable PR ve
 
   assert.match(verifyWorkflow, /pnpm test:run:general -- --group/);
   assert.match(verifyWorkflow, /pnpm test:run:serialized -- --shard-index/);
+});
+
+test("release verification builds native test binaries in a required Rust-cached lane", () => {
+  const workflow = readWorkflow("release-verify.yml");
+  const runnerJob = workflow.match(/  verify_paperclip_runner:\n[\s\S]*?(?=\n  [A-Za-z0-9_-]+:|$)/)?.[0] ?? "";
+  assert.equal((runnerJob.match(/- lane: server-integration/g) ?? []).length, 1);
+  assert.doesNotMatch(runnerJob, /continue-on-error/);
+  assert.match(runnerJob, /timeout-minutes: 20/);
+  assert.match(runnerJob, /shared-key: release-runner-v2/);
+  assert.match(runnerJob, /cache-workspace-crates: false/);
+  assert.match(runnerJob, /cache-bin: false/);
+  assert.match(runnerJob, /save-if: \$\{\{ matrix\.lane == 'rust'/);
+  assert.match(runnerJob, /Build native server test binaries\n\s+if: \$\{\{ matrix\.lane == 'server-integration' \}\}\n\s+timeout-minutes: 10/);
+  assert.match(runnerJob, /pnpm build:rust\n\s+cargo build --release --manifest-path runner\/Cargo\.toml --locked -p paperclip-runner-core --bin paperclip-runnerd --bin fake-codex-app-server/);
+  assert.match(runnerJob, /Run native server integration suites\n\s+if: \$\{\{ matrix\.lane == 'server-integration' \}\}\n\s+run: pnpm test:run:general -- --group general-server-native-runner/);
+  assert.ok(runnerJob.indexOf("Cache Runner Rust dependencies") < runnerJob.indexOf("Build native server test binaries"));
+  assert.ok(runnerJob.indexOf("Build native server test binaries") < runnerJob.indexOf("Run native server integration suites"));
+
+  // The reusable workflow result includes every matrix child. Its caller must
+  // await that result without an override that can certify a failed native lane.
+  const cloud = readWorkflow("cloud-readiness.yml");
+  assert.match(cloud, /verify:[\s\S]*?uses: \.\/\.github\/workflows\/release-verify\.yml/);
+  assert.match(cloud, /source_verified:[\s\S]*?needs: \[verify\]/);
+  assert.doesNotMatch(cloud, /continue-on-error|always\(\)/);
 });
 
 test("Runner eval workflows pin actions and gate paid live execution", () => {
@@ -455,4 +740,419 @@ test("direct protocol concurrency override only lowers the configured ceiling", 
     assert.equal(result.status, expected === null ? 1 : 0, requested);
     if (expected !== null) assert.equal(result.stdout, expected);
   }
+});
+
+
+
+test("canary startup refreshes an incomplete dependency publication, then onboards once", async () => {
+  const result = await canaryStartup({ mode: "recover" });
+  assert.equal(result.code, 0, result.output);
+  const installs = result.calls.filter(call => call.kind === "npm");
+  const onboarding = result.calls.filter(call => call.kind === "onboard");
+  assert.equal(installs.length, 2);
+  assert.equal(onboarding.length, 1);
+  for (const call of installs) {
+    assert.equal(call.args[0], "install");
+    assert.ok(call.args.includes("paperclipai@2026.1009.0-canary.1"));
+    assert.ok(call.args.includes("--no-package-lock"));
+    assert.ok(call.args.includes("--no-save"));
+  }
+  assert.ok(!installs[0].args.includes("--prefer-online"));
+  assert.ok(installs[1].args.includes("--prefer-online"));
+  assert.notEqual(installs[0].args[2], installs[1].args[2]);
+  assert.equal(installs[0].cache, installs[1].cache);
+  assert.deepEqual(onboarding[0].args.slice(0, 3), ["onboard", "--yes", "--data-dir"]);
+});
+
+test("permanent missing versions stop after three attempts without onboarding", async () => {
+  const result = await canaryStartup({ mode: "permanent" });
+  assert.equal(result.code, 1);
+  assert.equal(result.calls.filter(call => call.kind === "npm").length, 3);
+  assert.equal(result.calls.filter(call => call.kind === "onboard").length, 0);
+  assert.match(result.output, /installation failed.*onboarding was not started/);
+});
+
+test("npm failures other than ETARGET fail immediately without onboarding", async () => {
+  const result = await canaryStartup({ mode: "auth" });
+  assert.equal(result.code, 1);
+  assert.equal(result.calls.length, 1);
+  assert.match(result.output, /E401/);
+});
+
+test("onboarding failures are never retried, even when they mention ETARGET", async () => {
+  const result = await canaryStartup({ mode: "success", onboard: "fail" });
+  assert.equal(result.code, 1);
+  assert.equal(result.calls.filter(call => call.kind === "npm").length, 1);
+  assert.equal(result.calls.filter(call => call.kind === "onboard").length, 1);
+  assert.match(result.output, /onboarding failed \(exit 17\)/);
+});
+
+test("a hanging npm install is stopped within the shared acquisition budget", async () => {
+  const result = await canaryStartup({ mode: "hang", budget: 1000 });
+  assert.equal(result.code, 1);
+  assert.equal(result.calls.filter(call => call.kind === "npm").length, 1);
+  assert.equal(result.calls.filter(call => call.kind === "onboard").length, 0);
+  assert.ok(result.elapsed < 4000, `install exceeded bounded cancellation: ${result.elapsed}ms`);
+  assert.match(result.output, /exceeded its startup budget/);
+});
+
+test("backoff consumes the shared budget and does not begin another install after expiry", async () => {
+  const result = await canaryStartup({ mode: "permanent", budget: 1000, delay: 5000 });
+  assert.equal(result.code, 1);
+  assert.equal(result.calls.length, 1);
+  assert.match(result.output, /exceeded its startup budget/);
+});
+
+
+test("Playwright cancellation stops an onboarding process without replay", async () => {
+  const result = await canaryStartup({ mode: "success", onboard: "hang", cancelAtKind: "onboard" });
+  assert.equal(result.code, 1);
+  assert.equal(result.calls.filter(call => call.kind === "npm").length, 1);
+  const onboarding = result.calls.filter(call => call.kind === "onboard");
+  assert.equal(onboarding.length, 1);
+  assert.throws(() => process.kill(onboarding[0].pid, 0), {code:"ESRCH"});
+  assert.match(result.output, /stopped by SIGTERM/);
+  assert.ok(result.elapsed < 2500, `onboarding cancellation took ${result.elapsed}ms`);
+});
+
+test("canary install retries retain the existing overall Playwright startup deadline", async () => {
+  const { INSTALL_BUDGET_MS } = await import("../../tests/canary-onboarding/start-published-canary.mjs");
+  const config = readFileSync(path.join(repoRoot, "tests/canary-onboarding/playwright.config.ts"), "utf8");
+  assert.equal(INSTALL_BUDGET_MS, 120_000);
+  assert.match(config, /timeout: 300_000/);
+  assert.match(config, /start-published-canary\.mjs/);
+  assert.match(config, /reuseExistingServer: false/);
+});
+
+
+test("nested ETARGET output does not retry a final authentication or network failure", async () => {
+  for (const mode of ["mixed", "network"]) {
+    const result = await canaryStartup({ mode });
+    assert.equal(result.code, 1);
+    assert.equal(result.calls.length, 1);
+  }
+});
+
+const exactCanary = "2026.1009.0-canary.1";
+const canaryTarball = `https://registry.npmjs.org/@paperclipai/server/-/server-${exactCanary}.tgz`;
+const tarballFailure = (url = canaryTarball, prefix = "npm error") => `${prefix} code E404\n${prefix} 404 Not Found - GET ${url} - Not found\n${prefix} 404\n${prefix} 404  The requested resource '@paperclipai/server@${url}' could not be found or you do not have permission to access it.\n`;
+
+function tarballProof({ config = {}, manifest = {}, status = 200, redirected = false, responseUrl, rawBody } = {}) {
+  const calls = [];
+  const dist = { tarball: canaryTarball, integrity: `sha512-${Buffer.alloc(64).toString("base64")}`, ...manifest.dist };
+  const data = { name: "@paperclipai/server", version: exactCanary, ...manifest, dist };
+  return { calls, options: {
+    signal: new AbortController().signal, prefix: "/fixture/install", env: {},
+    runConfig: async (command, args, options) => {
+      calls.push({ kind: "config", command, args, options });
+      return { code: 0, stdout: "registry=https://registry.npmjs.org/\n@paperclipai:registry=undefined\n", ...config };
+    },
+    fetchMetadata: async (url, options) => {
+      calls.push({ kind: "metadata", url, options });
+      return { status, redirected, url: responseUrl ?? url, body: new Response(rawBody ?? JSON.stringify(data)).body };
+    },
+  } };
+}
+
+test("exact published tarball proof uses quiet effective config and fresh public metadata without credentials", async () => {
+  for (const prefix of ["npm error", "npm ERR!"]) {
+    const fixture = tarballProof();
+    assert.equal(await canRetryPublishedTarball404(tarballFailure(canaryTarball, prefix), exactCanary, fixture.options), true);
+    const [config, metadata] = fixture.calls;
+    assert.deepEqual(config.args, ["config", "get", "registry", "@paperclipai:registry", "--prefix", "/fixture/install"]);
+    assert.equal(config.options.env, fixture.options.env);
+    assert.equal(config.options.quiet, true);
+    assert.equal(config.options.captureStdout, true);
+    assert.equal(config.options.captureStderr, true);
+    assert.equal(config.options.outputLimit, 4096);
+    assert.equal(metadata.url, `https://registry.npmjs.org/%40paperclipai%2Fserver/${exactCanary}`);
+    assert.equal(metadata.options.signal, config.options.signal);
+    assert.equal(metadata.options.redirect, "error");
+    assert.equal(metadata.options.credentials, "omit");
+    assert.deepEqual(metadata.options.headers, { accept: "application/json", "cache-control": "no-cache" });
+  }
+});
+
+test("mixed npm errors and noncanonical or unreleased tarballs never read config or metadata", async () => {
+  const errors = [
+    "npm error code ETARGET\n", "npm error code E401\n", "npm error code ECONNRESET\n",
+    `${tarballFailure()}npm error code E401\n`, `${tarballFailure()}npm error code 1\n`,
+    `npm error code ENEEDAUTH\n${tarballFailure()}`, `${tarballFailure()}${tarballFailure()}`,
+    `${tarballFailure()}npm error 404 Not Found - GET https://registry.example.invalid/a.tgz - Not found\n`,
+    `${tarballFailure()}npm error 404 The requested resource 'other@${canaryTarball}' could not be found\n`,
+    tarballFailure().replace(" - GET ", " - PUT "),
+    ...[
+      canaryTarball + "?token=fixture", canaryTarball + "#fragment", canaryTarball.replace("npmjs.org/", "npmjs.org:443/"),
+      canaryTarball.replace("npmjs.org/", "npmjs.org.example.invalid/"), canaryTarball.replace("npmjs.org/", "fixture@npmjs.org/"),
+      canaryTarball.replace("https:", "http:"), canaryTarball.replace("@paperclipai/server", "%40paperclipai%2Fserver"),
+      canaryTarball.replace("@paperclipai/server", "@paperclipai/../server"), canaryTarball.replace(exactCanary, "2026.1009.0-canary.2"),
+      "https://registry.npmjs.org/@paperclipai/not-released/-/not-released-2026.1009.0-canary.1.tgz",
+      "https://registry.npmjs.org/@paperclipai/plugin-createos/-/plugin-createos-2026.1009.0-canary.1.tgz",
+      "https://registry.npmjs.org/%40paperclipai%2Fserver/2026.1009.0-canary.1",
+    ].map((url) => tarballFailure(url)),
+  ];
+  for (const error of errors) {
+    const fixture = tarballProof();
+    assert.equal(await canRetryPublishedTarball404(error, exactCanary, fixture.options), false, error);
+    assert.deepEqual(fixture.calls, [], error);
+  }
+  for (const version of ["2026.1009.0", "2026.1009.0-nightly.1", "2026.1009.0-beta.1", "2026.1009.0-canary.1+build"]) {
+    const fixture = tarballProof();
+    assert.equal(await canRetryPublishedTarball404(tarballFailure(canaryTarball.replace(exactCanary, version)), version, fixture.options), false);
+    assert.deepEqual(fixture.calls, []);
+  }
+});
+
+test("effective registry authority respects scope precedence and rejects unknown or private config", async () => {
+  const configs = [
+    [{ stdout: "registry=https://registry.example.invalid/\n@paperclipai:registry=https://registry.npmjs.org/\n" }, true],
+    [{ stdout: "registry=undefined\n@paperclipai:registry=https://registry.npmjs.org/\n" }, true],
+    [{ stdout: "registry=https://registry.npmjs.org/\n@paperclipai:registry=https://registry.example.invalid/\n" }, false],
+    [{ stdout: "registry=https://registry.example.invalid/\n@paperclipai:registry=undefined\n" }, false],
+    [{ stdout: "registry=undefined\n@paperclipai:registry=undefined\n" }, false],
+    [{ stdout: "registry=https://registry.npmjs.org/\n@paperclipai:registry=\n" }, false],
+    [{ stdout: "registry=https://fixture:secret@registry.npmjs.org/\n@paperclipai:registry=undefined\n" }, false],
+    [{ stdout: "unexpected output\n" }, false], [{ code: 1 }, false], [{ signal: "SIGTERM" }, false], [{ outputTruncated: true }, false],
+  ];
+  for (const [config, expected] of configs) {
+    const fixture = tarballProof({ config });
+    assert.equal(await canRetryPublishedTarball404(tarballFailure(), exactCanary, fixture.options), expected);
+    assert.equal(fixture.calls.filter((call) => call.kind === "metadata").length, expected ? 1 : 0);
+  }
+});
+
+test("metadata must identify the exact published artifact with valid SHA512 syntax, not merely exist", async () => {
+  const fixtures = [
+    { status: 404 }, { status: 401 }, { status: 403 }, { status: 302 }, { redirected: true },
+    { responseUrl: "https://registry.example.invalid/metadata" }, { rawBody: "not json" },
+    { manifest: { name: "@paperclipai/shared" } }, { manifest: { version: "2026.1009.0-canary.2" } },
+    { manifest: { dist: { tarball: canaryTarball + "?query=1" } } },
+    ...[undefined, "", "sha512-A===", `sha256-${Buffer.alloc(32).toString("base64")}`, `sha512-${Buffer.alloc(64).toString("base64")} extra`]
+      .map((integrity) => ({ manifest: { dist: { integrity } } })),
+    { rawBody: JSON.stringify({ padding: "x".repeat(65 * 1024) }) },
+  ];
+  for (const input of fixtures) {
+    const fixture = tarballProof(input);
+    assert.equal(await canRetryPublishedTarball404(tarballFailure(), exactCanary, fixture.options), false, JSON.stringify(input).slice(0, 200));
+  }
+});
+
+test("rejected and oversized native response bodies cancel without waiting for slow or rejected cleanup", async () => {
+  for (const [status, pending] of [[200, true], [200, false], [404, true], [404, false]]) {
+    let cancelled = false;
+    const fixture = tarballProof();
+    fixture.options.fetchMetadata = async (url) => ({ status, redirected: false, url, body: new Response(new ReadableStream({
+      start(controller) { controller.enqueue(new Uint8Array(65 * 1024)); },
+      cancel() { cancelled = true; return pending ? new Promise(() => {}) : Promise.reject(new Error("fixture rejected cancellation")); },
+    })).body });
+    const started = Date.now();
+    assert.equal(await canRetryPublishedTarball404(tarballFailure(), exactCanary, fixture.options), false);
+    assert.equal(cancelled, true);
+    assert.ok(Date.now() - started < 1000, "cancellation acknowledgement must not extend a rejection");
+  }
+});
+
+test("aborting a stalled metadata read cancels its reader without waiting for acknowledgement", { timeout: 2000 }, async () => {
+  let cancelled = false;
+  const fixture = tarballProof();
+  fixture.options.fetchMetadata = async (url) => ({ status: 200, redirected: false, url,
+    body: new Response(new ReadableStream({
+      cancel() { cancelled = true; return new Promise(() => {}); },
+    })).body });
+  const budget = new AbortController();
+  const timer = setTimeout(() => budget.abort(new Error("fixture body budget expired")), 100);
+  const started = Date.now();
+  try {
+    await assert.rejects(canRetryPublishedTarball404(tarballFailure(), exactCanary, {
+      ...fixture.options, signal: budget.signal,
+    }), /fixture body budget expired/);
+    assert.equal(cancelled, true);
+    assert.ok(Date.now() - started < 1000);
+  } finally { clearTimeout(timer); }
+});
+
+test("metadata headers cannot outlive the budget and late response bodies are cancelled", { timeout: 2000 }, async () => {
+  let headersArrive;
+  let cancelled = false;
+  const fixture = tarballProof();
+  fixture.options.fetchMetadata = (url) => new Promise((resolve) => {
+    headersArrive = () => resolve({ status: 200, redirected: false, url,
+      body: new Response(new ReadableStream({ cancel() { cancelled = true; } })).body });
+  });
+  const budget = new AbortController();
+  const timer = setTimeout(() => budget.abort(new Error("fixture headers budget expired")), 100);
+  const started = Date.now();
+  try {
+    await assert.rejects(canRetryPublishedTarball404(tarballFailure(), exactCanary, {
+      ...fixture.options, signal: budget.signal,
+    }), /fixture headers budget expired/);
+    assert.ok(Date.now() - started < 1000);
+    headersArrive();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(cancelled, true);
+  } finally { clearTimeout(timer); }
+});
+
+test("real npm effective registry reads isolated prefix, user, and environment configuration", async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "canary-config-proof-"));
+  mkdirSync(path.join(root, "prefix"));
+  writeFileSync(path.join(root, "global.npmrc"), "");
+  const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.toLowerCase().startsWith("npm_config_")));
+  env.npm_config_userconfig = path.join(root, "user.npmrc");
+  env.npm_config_globalconfig = path.join(root, "global.npmrc");
+  try {
+    for (const [user, project, override, expected] of [
+      ["registry=https://registry.npmjs.org/\n", "", undefined, true],
+      ["registry=https://registry.example.invalid/\n", "@paperclipai:registry=https://registry.npmjs.org/\n", undefined, true],
+      ["registry=https://registry.npmjs.org/\n", "@paperclipai:registry=https://registry.example.invalid/\n", undefined, false],
+      ["registry=https://registry.npmjs.org/\n", "", "https://registry.example.invalid/", false],
+    ]) {
+      writeFileSync(path.join(root, "user.npmrc"), user);
+      writeFileSync(path.join(root, "prefix", ".npmrc"), project);
+      const fixture = tarballProof();
+      delete fixture.options.runConfig;
+      assert.equal(await canRetryPublishedTarball404(tarballFailure(), exactCanary, {
+        ...fixture.options, prefix: path.join(root, "prefix"), env: { ...env, ...(override ? { npm_config_registry: override } : {}) },
+      }), expected);
+      assert.equal(fixture.calls.length, expected ? 1 : 0);
+    }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+async function stalledMetadata(run) {
+  let closed = false;
+  let closing = false;
+  let observeClose;
+  const connectionClosed = new Promise((resolve) => { observeClose = resolve; });
+  const server = createServer((_request, response) => {
+    response.on("close", () => { closed = true; observeClose(); });
+    response.writeHead(200, { "content-type": "application/json" });
+    response.write('{"name":');
+  });
+  // An HTTP client can replace an aborted pooled connection while shutdown
+  // starts. Own late connections too, so server.close cannot wait on them.
+  server.on("connection", (socket) => { if (closing) socket.destroy(); });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const fixture = tarballProof();
+  fixture.options.fetchMetadata = async (url, options) => {
+    const response = await fetch(`http://127.0.0.1:${server.address().port}/metadata`, options);
+    Object.defineProperty(response, "url", { value: url });
+    return response;
+  };
+  let closeDeadline;
+  try {
+    await run(fixture.options);
+    await Promise.race([connectionClosed, new Promise((_, reject) => {
+      closeDeadline = setTimeout(() => reject(new Error("metadata connection outlived cancellation")), 1000);
+    })]);
+    assert.equal(closed, true, "metadata connection must close before fixture-forced cleanup");
+  }
+  finally {
+    clearTimeout(closeDeadline);
+    closing = true;
+    await new Promise((resolve) => {
+      server.close(resolve);
+      server.closeAllConnections();
+    });
+  }
+}
+
+test("shared acquisition cancellation aborts the metadata body before the lookup deadline", async () => {
+  await stalledMetadata(async (options) => {
+    const budget = new AbortController();
+    const timer = setTimeout(() => budget.abort(new Error("fixture shared budget expired")), 250);
+    try {
+      await assert.rejects(canRetryPublishedTarball404(tarballFailure(), exactCanary, { ...options, signal: budget.signal }), /fixture shared budget expired/);
+    } finally { clearTimeout(timer); }
+  });
+});
+
+test("the short config and metadata deadline also covers a stalled real HTTP body", { timeout: 10_000 }, async () => {
+  assert.equal(TARBALL_METADATA_TIMEOUT_MS, 5000);
+  const started = Date.now();
+  await stalledMetadata(async (options) => {
+    assert.equal(await canRetryPublishedTarball404(tarballFailure(), exactCanary, options), false);
+  });
+  assert.ok(Date.now() - started < 7000, "metadata must not consume the 120s acquisition budget");
+});
+
+test("a verified canary tarball404 retries acquisition and runs onboarding once", async () => {
+  const result = await canaryStartup({ mode: "tarball-recover" });
+  assert.equal(result.code, 0, result.output);
+  assert.equal(result.calls.filter((call) => call.kind === "npm").length, 2);
+  assert.equal(result.calls.filter((call) => call.kind === "config").length, 1);
+  assert.equal(result.calls.filter((call) => call.kind === "metadata").length, 1);
+  assert.equal(result.calls.filter((call) => call.kind === "onboard").length, 1);
+  assert.doesNotMatch(result.output, /fixture config diagnostic/);
+});
+
+test("persistent promised tarball404s stop at three installs without a final lookup or onboarding", async () => {
+  const result = await canaryStartup({ mode: "tarball-permanent" });
+  assert.equal(result.code, 1);
+  assert.equal(result.calls.filter((call) => call.kind === "npm").length, 3);
+  assert.equal(result.calls.filter((call) => call.kind === "config").length, 2);
+  assert.equal(result.calls.filter((call) => call.kind === "metadata").length, 2);
+  assert.equal(result.calls.filter((call) => call.kind === "onboard").length, 0);
+  assert.match(result.output, /installation failed.*onboarding was not started/);
+});
+
+test("private or oversized config and unpublished metadata404 fail without retry or leaking config", async () => {
+  for (const input of [{ config: "private" }, { config: "large" }, { metadata: "missing" }]) {
+    const result = await canaryStartup({ mode: "tarball-permanent", ...input });
+    assert.equal(result.code, 1);
+    assert.equal(result.calls.filter((call) => call.kind === "npm").length, 1);
+    assert.equal(result.calls.filter((call) => call.kind === "onboard").length, 0);
+    assert.doesNotMatch(result.output, /fixture-user|fixture-password|fixture config diagnostic/);
+  }
+});
+
+test("truncated npm output cannot hide an earlier auth failure and qualify a tarball retry", async () => {
+  const result = await canaryStartup({ mode: "tarball-large" });
+  assert.equal(result.code, 1);
+  assert.equal(result.calls.filter((call) => call.kind === "npm").length, 1);
+  assert.equal(result.calls.filter((call) => call.kind === "config").length, 0);
+  assert.equal(result.calls.filter((call) => call.kind === "onboard").length, 0);
+});
+
+test("tarball recovery does not replay onboarding failures or change ETARGET for other exact versions", async () => {
+  const failed = await canaryStartup({ mode: "tarball-recover", onboard: "fail" });
+  assert.equal(failed.code, 1);
+  assert.equal(failed.calls.filter((call) => call.kind === "npm").length, 2);
+  assert.equal(failed.calls.filter((call) => call.kind === "onboard").length, 1);
+  assert.match(failed.output, /onboarding failed \(exit 17\)/);
+  const other = await canaryStartup({ mode: "recover", version: "2026.1009.0-nightly.1" });
+  assert.equal(other.code, 0, other.output);
+  assert.equal(other.calls.filter((call) => call.kind === "npm").length, 2);
+  assert.equal(other.calls.filter((call) => call.kind === "onboard").length, 1);
+  assert.equal(other.calls.filter((call) => call.kind === "config").length, 0);
+});
+
+test("existing ETARGET character-tail behavior survives long multibyte npm diagnostics", async () => {
+  const result = await canaryStartup({ mode: "multibyte-recover" });
+  assert.equal(result.code, 0, result.output);
+  assert.equal(result.calls.filter((call) => call.kind === "npm").length, 2);
+  assert.equal(result.calls.filter((call) => call.kind === "onboard").length, 1);
+  assert.equal(result.calls.filter((call) => call.kind === "config").length, 0);
+});
+
+test("metadata lookup and backoff both consume the unchanged shared acquisition budget", async () => {
+  for (const input of [{ metadata: "hang" }, { delay: 5000 }]) {
+    const result = await canaryStartup({ mode: "tarball-permanent", budget: 1000, ...input });
+    assert.equal(result.code, 1);
+    assert.equal(result.calls.filter((call) => call.kind === "npm").length, 1);
+    assert.equal(result.calls.filter((call) => call.kind === "onboard").length, 0);
+    assert.match(result.output, /exceeded its startup budget/);
+    assert.ok(result.elapsed < 4000, `shared-budget cancellation took ${result.elapsed}ms`);
+  }
+});
+
+test("cancellation reaps a config process and its descendant that ignore SIGTERM", async () => {
+  const result = await canaryStartup({ mode: "tarball-permanent", config: "hang", cancelAtKind: "config-descendant" });
+  assert.equal(result.code, 1);
+  assert.equal(result.calls.filter((call) => call.kind === "npm").length, 1);
+  assert.equal(result.calls.filter((call) => call.kind === "onboard").length, 0);
+  for (const child of result.calls.filter((call) => ["config", "config-descendant"].includes(call.kind))) {
+    assert.throws(() => process.kill(child.pid, 0), { code: "ESRCH" });
+  }
+  assert.match(result.output, /stopped by SIGTERM/);
 });
