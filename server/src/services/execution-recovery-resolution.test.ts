@@ -15,7 +15,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "../__tests__/helpers/embedded-postgres.js";
-import { settleUnrecoverableExecutions } from "./execution-recovery-resolution.js";
+import { settleUnrecoverableExecutions, deliverRecoveryUnblockNotifications } from "./execution-recovery-resolution.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -274,6 +274,55 @@ describeEmbeddedPostgres("execution recovery resolution", () => {
       .from(issueRecoveryActions)
       .where(eq(issueRecoveryActions.id, actionId));
     expect(action).toMatchObject({ status: "resolved", outcome: "blocked" });
+  });
+
+  it("delivers one unblock wake for a recovery block", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const issueId = randomUUID();
+    const { actionId } = await seedLegacyRunRequiringReconciliation({
+      companyId,
+      agentId,
+      issueId,
+      issueStatus: "in_progress",
+      statusWrittenByRun: null,
+    });
+
+    await settleUnrecoverableExecutions(db);
+
+    const [before] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, actionId));
+    expect(before?.evidence).toMatchObject({ unblockDelivery: "pending" });
+    const [blocked] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(blocked?.blockedOwnerNotifiedAt).toBeNull();
+
+    const wakes: Array<{ agentId: string; options: any }> = [];
+    const wake = async (agentId: string, options: any) => {
+      wakes.push({ agentId, options });
+      return { id: "unblock-wake-run" };
+    };
+    await deliverRecoveryUnblockNotifications(db, wake);
+
+    expect(wakes).toHaveLength(1);
+    expect(wakes[0]?.agentId).toBe(agentId);
+    expect(wakes[0]?.options).toMatchObject({
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_unblock_requested",
+      payload: { issueId, action: expect.stringContaining("Review the recorded work") },
+    });
+    const [notified] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(notified?.blockedOwnerNotifiedAt).toBeInstanceOf(Date);
+    const [delivered] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, actionId));
+    expect(delivered?.evidence).toMatchObject({ unblockDelivery: "delivered" });
+
+    // A second sweep must not wake the same hold again.
+    await deliverRecoveryUnblockNotifications(db, wake);
+    expect(wakes).toHaveLength(1);
   });
 
   it("keeps the unblock descriptor an already-blocked issue carries", async () => {

@@ -23,6 +23,7 @@ import {
 } from "@paperclipai/shared";
 import { parseIssueExecutionState } from "./issue-execution-policy.js";
 import { isSupersededConversationRun } from "./agent-conversations.js";
+import { deliverAgentUnblockNotification } from "./routable-blocked.js";
 import {
   findRunOwnedIssueStatusEvidence,
   isRunOwnedIssueStatus,
@@ -307,6 +308,87 @@ export async function deliverReconciledExecutions(
 }
 
 /**
+ * A recovery block is written by SQL, so it never passes through the route that
+ * delivers the unblock wake. This sweep delivers it after commit: the owner
+ * named by the descriptor is woken once, and `blockedOwnerNotifiedAt` is stamped
+ * on the issue so a retry (or another path) cannot wake the same hold twice.
+ */
+export async function deliverRecoveryUnblockNotifications(
+  db: Db,
+  wake: Parameters<typeof deliverAgentUnblockNotification>[0]["wakeup"],
+) {
+  const pending = await db
+    .select()
+    .from(issueRecoveryActions)
+    .where(
+      and(
+        eq(issueRecoveryActions.status, "resolved"),
+        sql`${issueRecoveryActions.evidence}->>'unblockDelivery' = 'pending'`,
+      ),
+    )
+    .limit(25);
+  for (const action of pending) {
+    try {
+      const pendingMarker = and(
+        eq(issueRecoveryActions.companyId, action.companyId),
+        eq(issueRecoveryActions.id, action.id),
+        eq(issueRecoveryActions.status, "resolved"),
+        sql`${issueRecoveryActions.evidence}->>'unblockDelivery' = 'pending'`,
+      );
+      const [task] = await db
+        .select()
+        .from(issues)
+        .where(
+          and(
+            eq(issues.companyId, action.companyId),
+            eq(issues.id, action.sourceIssueId),
+          ),
+        );
+      if (!task || task.status !== "blocked" || !task.unblockDescriptor) {
+        await db
+          .update(issueRecoveryActions)
+          .set({
+            evidence: sql`${issueRecoveryActions.evidence} || '{"unblockDelivery":"invalidated"}'::jsonb`,
+          })
+          .where(pendingMarker);
+        continue;
+      }
+      const delivered = await deliverAgentUnblockNotification({
+        issue: task,
+        wakeup: wake,
+        markNotified: async (notifiedAt) => {
+          await db
+            .update(issues)
+            .set({ blockedOwnerNotifiedAt: notifiedAt })
+            .where(
+              and(
+                eq(issues.companyId, task.companyId),
+                eq(issues.id, task.id),
+                // A later hold keeps its own timestamp and must not be stamped
+                // as notified by this delivery.
+                eq(issues.blockedTransitionAt, task.blockedTransitionAt!),
+              ),
+            );
+        },
+      });
+      await db
+        .update(issueRecoveryActions)
+        .set({
+          evidence: sql`${issueRecoveryActions.evidence} || ${JSON.stringify({
+            unblockDelivery: delivered ? "delivered" : "skipped",
+          })}::jsonb`,
+        })
+        .where(pendingMarker);
+    } catch {
+      logger.warn(
+        { recoveryActionId: action.id },
+        "Recovery unblock delivery remains pending for retry",
+      );
+    }
+  }
+}
+
+/**
  * Failed execution is a system responsibility, not a user questionnaire. After
  * automatic recovery is ruled out, preserve evidence and stop without replay.
  * This is NOT evidence that an external action succeeded or never happened.
@@ -509,14 +591,15 @@ export async function settleUnrecoverableExecutions(
         let nativeBootstrapFailureBlock = action.evidence.nativeBootstrapFailureBlock;
         if (blockable) {
           // A recovery block must carry the disposition the API requires, or
-          // nobody can wake the issue. Name the owner the work returns to and
-          // the action that clears it. An already-blocked task keeps the
-          // descriptor it has: that hold may belong to a different failure.
-          const blockOwner: IssueUnblockDescriptor["owner"] = task.assigneeAgentId
-            ? { agentId: task.assigneeAgentId }
-            : task.assigneeUserId
-              ? { userId: task.assigneeUserId }
-              : "board";
+          // the block is invisible to the board. Name the owner the work
+          // returns to and the action that clears it; the delivery sweep below
+          // wakes that owner once. An already-blocked task keeps the descriptor
+          // it has: that hold may belong to a different failure.
+          // `current` above requires an agent owner, so the owner is always the
+          // assignee agent; a user/board owner cannot reach this branch.
+          const blockOwner: IssueUnblockDescriptor["owner"] = {
+            agentId: task.assigneeAgentId!,
+          };
           const blockAction = workspaceRestoreFailure
             ? "Verify staging or repair the workspace, then continue. Saved work and approval decisions remain in force."
             : "Review the recorded work from the stopped run, then continue or close. Recovery did not replay any unverified action.";
@@ -562,6 +645,13 @@ export async function settleUnrecoverableExecutions(
               ...(nativeFailureBlock ? { nativeFailureBlock } : {}),
               ...(nativeBootstrapFailureBlock ? { nativeBootstrapFailureBlock } : {}),
               ...(preservedIssueStatus ? { preservedIssueStatus } : {}),
+              // A recovery block writes SQL directly, so no request reaches the
+              // route that normally delivers the unblock wake. Mark the delivery
+              // for the execution-control sweep instead; it stamps
+              // blockedOwnerNotifiedAt so a retry cannot double-wake.
+              ...(blockable && task.status !== "blocked"
+                ? { unblockDelivery: "pending" }
+                : {}),
               automaticRecovery: {
                 policy: "preserve_without_replay_v1",
                 runId: run.id,
