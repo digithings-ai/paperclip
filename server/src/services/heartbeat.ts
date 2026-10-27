@@ -13424,9 +13424,16 @@ export function heartbeatService(
     patch?: Partial<typeof agentWakeupRequests.$inferInsert>,
   ) {
     if (!wakeupRequestId) return;
+    // The error column is text that the provider wrote. A call site passes the
+    // raw `error.message`, and that message can hold the value of a credential.
+    // The redaction is here, so every call site is covered.
+    const storedPatch =
+      patch && typeof patch.error === "string"
+        ? { ...patch, error: redactPersistedRunText(patch.error) }
+        : patch;
     await db
       .update(agentWakeupRequests)
-      .set({ status, ...patch, updatedAt: new Date() })
+      .set({ status, ...storedPatch, updatedAt: new Date() })
       // Reassignment revokes requests transactionally. Late execution settlement
       // must not turn a revoked request back into authority for a later retry.
       .where(and(eq(agentWakeupRequests.id, wakeupRequestId), ne(agentWakeupRequests.status, "cancelled")));

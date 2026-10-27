@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  NOT_INSPECTED_NO_JSON_FORM_REASON,
   NOT_INSPECTED_RUN_OUTPUT_VALUE,
   redactAdapterResultForPersistence,
   redactContextSnapshotForPersistence,
@@ -147,17 +148,51 @@ describe("redactPersistedRunOutput", () => {
     expect(JSON.stringify(redacted)).not.toContain(JWT);
   });
 
-  it("keeps a value that is not a plain record", () => {
+  it("redacts a value that is not a plain record and marks it as not walked", () => {
     class Instance {
-      constructor(readonly value: string) {}
+      constructor(
+        readonly value: string,
+        readonly label: string,
+      ) {}
     }
-    const instance = new Instance(`PAPERCLIP_API_KEY=${JWT}`);
+    const instance = new Instance(`PAPERCLIP_API_KEY=${JWT}`, "provider-a");
     const redacted = redactPersistedRunOutput({ instance }) as Record<string, unknown>;
     const marked = redacted.instance as Record<string, unknown>;
     expect(marked[NOT_INSPECTED_RUN_OUTPUT_VALUE]).toBe(true);
-    // The value keeps its prototype and its data.
-    expect(marked.value).toBeInstanceOf(Instance);
-    expect((marked.value as Instance).value).toContain("PAPERCLIP_API_KEY=");
+    const text = JSON.stringify(marked);
+    // The text form of the value is redacted before it is stored. No credential
+    // text survives in the stored value, and the data stays readable.
+    expect(text).not.toContain(JWT);
+    expect(text).toContain("PAPERCLIP_API_KEY=");
+    expect(text).toContain("provider-a");
+    expect("reason" in marked).toBe(false);
+  });
+
+  it("redacts a typed array and marks it as not walked", () => {
+    const bytes = new TextEncoder().encode("a plain byte array");
+    const redacted = redactPersistedRunOutput({ bytes }) as Record<
+      string,
+      Record<string, unknown>
+    >;
+    const marked = redacted.bytes;
+    expect(marked[NOT_INSPECTED_RUN_OUTPUT_VALUE]).toBe(true);
+    // A typed array has a JSON form, so its data is kept as a plain record.
+    expect(marked.value).toEqual(JSON.parse(JSON.stringify(bytes)));
+  });
+
+  it("drops a map and a set and records why", () => {
+    const redacted = redactPersistedRunOutput({
+      map: new Map([["key", `PAPERCLIP_API_KEY=${JWT}`]]),
+      set: new Set([`PAPERCLIP_API_KEY=${JWT}`]),
+    }) as Record<string, Record<string, unknown>>;
+    for (const key of ["map", "set"] as const) {
+      const marked = redacted[key];
+      expect(marked[NOT_INSPECTED_RUN_OUTPUT_VALUE]).toBe(true);
+      expect(marked.reason).toBe(NOT_INSPECTED_NO_JSON_FORM_REASON);
+      // The value is dropped, so no raw text can reach the store.
+      expect("value" in marked).toBe(false);
+    }
+    expect(JSON.stringify(redacted)).not.toContain(JWT);
   });
 });
 

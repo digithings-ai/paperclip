@@ -506,12 +506,36 @@ escape sequence, or that a seat glued to a word, is removed as well. The stored
 output is the JSON event stream of the provider, so a newline in it is still
 the two characters `\` and `n`.
 
-Two sinks of the board are digest-anchored, and the rule does not reach them.
-The stored value of a native run result, and the stored payload of a run event
-that carries a source digest, are hashed, and the hash is compared with the
-stored value on every read. Redacting the stored value would break that
-check. The write path of those sinks keeps the rule; the cleanup script below
-counts the rows it leaves alone and reports them.
+Some values cannot be walked. A class instance, a typed array, and a document
+that sits below the depth limit are such values. The redaction stringifies the
+value, redacts the text form with the same rule, parses the result back, and
+stores it under the marker `***NOT_INSPECTED***`:
+
+```json
+{ "***NOT_INSPECTED***": true, "value": { "...": "..." } }
+```
+
+The marker says that the structure below the value was not walked: only the
+text that `JSON.stringify` writes for it was redacted. A map and a set have no
+JSON form, and a value that `JSON.stringify` cannot write is not kept. Such a
+value is dropped, and the reason is stored with the marker and no value:
+
+```json
+{ "***NOT_INSPECTED***": true, "reason": "the value has no JSON form" }
+```
+
+A raw value never reaches the store under the marker. A value that the
+redaction removed a credential from is stored with the credential removed, or
+it is dropped and the reason is stored with the marker.
+
+Two sinks of the board are digest-anchored. The stored value of a native run
+result, and the stored payload of a run event that carries a source digest,
+are hashed, and the hash is compared with the stored value on every read. The
+write path redacts the value before it takes the hash, so the hash covers the
+redacted value and the check still holds. A row that was stored before that
+rule keeps the value it holds: redacting it now would change the value that
+the hash covers and break the replay check. The cleanup script below counts
+those rows and reports them.
 
 If a board already stored run output that holds a credential value, redact the
 stored rows in place:

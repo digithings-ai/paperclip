@@ -1,8 +1,18 @@
+import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { afterEach, describe, expect, it } from "vitest";
+import { sql } from "drizzle-orm";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { agents, companies, createDb } from "@paperclipai/db";
+import {
+  getEmbeddedPostgresTestSupport,
+  startEmbeddedPostgresTestDatabase,
+} from "../__tests__/helpers/embedded-postgres.js";
+import { drainHeartbeatRunsToQuiescence } from "../__tests__/helpers/drain-heartbeat-runs.js";
+import { registerServerAdapter, unregisterServerAdapter } from "../adapters/index.js";
+import { heartbeatService } from "./heartbeat.js";
 import {
   repairDamagedJsonDocument,
   resolveSeatSessionStorePath,
@@ -636,3 +646,168 @@ describe("scrubSeatSessionStoreForAgent", () => {
     expect(rows).toHaveLength(1);
   });
 });
+
+/**
+ * The board scrubs the session store of a seat after a run, on the success
+ * path and on the failure path (`scrubSeatSessionStoreAfterRun` in
+ * `heartbeat.ts`). The unit tests above call the scrub directly, so they stay
+ * green when a heartbeat call site is removed. This test runs a heartbeat that
+ * fails, so the failure-path call site is covered.
+ */
+const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
+const describeEmbeddedPostgres = embeddedPostgresSupport.supported
+  ? describe
+  : describe.skip;
+
+if (!embeddedPostgresSupport.supported) {
+  console.warn(
+    `Skipping the heartbeat failure-path seat store test on this host: ${embeddedPostgresSupport.reason ?? "unsupported environment"}`,
+  );
+}
+
+describeEmbeddedPostgres("the failure path of a heartbeat run", () => {
+  const ADAPTER_TYPE = "seat_store_failure_test";
+  let db!: ReturnType<typeof createDb>;
+  let heartbeat!: ReturnType<typeof heartbeatService>;
+  let tempDb: Awaited<
+    ReturnType<typeof startEmbeddedPostgresTestDatabase>
+  > | null = null;
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase(
+      "paperclip-heartbeat-seat-store-",
+    );
+    db = createDb(tempDb.connectionString);
+    heartbeat = heartbeatService(db);
+    registerServerAdapter({
+      type: ADAPTER_TYPE,
+      execute: async () => {
+        throw new Error(`the provider failed with PAPERCLIP_API_KEY=${JWT}`);
+      },
+      testEnvironment: async () => ({
+        adapterType: ADAPTER_TYPE,
+        status: "pass",
+        checks: [],
+        testedAt: new Date(0).toISOString(),
+      }),
+    });
+  }, 20_000);
+
+  afterEach(async () => {
+    await drainHeartbeatRunsToQuiescence(db, heartbeat);
+    await db.execute(
+      sql.raw(`
+      TRUNCATE TABLE
+        "heartbeat_run_events",
+        "agent_wakeup_requests",
+        "heartbeat_runs",
+        "agents",
+        "companies"
+      RESTART IDENTITY CASCADE
+    `),
+    );
+  });
+
+  afterAll(async () => {
+    unregisterServerAdapter(ADAPTER_TYPE);
+    await tempDb?.cleanup();
+  });
+
+  it("scrubs the session store of a seat whose run failed", async () => {
+    const directory = mkdtempSync(path.join(tmpdir(), "paperclip-seat-store-"));
+    temporaryDirectories.push(directory);
+    mkdirSync(path.join(directory, "opencode"), { recursive: true });
+    const storePath = path.join(directory, "opencode", "opencode.db");
+    const seatDb = new DatabaseSync(storePath);
+    seatDb.exec(`
+      CREATE TABLE session_message (
+        id text PRIMARY KEY,
+        session_id text NOT NULL,
+        type text NOT NULL,
+        seq integer NOT NULL,
+        time_created integer NOT NULL,
+        time_updated integer NOT NULL,
+        data text NOT NULL
+      );
+    `);
+    seatDb.prepare(
+      "INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?, ?)",
+    ).run(
+      "msg-1",
+      "session-1",
+      "tool",
+      1,
+      now(),
+      now(),
+      JSON.stringify({
+        output: `the seat printed its environment: PAPERCLIP_API_KEY=${JWT}`,
+      }),
+    );
+    seatDb.close();
+
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Seat store failure company",
+      issuePrefix: `S${companyId.replaceAll("-", "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Failing seat",
+      role: "engineer",
+      status: "idle",
+      adapterType: ADAPTER_TYPE,
+      adapterConfig: { env: { XDG_DATA_HOME: directory } },
+      runtimeConfig: {
+        heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 },
+      },
+      permissions: {},
+    });
+
+    const queued = await heartbeat.invoke(agentId, "on_demand", {}, "manual");
+    expect(queued).not.toBeNull();
+    const deadline = Date.now() + 10_000;
+    let finished = await heartbeat.getRun(queued!.id);
+    while (
+      finished &&
+      ["queued", "running"].includes(finished.status) &&
+      Date.now() < deadline
+    ) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      finished = await heartbeat.getRun(queued!.id);
+    }
+    expect(finished?.status).toBe("failed");
+
+    const readStoredData = (): string | null => {
+      const reader = new DatabaseSync(storePath, { readOnly: true });
+      const rows = reader
+        .prepare("SELECT data FROM session_message")
+        .all() as Array<{ data: string }>;
+      reader.close();
+      return rows[0]?.data ?? null;
+    };
+
+    // The run row reaches its terminal status before the scrub of the seat
+    // store finishes, so the store is read until the redacted value lands.
+    const scrubDeadline = Date.now() + 10_000;
+    let stored = readStoredData();
+    while (
+      stored !== null &&
+      stored.includes(JWT) &&
+      Date.now() < scrubDeadline
+    ) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      stored = readStoredData();
+    }
+    if (stored === null) throw new Error("the session store row is missing");
+    // The row is redacted in place: no credential text survives, and the rest
+    // of the document is still there.
+    expect(stored).not.toContain(JWT);
+    expect(stored).toContain("PAPERCLIP_API_KEY=");
+  });
+});
+

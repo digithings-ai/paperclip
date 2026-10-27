@@ -18,6 +18,7 @@ import {
   validatePrpEvent,
   validatePrpStructuredRunResult,
 } from "../../vendor/paperclip-runner/index.js";
+import { redactPersistedRunOutput } from "../run-output-redaction.js";
 
 export interface NativeRunStoreBinding {
   readonly companyId: string;
@@ -212,8 +213,15 @@ export class NativeRunCoordinatorStore {
     ) {
       throw new Error("native_event_binding_mismatch");
     }
-    const canonicalPayload = event as unknown as Record<string, unknown>;
-    const payloadDigest = sha256(canonicalPayload);
+    // The event is stored and its digest is stored next to it. A seat that
+    // printed its environment puts a raw credential in the payload, so the
+    // event is redacted before the digest is taken and before the insert. The
+    // digest then covers the value that the store holds, so a replay of the
+    // same event still matches the duplicate check below.
+    const persistedPayload = redactPersistedRunOutput(
+      event as unknown as Record<string, unknown>,
+    ) as Record<string, unknown>;
+    const payloadDigest = sha256(persistedPayload);
 
     return this.#db.transaction(async (tx) => {
       const [run] = await tx
@@ -301,7 +309,7 @@ export class NativeRunCoordinatorStore {
           eventType: event.eventType,
           stream: "system",
           level: event.eventType.includes("failed") ? "error" : "info",
-          payload: { prpEvent: canonicalPayload },
+          payload: { prpEvent: persistedPayload },
           sourceInstanceId: event.sourceInstanceId,
           sourceEventId: event.sourceEventId,
           sourceSeq: event.sourceSeq,
@@ -327,11 +335,16 @@ export class NativeRunCoordinatorStore {
     readonly resultId: string;
   }> {
     const validated = validateBoundCompletion(this.#binding, input.result, input.terminal);
-    const canonical = {
+    // The result is stored and its digest is stored next to it. The summary and
+    // the evidence of the result are text that the seat wrote, so they can hold
+    // a raw credential. The result is redacted before the digest is taken and
+    // before the insert: canonicalSha256 covers the value that the store holds,
+    // so a replay of the same result still matches the replay check below.
+    const canonical = redactPersistedRunOutput({
       result: validated.result,
       terminal: validated.terminal,
       turnId: input.turnId ?? null,
-    };
+    }) as Record<string, unknown>;
     const canonicalSha256 = sha256(canonical);
     const serverFingerprint = sha256({
       runId: this.#binding.runId,
@@ -392,7 +405,7 @@ export class NativeRunCoordinatorStore {
           callerDedupeKey: input.callerDedupeKey ?? null,
           serverFingerprint,
           schemaStatus: "accepted",
-          resultJson: canonical as unknown as Record<string, unknown>,
+          resultJson: canonical,
           canonicalSha256,
         })
         .returning({ id: nativeRunResults.id });

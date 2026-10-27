@@ -40,12 +40,12 @@ import {
 } from "../src/services/seat-store-redaction.js";
 
 /**
- * The run statuses that mean that the seat of the agent writes to its store
- * right now. The store of such a seat is left alone. A run that waits for a
- * retry writes nothing yet, and the seat of that run reads the store before
- * the next run of the seat writes to it.
+ * The run statuses that mean that the seat of the agent writes to its store,
+ * or is about to write to it. A run that runs now writes; a run that waits for
+ * a retry is created as `queued` and writes on the next attempt. The store of
+ * such a seat is left alone.
  */
-const LIVE_RUN_STATUSES = ["running"];
+const LIVE_RUN_STATUSES = ["running", "queued"];
 
 function isDryRun() {
   return process.argv.includes("--dry-run");
@@ -89,8 +89,9 @@ async function seatStorePaths(
 }
 
 /**
- * The stores of the seats that are busy. A run that is queued, that waits for
- * a retry or that runs now means that the seat writes to its store.
+ * The stores of the seats that are busy. A run that runs now writes to its
+ * store now. A run that waits for a retry is created as `queued` and writes on
+ * the next attempt. Either status means that the store is left alone.
  */
 async function liveStorePaths(
   db: ReturnType<typeof createDb>,

@@ -25,13 +25,20 @@ const RUN_SECRET_REDACTION_REGISTRY_KEY = "paperclipSecretRedactions";
 export const REDACTED_RUN_OUTPUT_VALUE = "***REDACTED***";
 
 /**
- * The marker of a value that the redaction kept but did not inspect. The value
- * is a class instance, a typed array or a document that sits below the depth
- * limit. The redaction keeps it, because dropping it would lose data. It
- * marks it, because the reader of the stored value has to know that the
- * structure below it was not walked.
+ * The marker of a value that the redaction did not walk. The value is a class
+ * instance, a typed array or a document that sits below the depth limit. The
+ * text form of the value is redacted with the same rule as any other text, and
+ * the result is marked, because the reader of the stored value has to know
+ * that the structure itself was not walked.
  */
 export const NOT_INSPECTED_RUN_OUTPUT_VALUE = "***NOT_INSPECTED***";
+
+/** Why the redaction dropped a value instead of keeping it. */
+export const NOT_INSPECTED_NO_JSON_FORM_REASON = "the value has no JSON form";
+
+/** Why the redaction dropped a value that it could not put back together. */
+export const NOT_INSPECTED_REDACTED_TEXT_REASON =
+  "the redacted text of the value is not JSON";
 
 /** A character of a credential token. The runner uses the same set. */
 function isTokenByte(char: string): boolean {
@@ -208,18 +215,68 @@ export function redactPersistedRunTextOrNull(value: string | null): string | nul
 }
 
 /**
- * Mark a value that the redaction keeps but does not inspect. The marker tells
- * the reader of the stored value that the structure was not walked.
+ * Mark a value as not walked by the redaction. The value is the redacted text
+ * form of the stored value. A value that the redaction had to drop carries the
+ * reason and no value: the text form of the value can still hold the
+ * credential that the redaction removed from it.
  */
-function markNotInspected(value: unknown): Record<string, unknown> {
-  return { [NOT_INSPECTED_RUN_OUTPUT_VALUE]: true, value };
+function markNotInspected(
+  value: unknown,
+  reason?: string,
+): Record<string, unknown> {
+  return typeof reason === "string"
+    ? { [NOT_INSPECTED_RUN_OUTPUT_VALUE]: true, reason }
+    : { [NOT_INSPECTED_RUN_OUTPUT_VALUE]: true, value };
+}
+
+/**
+ * A map and a set have no JSON form. `JSON.stringify` writes an empty object
+ * for both, so the stored value would lose every entry with no record that it
+ * did.
+ */
+function hasNoJsonForm(value: object): boolean {
+  return value instanceof Map || value instanceof Set;
+}
+
+/** The JSON text of a value, or null when the value has no JSON text. */
+function jsonTextOf(value: unknown): string | null {
+  try {
+    const text = JSON.stringify(value);
+    return typeof text === "string" ? text : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Redact a value that the redaction could not walk, because it is a class
+ * instance, a typed array or a document below the depth limit. The value is
+ * stringified, the text is redacted with the same rule as any other text, and
+ * the result is parsed back and marked. A value that has no JSON form, or
+ * whose redacted text is not JSON, is dropped: the raw text can still hold the
+ * credential that the redaction removed from it, so it must not reach the
+ * store.
+ */
+function redactNotWalkedValue(value: unknown): Record<string, unknown> {
+  if (typeof value === "object" && value !== null && hasNoJsonForm(value)) {
+    return markNotInspected(undefined, NOT_INSPECTED_NO_JSON_FORM_REASON);
+  }
+  const text = jsonTextOf(value);
+  if (text === null) {
+    return markNotInspected(undefined, NOT_INSPECTED_NO_JSON_FORM_REASON);
+  }
+  try {
+    return markNotInspected(JSON.parse(redactPersistedRunText(text)));
+  } catch {
+    return markNotInspected(undefined, NOT_INSPECTED_REDACTED_TEXT_REASON);
+  }
 }
 
 /**
  * A plain record is an object with the prototype of an object literal, or an
  * object without a prototype. A class instance, a typed array, a map and a set
- * are not plain records. The redaction keeps those values as they are, because
- * rebuilding them would lose their prototype or their data.
+ * are not plain records. The redaction cannot rebuild those values, so their
+ * text form is redacted as a whole instead.
  */
 function isPlainRecord(value: object): boolean {
   const prototype = Object.getPrototypeOf(value);
@@ -264,37 +321,24 @@ function isSecretRedactionRegistry(
 }
 
 /**
- * Redact a value that sits below the depth limit. The value is kept, because
- * dropping it would lose data. The text of the value is checked with the same
- * rule, so a credential that hides below the depth limit is still removed.
- * The value is marked as not inspected, because its structure was not walked.
+ * Redact a value that sits below the depth limit. The text of the value is
+ * checked with the same rule, so a credential that hides below the depth limit
+ * is still removed. The value is marked as not walked, because its structure
+ * was not walked.
  */
 function redactBelowDepthLimit(value: unknown): unknown {
   if (typeof value === "string") return redactPersistedRunText(value);
   if (value === null || value === undefined || typeof value !== "object") {
     return value;
   }
-  let text: string | null = null;
-  try {
-    text = JSON.stringify(value);
-  } catch {
-    text = null;
-  }
-  if (typeof text !== "string") return markNotInspected(value);
-  const redactedText = redactPersistedRunText(text);
-  if (redactedText === text) return markNotInspected(value);
-  try {
-    return markNotInspected(JSON.parse(redactedText));
-  } catch {
-    return markNotInspected(value);
-  }
+  return redactNotWalkedValue(value);
 }
 
 /**
  * Redact every string inside a value that Paperclip stores in the board
  * database. The function walks objects and arrays. It keeps numbers, booleans
  * and null values. It stops at a fixed depth. A value below that depth is
- * kept, and it is marked as not inspected.
+ * redacted as text and marked as not walked.
  */
 export function redactPersistedRunOutput(value: unknown, depth = 0): unknown {
   if (typeof value === "string") return redactPersistedRunText(value);
@@ -310,10 +354,11 @@ export function redactPersistedRunOutput(value: unknown, depth = 0): unknown {
     return value.map((item) => redactPersistedRunOutput(item, depth + 1));
   }
   if (!isPlainRecord(value)) {
-    // A class instance, a typed array, a map or a set. The redaction keeps the
-    // value, because rebuilding it would lose its prototype or its data. It
-    // marks the value, because the structure below it was not walked.
-    return markNotInspected(value);
+    // A class instance, a typed array, a map or a set. The structure is not
+    // walked, so the text form of the value is redacted with the same rule and
+    // the result is marked as not walked. A map or a set has no JSON form, so
+    // it is dropped and recorded instead.
+    return redactNotWalkedValue(value);
   }
   const record = value as Record<string, unknown>;
   const entries = Object.entries(record).map(([key, item]): [string, unknown] => [
