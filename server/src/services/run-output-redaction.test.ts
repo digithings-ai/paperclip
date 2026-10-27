@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   NOT_INSPECTED_NO_JSON_FORM_REASON,
   NOT_INSPECTED_RUN_OUTPUT_VALUE,
+  REDACTED_RUN_OUTPUT_VALUE,
   redactAdapterResultForPersistence,
   redactContextSnapshotForPersistence,
   redactPersistedRunOutput,
@@ -111,6 +112,52 @@ describe("redactPersistedRunOutput", () => {
       missing: null,
     });
     expect(redacted).toEqual({ exitCode: 0, timedOut: false, missing: null });
+  });
+
+  it("redacts a credential that is the key of a record", () => {
+    const redacted = redactPersistedRunOutput({
+      [JWT]: "value",
+      [`PAPERCLIP_API_KEY=${JWT}`]: "value",
+      nested: { [`PAPERCLIP_API_KEY=${JWT}`]: "value" },
+      kept: "value",
+    }) as Record<string, unknown>;
+    const text = JSON.stringify(redacted);
+    expect(text).not.toContain(JWT);
+    const keys = Object.keys(redacted);
+    expect(keys).toContain(REDACTED_RUN_OUTPUT_VALUE);
+    expect(keys).toContain(`PAPERCLIP_API_KEY=${REDACTED_RUN_OUTPUT_VALUE}`);
+    const nestedKeys = Object.keys(redacted.nested as Record<string, unknown>);
+    expect(nestedKeys).toContain(`PAPERCLIP_API_KEY=${REDACTED_RUN_OUTPUT_VALUE}`);
+    expect(redacted.kept).toBe("value");
+  });
+
+  it("replaces a function value before it can run after the walk", () => {
+    let calls = 0;
+    const toJSON = () => {
+      calls += 1;
+      return { v: `PAPERCLIP_API_KEY=${JWT}` };
+    };
+    const redacted = redactPersistedRunOutput({ o: { toJSON } }) as Record<
+      string,
+      Record<string, Record<string, unknown>>
+    >;
+    const text = JSON.stringify(redacted);
+    // The serialiser never calls the function, so no unredacted result can
+    // reach the store.
+    expect(calls).toBe(0);
+    expect(text).not.toContain(JWT);
+    const marked = redacted.o.toJSON;
+    expect(marked[NOT_INSPECTED_RUN_OUTPUT_VALUE]).toBe(true);
+    expect(marked.reason).toBe(NOT_INSPECTED_NO_JSON_FORM_REASON);
+    expect("value" in marked).toBe(false);
+  });
+
+  it("drops a symbol value and records why", () => {
+    const redacted = redactPersistedRunOutput({
+      marker: Symbol("a-synthetic-symbol"),
+    }) as Record<string, Record<string, unknown>>;
+    expect(redacted.marker[NOT_INSPECTED_RUN_OUTPUT_VALUE]).toBe(true);
+    expect(redacted.marker.reason).toBe(NOT_INSPECTED_NO_JSON_FORM_REASON);
   });
 
   it("keeps a value below the depth limit and marks it as not inspected", () => {

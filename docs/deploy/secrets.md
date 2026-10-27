@@ -506,6 +506,17 @@ escape sequence, or that a seat glued to a word, is removed as well. The stored
 output is the JSON event stream of the provider, so a newline in it is still
 the two characters `\` and `n`.
 
+The redaction walks the keys of a record as well as its values. A key holds
+data, and a seat can put a credential in it. A key that changes under the same
+shape check is stored with the credential removed, and the name of the secret
+stays. An entry never keeps the raw key:
+
+```json
+{ "PAPERCLIP_API_KEY=***REDACTED***": "value" }
+```
+
+A key that is only the credential is stored as `***REDACTED***`.
+
 Some values cannot be walked. A class instance, a typed array, and a document
 that sits below the depth limit are such values. The redaction stringifies the
 value, redacts the text form with the same rule, parses the result back, and
@@ -516,9 +527,12 @@ stores it under the marker `***NOT_INSPECTED***`:
 ```
 
 The marker says that the structure below the value was not walked: only the
-text that `JSON.stringify` writes for it was redacted. A map and a set have no
-JSON form, and a value that `JSON.stringify` cannot write is not kept. Such a
-value is dropped, and the reason is stored with the marker and no value:
+text that `JSON.stringify` writes for it was redacted. A map, a set, a function
+and a symbol have no JSON form, and a value that `JSON.stringify` cannot write
+is not kept. A function is also replaced before the store can call it: the
+database serialiser calls a `toJSON` function, and its result would reach the
+row with no redaction. Such a value is dropped, and the reason is stored with
+the marker and no value:
 
 ```json
 { "***NOT_INSPECTED***": true, "reason": "the value has no JSON form" }

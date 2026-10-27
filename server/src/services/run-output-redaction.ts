@@ -336,13 +336,22 @@ function redactBelowDepthLimit(value: unknown): unknown {
 
 /**
  * Redact every string inside a value that Paperclip stores in the board
- * database. The function walks objects and arrays. It keeps numbers, booleans
- * and null values. It stops at a fixed depth. A value below that depth is
- * redacted as text and marked as not walked.
+ * database. The function walks objects and arrays, and it walks the keys of a
+ * record as well as the values. It keeps numbers, booleans, null values and a
+ * date. It drops a function and a symbol, because they have no JSON form and a
+ * function can run after the walk. It stops at a fixed depth. A value below
+ * that depth is redacted as text and marked as not walked.
  */
 export function redactPersistedRunOutput(value: unknown, depth = 0): unknown {
   if (typeof value === "string") return redactPersistedRunText(value);
   if (value === null || value === undefined) return value;
+  // A function and a symbol have no JSON form. A function can also run after
+  // the walk: the database serialiser calls a `toJSON` function, and its
+  // result is written with no redaction. Replace it with the marker before
+  // anything can call it, so nothing executes on the stored value.
+  if (typeof value === "function" || typeof value === "symbol") {
+    return markNotInspected(undefined, NOT_INSPECTED_NO_JSON_FORM_REASON);
+  }
   if (typeof value !== "object") return value;
   // A date carries no redactable text. Rebuilding it with object entries
   // would turn it into an empty object.
@@ -361,12 +370,19 @@ export function redactPersistedRunOutput(value: unknown, depth = 0): unknown {
     return redactNotWalkedValue(value);
   }
   const record = value as Record<string, unknown>;
-  const entries = Object.entries(record).map(([key, item]): [string, unknown] => [
-    key,
-    isSecretRedactionRegistry(key, depth, item)
-      ? item
-      : redactPersistedRunOutput(item, depth + 1),
-  ]);
+  const entries = Object.entries(record).map(([key, item]): [string, unknown] => {
+    // A key is data too. A seat can put a credential in the key of a record,
+    // and the value walk alone would store it unchanged. Redact the key with
+    // the same rule as a value, so the name of the secret stays and the
+    // credential does not reach the store.
+    const redactedKey = redactPersistedRunText(key);
+    return [
+      redactedKey,
+      isSecretRedactionRegistry(key, depth, item)
+        ? item
+        : redactPersistedRunOutput(item, depth + 1),
+    ];
+  });
   if (Object.getPrototypeOf(record) === null) {
     // An object without a prototype keeps that prototype.
     const copy: Record<string, unknown> = Object.create(null);
