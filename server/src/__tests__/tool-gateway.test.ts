@@ -4734,6 +4734,91 @@ rl.on("line", (line) => {
     }
   });
 
+  it("re-admits a connection an earlier error hid once a later probe restores its health", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    // The remote answers a tools/list probe. The connection was hidden by a
+    // remote call that failed before this change shipped, so its stored
+    // health is the hiding "error" status.
+    const fake = await startFakeRemoteMcpServer(({ body }) => ({
+      body: body?.method === "tools/list"
+        ? {
+            jsonrpc: "2.0",
+            id: body?.id,
+            result: {
+              tools: [
+                { name: "kv_get", inputSchema: { type: "object" } },
+              ],
+            },
+          }
+        : {
+            jsonrpc: "2.0",
+            id: body?.id,
+            result: { content: [{ type: "text", text: "ok" }] },
+          },
+    }));
+    try {
+      const hidden = await createRemoteMcpTool(db, company.id, {
+        applicationKey: "hidden-readmission",
+        toolName: "kv_get",
+        url: fake.url,
+        healthStatus: "error",
+      });
+      await allowAllToolsForAgent(db, company.id, agent.id);
+      // The failing call happened 16 minutes ago, so the next sweep probes
+      // this connection. Every other connection is not due.
+      await db
+        .update(toolConnections)
+        .set({ healthCheckedAt: new Date(Date.now() - 16 * 60 * 1000) })
+        .where(eq(toolConnections.id, hidden.connection.id));
+      await db
+        .update(toolConnections)
+        .set({ healthCheckedAt: new Date() })
+        .where(ne(toolConnections.id, hidden.connection.id));
+
+      const gateway = createTestToolGatewayService(db);
+      const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+      const toolName = expectedConnectedToolName({
+        applicationKey: "hidden-readmission",
+        connectionId: hidden.connection.id,
+        toolName: hidden.catalogEntry.toolName,
+      });
+
+      // The hiding status keeps the tool out of every catalogue, which is the
+      // remaining half of the class for a connection hidden before the fix.
+      const before = await gateway.listToolsForSession(session.token);
+      expect(before.map((tool) => tool.name)).not.toContain(toolName);
+
+      // The background probe is the automatic clear. It writes "ok", which
+      // the catalogue filter keeps.
+      const access = toolAccessService(db);
+      const sweep = await access.sweepConnectionHealth();
+      expect(sweep.failedConnectionIds).not.toContain(hidden.connection.id);
+      const [connection] = await db
+        .select()
+        .from(toolConnections)
+        .where(eq(toolConnections.id, hidden.connection.id));
+      expect(connection.healthStatus).toBe("ok");
+
+      const after = await gateway.listToolsForSession(session.token);
+      expect(after.map((tool) => tool.name)).toContain(toolName);
+
+      // Re-admission is real, not a catalogue row that looks present: the
+      // name now runs at call time instead of answering 404 at lookup.
+      await expect(
+        gateway.executeTool({
+          sessionToken: session.token,
+          tool: toolName,
+          parameters: { key: "alpha", value: "beta" },
+          timeoutMs: 5000,
+        }),
+      ).resolves.toBeTruthy();
+    } finally {
+      await fake.close();
+    }
+  });
+
   it("persists hashed sessions and accepts them across gateway service instances", async () => {
     const company = await createCompany(db);
     const agent = await createAgent(db, company.id);
