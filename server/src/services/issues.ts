@@ -2657,6 +2657,53 @@ export async function heartbeatRunIsTerminalOrMissing(
 }
 
 /**
+ * The native phase that says the native coordinator gave up on a run. After
+ * this phase no copy-back comes for that run.
+ */
+const NATIVE_RUN_PHASE_TERMINAL_FAILURE = "terminal_failure";
+
+/**
+ * Whether a heartbeat run can still write or complete a `workspace_finalize`
+ * row for its execution workspace. A gate that waits for that sync-back must
+ * keep waiting while this is true.
+ *
+ * - A missing run can make no progress at all → false.
+ * - A run that is not over yet (`queued`, `running`, `scheduled_retry`) can
+ *   still reach its sync-back → true.
+ * - A legacy run that reached a terminal state can make no progress: the
+ *   legacy runtime writes its own `workspace_finalize` row, and a row that
+ *   lands after a third party ended the run records a failed sync-back, not a
+ *   successful copy-back → false.
+ * - A native run can still owe a copy-back after it ended. The durable native
+ *   coordinator owns that copy-back and resumes it for a run that already
+ *   ended (`native-finalization-reconciler.ts` selects native runs without a
+ *   status filter). The coordinator gives up with the phase
+ *   `terminal_failure`, and then no copy-back comes → true while the
+ *   coordinator is still alive, false after it gave up.
+ */
+export async function heartbeatRunCanStillFinalize(
+  dbOrTx: Pick<Db, "select">,
+  runId: string,
+): Promise<boolean> {
+  const run = await dbOrTx
+    .select({
+      status: heartbeatRuns.status,
+      runtimeMode: heartbeatRuns.runtimeMode,
+      nativePhase: heartbeatRuns.nativePhase,
+    })
+    .from(heartbeatRuns)
+    .where(eq(heartbeatRuns.id, runId))
+    .then(
+      (rows: Array<{ status: string; runtimeMode: string; nativePhase: string | null }>) =>
+        rows[0] ?? null,
+    );
+  if (!run) return false;
+  if (!TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status)) return true;
+  if (run.runtimeMode !== "native") return false;
+  return run.nativePhase !== NATIVE_RUN_PHASE_TERMINAL_FAILURE;
+}
+
+/**
  * Returns whether a specific run's sync-back on a specific execution workspace
  * has settled — i.e. the accept/review gates that guard against a still-in-flight
  * worktree sync no longer need to block on this run.
@@ -2664,17 +2711,22 @@ export async function heartbeatRunIsTerminalOrMissing(
  * Semantics:
  * - No operations recorded → settled. The run never touched the workspace state
  *   the gates protect.
- * - Earlier phases recorded but no `workspace_finalize` yet → NOT settled. The
- *   sync-back hasn't been attempted; the gate should wait for it.
+ * - Earlier phases recorded but no `workspace_finalize` yet → NOT settled while the
+ *   owning run can still reach the sync-back: the sync-back hasn't been attempted,
+ *   so the gate should wait for it. Once the owning run can make no further
+ *   progress (it ended, or it no longer exists) the sync-back can never happen,
+ *   so the run counts as settled and the gate stops waiting on it. A native run
+ *   whose coordinator is still alive keeps blocking: that coordinator can still
+ *   run the copy-back for a run that already ended.
  * - Latest `workspace_finalize` reached a terminal status (`succeeded`, `failed`,
  *   or `skipped`) → settled. A finalize that ran and finished is done even if it
  *   failed: it will not retry within this run, so continuing to block would wedge
  *   the gate forever — a failed sync-back must not permanently block a
  *   confirmation accept behind a misleading "still syncing" error.
- * - Latest `workspace_finalize` is still `running` → in flight, so NOT settled —
- *   unless the owning run has itself ended, in which case the `running` record is
- *   stale (the process died mid-finalize) and we treat it as settled rather than
- *   wait on a run that can never make progress.
+ * - Latest `workspace_finalize` is still `running` → in flight, so NOT settled
+ *   while the owning run can still complete it. A `running` record left behind by
+ *   a run that can make no further progress is stale, and we treat it as settled
+ *   rather than wait on a run that can never make progress.
  */
 export async function runWorkspaceIsFinalized(
   dbOrTx: Pick<Db, "select">,
@@ -2707,15 +2759,21 @@ export async function runWorkspaceIsFinalized(
   }
 
   // The run touched the workspace but hasn't reached the sync-back phase yet.
-  if (!latestFinalize) return false;
+  // That is in flight only while the owning run can still reach the sync-back: a
+  // legacy run that already ended (or that no longer exists) will never reach it,
+  // so the gate must stop waiting on it instead of blocking the accept for good.
+  // A native run whose coordinator is still alive keeps blocking: that
+  // coordinator can still run the copy-back for a run that already ended.
+  if (!latestFinalize) return !(await heartbeatRunCanStillFinalize(dbOrTx, runId));
 
   // A finalize that reached any terminal status is settled — including `failed`
   // and `skipped`. It will not retry within this run, so gates must stop waiting.
   if (latestFinalize.status !== "running") return true;
 
-  // Finalize is still marked `running`. It is only genuinely in flight while the
-  // owning run is alive; a `running` record left behind by an ended run is stale.
-  return heartbeatRunIsTerminalOrMissing(dbOrTx, runId);
+  // Finalize is still marked `running`. It is in flight while the owning run can
+  // still complete it. A `running` record left behind by a run that can make no
+  // further progress is stale.
+  return !(await heartbeatRunCanStillFinalize(dbOrTx, runId));
 }
 
 async function listIssueDependencyReadinessMap(
