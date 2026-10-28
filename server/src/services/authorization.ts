@@ -39,6 +39,7 @@ import {
 import { logger } from "../middleware/logger.js";
 import { normalizeAgentPermissions } from "./agent-permissions.js";
 import { grantsForHumanRole, normalizeHumanRole } from "./company-member-roles.js";
+import { isUuidShaped } from "./uuid-shape.js";
 
 export type AuthorizationActor =
   {
@@ -819,7 +820,9 @@ export function authorizationService(db: Db | DbTransaction) {
   }
 
   async function loadRunPolicy(runId: string | null | undefined, companyId: string, agentId: string) {
-    if (!runId) return null;
+    // A run id arrives in a request header. A value that is not a uuid names
+    // no run and must not reach the database.
+    if (!runId || !isUuidShaped(runId.trim())) return null;
     const row = await db
       .select({
         id: heartbeatRuns.id,
@@ -838,7 +841,7 @@ export function authorizationService(db: Db | DbTransaction) {
   }
 
   async function loadRunIssueId(runId: string | null | undefined, companyId: string, agentId: string) {
-    if (!runId) return null;
+    if (!runId || !isUuidShaped(runId.trim())) return null;
     const row = await db
       .select({
         companyId: heartbeatRuns.companyId,
