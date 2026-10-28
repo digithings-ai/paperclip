@@ -12383,8 +12383,27 @@ export function issueService(db: Db) {
         const [run] = await dbOrTx.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, actor.runId));
         const [current] = await dbOrTx.select().from(issues).where(eq(issues.id, issueId));
         if (run?.status === "cancelled") throw conflict("This conversation turn was cancelled; it cannot post a reply");
-        if (run?.contextSnapshot?.conversationSessionGeneration !== current.conversationSessionGeneration) {
-          throw conflict("Conversation session changed; this reply belongs to an earlier session");
+        // A run that belongs to another task and carries no conversation
+        // marker is not a reply in this session. It posts a notice: the
+        // comment belongs to the posting agent, it does not settle the turn,
+        // and it does not speak as the conversation agent. Refusing it would
+        // block the notice. Every other run keeps the session rule: a reply
+        // has to match the generation of the conversation it belongs to, and a
+        // turn of another conversation cannot post here at all.
+        const context = run?.contextSnapshot ?? {};
+        const runIssueId = typeof context.issueId === "string" ? context.issueId : null;
+        const runIsConversationTurn =
+          context.conversationMode === true ||
+          typeof context.conversationSessionGeneration === "number";
+        const noticeFromAnotherTask =
+          !runIsConversationTurn && runIssueId !== null && runIssueId !== issueId;
+        if (!noticeFromAnotherTask) {
+          if (runIsConversationTurn && runIssueId !== issueId) {
+            throw conflict("This conversation turn belongs to another conversation session; it cannot post here");
+          }
+          if (context.conversationSessionGeneration !== current.conversationSessionGeneration) {
+            throw conflict("Conversation session changed; this reply belongs to an earlier session");
+          }
         }
       }
       if (options?.completionReply && actor.agentId && actor.runId) {
