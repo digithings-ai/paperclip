@@ -23,7 +23,7 @@ function asDatabaseDate(value: string | Date | null) {
   return typeof value === "string" ? new Date(value) : value;
 }
 
-function isRecoveryBudgetExhausted(evidence: Record<string, unknown>) {
+export function isRecoveryBudgetExhausted(evidence: Record<string, unknown>) {
   const budget = evidence.recoveryBudget;
   return Boolean(
     budget &&
