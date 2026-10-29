@@ -726,6 +726,13 @@ const PAPERCLIP_HARNESS_CHECKOUT_KEY = "paperclipHarnessCheckedOut";
 const PAPERCLIP_EXTERNAL_CHAT_EXECUTION_BOUND_KEY =
   "paperclipExternalChatExecutionBound";
 const DETACHED_PROCESS_ERROR_CODE = "process_detached";
+// How long the finalizer may hold a run before the reconciliation sweep
+// records a terminal row. Measured on 2026-10-26 (DIG-5758): a run's post-turn
+// finalization normally takes 9 s (p50), 45 s at p90 and 62 s at p99, so this
+// budget sits inside the natural distribution and one run in a hundred loses
+// the race by design. The value is unchanged here on purpose: changing it is a
+// separate decision, and the deadline path now records a readable cause.
+const EXECUTION_CONTROL_DEADLINE_MS = 60_000;
 const NATIVE_OWNERSHIP_UNVERIFIED_MESSAGE =
   "Native execution ownership could not be verified; automatic recovery is blocked";
 // The reaper sweeps at most this many pending_cleanup leases per tick.
@@ -25659,7 +25666,7 @@ export function heartbeatService(
               await ownership?.assertHeld();
               await db
                 .update(heartbeatRuns)
-                .set({ executionControlDeadlineAt: new Date(Date.now() + 60_000) })
+                .set({ executionControlDeadlineAt: new Date(Date.now() + EXECUTION_CONTROL_DEADLINE_MS) })
                 .where(
                   and(
                     eq(heartbeatRuns.id, run.id),
@@ -25725,7 +25732,7 @@ export function heartbeatService(
           }
           await db
             .update(heartbeatRuns)
-            .set({ executionControlDeadlineAt: new Date(Date.now() + 60_000) })
+            .set({ executionControlDeadlineAt: new Date(Date.now() + EXECUTION_CONTROL_DEADLINE_MS) })
             .where(
               and(
                 eq(heartbeatRuns.id, run.id),
