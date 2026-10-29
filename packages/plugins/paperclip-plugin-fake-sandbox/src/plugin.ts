@@ -223,6 +223,20 @@ async function runCommand(params: PluginEnvironmentExecuteParams, timeoutMs: num
         }, timeoutMs)
       : null;
 
+    let stdioFailure: string | null = null;
+    const noteStdioError = (stream: "stdin" | "stdout" | "stderr", error: Error) => {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "EPIPE" || code === "ERR_STREAM_DESTROYED") {
+        stdioFailure ??= `${stream} closed before the command finished (${code})`;
+        console.warn({ err: error, stream, code }, stdioFailure);
+        return;
+      }
+      console.warn({ err: error, stream }, "child stdio error");
+    };
+    child.stdin?.on("error", (error) => noteStdioError("stdin", error));
+    child.stdout?.on("error", (error) => noteStdioError("stdout", error));
+    child.stderr?.on("error", (error) => noteStdioError("stderr", error));
+
     child.stdout?.on("data", (chunk) => {
       stdout += String(chunk);
     });
@@ -237,22 +251,44 @@ async function runCommand(params: PluginEnvironmentExecuteParams, timeoutMs: num
     child.on("close", (code, signal) => {
       if (timer) clearTimeout(timer);
       if (killTimer) clearTimeout(killTimer);
-      resolve({
-        exitCode: timedOut ? null : code,
-        signal,
-        timedOut,
-        stdout,
-        stderr,
-        metadata: {
-          startedAt,
-          commandLine: buildCommandLine(params.command, params.args),
-        },
+      // A closed-pipe error is emitted on a later turn than the write. Settle
+      // after that turn so the failure is part of this result, not an uncaught throw.
+      setImmediate(() => {
+        let exitCode = timedOut ? null : code;
+        let resolvedStderr = stderr;
+        if (stdioFailure && !timedOut && (exitCode === 0 || exitCode === null) && signal == null) {
+          exitCode = 1;
+          resolvedStderr = `${stderr}${stderr.length > 0 && !stderr.endsWith("\n") ? "\n" : ""}${stdioFailure}\n`;
+        }
+        resolve({
+          exitCode,
+          signal,
+          timedOut,
+          stdout,
+          stderr: resolvedStderr,
+          metadata: {
+            startedAt,
+            commandLine: buildCommandLine(params.command, params.args),
+          },
+        });
       });
     });
 
     if (params.stdin != null && child.stdin) {
-      child.stdin.write(params.stdin);
-      child.stdin.end();
+      if (child.killed || child.stdin.destroyed || child.exitCode !== null || child.signalCode !== null) {
+        if (!child.killed) {
+          stdioFailure ??= "stdin closed before the command finished (EPIPE)";
+          console.warn({ code: "EPIPE" }, stdioFailure);
+        }
+      } else {
+        try {
+          child.stdin.write(params.stdin);
+          child.stdin.end();
+        } catch (error) {
+          const err = error instanceof Error ? error : new Error(String(error));
+          noteStdioError("stdin", err);
+        }
+      }
     }
   });
 }

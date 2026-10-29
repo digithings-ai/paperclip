@@ -482,6 +482,16 @@ class CodexRpcClient {
   constructor() {
     this.proc.stdout.setEncoding("utf8");
     this.proc.stderr.setEncoding("utf8");
+    const onStdioError = (stream: "stdin" | "stdout" | "stderr", err: Error) => {
+      const code = (err as NodeJS.ErrnoException).code;
+      console.warn({ err, stream, code }, "codex app-server stdio error");
+      if (code === "EPIPE" || code === "ERR_STREAM_DESTROYED" || this.proc.exitCode !== null || this.proc.signalCode !== null) {
+        this.failPending(new Error(this.stderr.trim() || `codex app-server ${stream} closed (${code ?? "error"})`));
+      }
+    };
+    this.proc.stdin.on("error", (err) => onStdioError("stdin", err));
+    this.proc.stdout.on("error", (err) => onStdioError("stdout", err));
+    this.proc.stderr.on("error", (err) => onStdioError("stderr", err));
     this.proc.stdout.on("data", (chunk: string) => this.onStdout(chunk));
     this.proc.stderr.on("data", (chunk: string) => {
       this.stderr += chunk;
@@ -535,12 +545,54 @@ class CodexRpcClient {
         reject(new Error(`codex app-server timed out on ${method}`));
       }, timeoutMs);
       this.pending.set(id, { resolve, reject, timer });
-      this.proc.stdin.write(payload);
+      if (!this.stdinWritable()) {
+        this.pending.delete(id);
+        clearTimeout(timer);
+        reject(new Error(this.stderr.trim() || "codex app-server exited before the request was written"));
+        return;
+      }
+      try {
+        this.proc.stdin.write(payload);
+      } catch (err) {
+        this.pending.delete(id);
+        clearTimeout(timer);
+        const error = err instanceof Error ? err : new Error(String(err));
+        const code = (error as NodeJS.ErrnoException).code;
+        console.warn({ err: error, code }, "codex app-server stdin write failed");
+        reject(new Error(this.stderr.trim() || `codex app-server stdin closed (${code ?? "error"})`));
+      }
     });
   }
 
+  private stdinWritable(): boolean {
+    const stdin = this.proc.stdin;
+    return Boolean(
+      stdin &&
+      !stdin.destroyed &&
+      stdin.writable &&
+      !this.proc.killed &&
+      this.proc.exitCode === null &&
+      this.proc.signalCode === null,
+    );
+  }
+
+  private failPending(error: Error) {
+    for (const request of this.pending.values()) {
+      clearTimeout(request.timer);
+      request.reject(error);
+    }
+    this.pending.clear();
+  }
+
   private notify(method: string, params: Record<string, unknown> = {}) {
-    this.proc.stdin.write(JSON.stringify({ method, params }) + "\n");
+    if (!this.stdinWritable()) return;
+    try {
+      this.proc.stdin.write(JSON.stringify({ method, params }) + "\n");
+    } catch (err) {
+      const error = err instanceof Error ? err : new Error(String(err));
+      console.warn({ err: error }, "codex app-server notify failed");
+      this.failPending(error);
+    }
   }
 
   async initialize() {
