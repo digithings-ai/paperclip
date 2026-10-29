@@ -1,0 +1,134 @@
+name: Heartbeat run context columns acceptance
+
+# The scheduler read of heartbeat_runs must stay an index-only scan on
+# dt_perf_hr_company_agent_created_ctx_idx. A scan of the TOASTed
+# context_snapshot column reads the snapshot of every row of the table.
+#
+# This job builds a scratch database from the migration chain, runs the
+# benchmark and checks the plan of the scheduler query. The plan is published
+# as a job artifact. The row counts are small on purpose: the job shows the
+# plan, it does not measure the full load.
+
+on:
+  pull_request:
+    paths:
+      - "packages/db/**"
+      - "server/scripts/benchmark-heartbeat-run-context-columns.ts"
+      - ".github/scripts/check-heartbeat-run-context-columns-plan.mjs"
+      - ".github/scripts/tests/check-heartbeat-run-context-columns-plan.test.mjs"
+      - ".github/workflows/heartbeat-run-context-columns.yml"
+  push:
+    branches:
+      - master
+    paths:
+      - "packages/db/**"
+      - "server/scripts/benchmark-heartbeat-run-context-columns.ts"
+      - ".github/scripts/check-heartbeat-run-context-columns-plan.mjs"
+      - ".github/scripts/tests/check-heartbeat-run-context-columns-plan.test.mjs"
+      - ".github/workflows/heartbeat-run-context-columns.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: heartbeat-run-context-columns-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  acceptance:
+    name: Rebuild from the migrations and check the scheduler plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js for the pnpm bootstrap
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 24
+          package-manager-cache: false
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+        env:
+          NPM_CONFIG_AUDIT: "false"
+          NPM_CONFIG_FUND: "false"
+          NPM_CONFIG_UPDATE_NOTIFIER: "false"
+        with:
+          version: 9.15.4
+
+      - name: Install the dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! pnpm install --frozen-lockfile; then
+            echo '::notice title=Lockfile::checked-in lockfile is stale for this merge tree; resolving it inline'
+            pnpm install --resolution-only --ignore-scripts --no-frozen-lockfile
+            pnpm install --frozen-lockfile
+          fi
+
+      # The embedded PostgreSQL package ships its symlinks as a script that
+      # runs after the install. A resolution-only install skips it, so the
+      # symlinks are hydrated again here. The script swallows errors, so it is
+      # safe to run it twice.
+      - name: Hydrate the embedded PostgreSQL binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          hydrated=0
+          for dir in node_modules/.pnpm/@embedded-postgres+*/node_modules/@embedded-postgres/*/; do
+            if [ ! -f "$dir/scripts/hydrate-symlinks.js" ]; then
+              continue
+            fi
+            echo "Hydrate the embedded PostgreSQL symlinks in $dir"
+            (cd "$dir" && node scripts/hydrate-symlinks.js)
+            hydrated=1
+          done
+          if [ "$hydrated" -ne 1 ]; then
+            echo "The embedded PostgreSQL package is missing. The benchmark cannot run." >&2
+            exit 1
+          fi
+
+      - name: Find the benchmark script
+        id: benchmark
+        shell: bash
+        run: |
+          if [ -f server/scripts/benchmark-heartbeat-run-context-columns.ts ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::The benchmark script is not in this tree. There is no plan to check."
+          fi
+
+      - name: Run the benchmark on a scratch database
+        if: steps.benchmark.outputs.present == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd server
+          node --import tsx scripts/benchmark-heartbeat-run-context-columns.ts \
+            --target-rows 2000 --background-rows 4000 \
+            > ../heartbeat-run-context-columns-plan.txt
+          cat ../heartbeat-run-context-columns-plan.txt
+
+      - name: Check the plan of the scheduler query
+        if: steps.benchmark.outputs.present == 'true'
+        shell: bash
+        run: node .github/scripts/check-heartbeat-run-context-columns-plan.mjs heartbeat-run-context-columns-plan.txt
+
+      - name: Test the plan checker
+        shell: bash
+        run: node --test .github/scripts/tests/check-heartbeat-run-context-columns-plan.test.mjs
+
+      - name: Publish the plan of the scheduler query
+        if: steps.benchmark.outputs.present == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: heartbeat-run-context-columns-plan
+          path: heartbeat-run-context-columns-plan.txt
+          if-no-files-found: error
