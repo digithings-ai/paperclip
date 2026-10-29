@@ -21,6 +21,7 @@ import {
   issues,
   projectWorkspaces,
   projects,
+  workspaceOperations,
   workspaceRuntimeServices,
 } from "@paperclipai/db";
 import {
@@ -53,6 +54,7 @@ describe("execution workspace delivery state", () => {
     [{ sourceIssueTerminal: false, mergedPullRequest: false, pullRequestStateUnknown: false, isMergedIntoBase: true }, "merged_by_ancestry"],
     [{ sourceIssueTerminal: true, mergedPullRequest: false, pullRequestStateUnknown: false, isMergedIntoBase: false }, "unmerged"],
     [{ sourceIssueTerminal: true, mergedPullRequest: false, pullRequestStateUnknown: true, isMergedIntoBase: false }, "unknown"],
+    [{ sourceIssueTerminal: true, mergedPullRequest: false, pullRequestStateUnknown: false, isMergedIntoBase: null, worktreeMissing: true }, "worktree_missing"],
   ] as const)("derives %s as %s", (input, expected) => {
     expect(deriveExecutionWorkspaceDeliveryState(input)).toBe(expected);
   });
@@ -934,6 +936,24 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       expect(sweep).toMatchObject({ archived: 0, skippedCooldown: 1 });
       expect(await statusOf(seeded.executionWorkspaceId)).toBe("active");
     }, 20_000);
+
+    it("archives a dead worktree inside the cooldown window", async () => {
+      const seeded = await seedTerminalWorkspace();
+      await db
+        .update(executionWorkspaces)
+        .set({ updatedAt: new Date(nowMs - DAY_MS) })
+        .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+      await db
+        .update(issues)
+        .set({ completedAt: new Date(nowMs), updatedAt: new Date(nowMs) })
+        .where(eq(issues.id, seeded.sourceIssueId));
+      await fs.rm(seeded.worktreePath, { recursive: true, force: true });
+
+      const sweep = await cooldownService(7).sweepTerminalWorkspaces();
+
+      expect(sweep).toMatchObject({ archived: 1, skippedCooldown: 0, cleanupFailed: 0 });
+      expect(await statusOf(seeded.executionWorkspaceId)).toBe("archived");
+    }, 20_000);
   });
 
   it("does not treat an unrelated inbound issue mention as delivery evidence", async () => {
@@ -1060,6 +1080,144 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     expect(sweep).toMatchObject({ archived: 0, skippedUndelivered: 1 });
     expect(workspace?.status).toBe("active");
   });
+
+  it("archives a terminal workspace whose worktree path is gone", async () => {
+    const seeded = await seedTerminalWorkspace();
+    await fs.rm(seeded.worktreePath, { recursive: true, force: true });
+
+    const readiness = await svc.getCloseReadiness(seeded.executionWorkspaceId);
+    const sweep = await svc.sweepTerminalWorkspaces();
+    const [workspace] = await db
+      .select({
+        status: executionWorkspaces.status,
+        closedAt: executionWorkspaces.closedAt,
+        cleanupEligibleAt: executionWorkspaces.cleanupEligibleAt,
+        cleanupReason: executionWorkspaces.cleanupReason,
+      })
+      .from(executionWorkspaces)
+      .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+    const cleanupFailures = await db
+      .select({ id: activityLog.id })
+      .from(activityLog)
+      .where(eq(activityLog.action, "execution_workspace.issue_terminal_cleanup_failed"));
+
+    expect(readiness?.deliveryState).toBe("worktree_missing");
+    expect(sweep).toMatchObject({ archived: 1, cleanupFailed: 0, skippedUndelivered: 0 });
+    expect(workspace).toMatchObject({
+      status: "archived",
+      cleanupReason: "issue_terminal",
+    });
+    expect(workspace?.closedAt).toBeInstanceOf(Date);
+    expect(workspace?.cleanupEligibleAt).toBeInstanceOf(Date);
+    expect(cleanupFailures).toEqual([]);
+  }, 20_000);
+
+  it("does not archive a dead worktree whose source issue is still open", async () => {
+    const seeded = await seedTerminalWorkspace({ childStatus: "todo" });
+    await fs.rm(seeded.worktreePath, { recursive: true, force: true });
+
+    const sweep = await svc.sweepTerminalWorkspaces();
+    const [workspace] = await db
+      .select({ status: executionWorkspaces.status, closedAt: executionWorkspaces.closedAt })
+      .from(executionWorkspaces)
+      .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+
+    expect(sweep).toMatchObject({ archived: 0, skippedNonTerminalTree: 1 });
+    expect(workspace).toMatchObject({ status: "active", closedAt: null });
+  }, 20_000);
+
+  it("still skips a live workspace whose delivery state is unknown", async () => {
+    const seeded = await seedTerminalWorkspace();
+    await db
+      .update(executionWorkspaces)
+      .set({ baseRef: null })
+      .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+
+    const readiness = await svc.getCloseReadiness(seeded.executionWorkspaceId);
+    const sweep = await svc.sweepTerminalWorkspaces();
+    const [workspace] = await db
+      .select({ status: executionWorkspaces.status })
+      .from(executionWorkspaces)
+      .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+
+    expect(readiness?.deliveryState).toBe("unknown");
+    expect(sweep).toMatchObject({ archived: 0, skippedUndelivered: 1 });
+    expect(workspace?.status).toBe("active");
+    await expect(fs.access(seeded.worktreePath)).resolves.toBeUndefined();
+  }, 20_000);
+
+  it("does not archive a dirty workspace", async () => {
+    const seeded = await seedTerminalWorkspace();
+    await db
+      .update(executionWorkspaces)
+      .set({ baseRef: null })
+      .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+    await fs.writeFile(path.join(seeded.worktreePath, "uncommitted.txt"), "still here\n", "utf8");
+
+    const readiness = await svc.getCloseReadiness(seeded.executionWorkspaceId);
+    const sweep = await svc.sweepTerminalWorkspaces();
+    const [workspace] = await db
+      .select({ status: executionWorkspaces.status })
+      .from(executionWorkspaces)
+      .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+
+    expect(readiness?.git?.hasUntrackedFiles).toBe(true);
+    expect(sweep).toMatchObject({ archived: 0, skippedUndelivered: 1 });
+    expect(workspace?.status).toBe("active");
+    await expect(fs.access(seeded.worktreePath)).resolves.toBeUndefined();
+  }, 20_000);
+
+  it("skips a refused git branch -d on a dead worktree without writing cleanup_failed", async () => {
+    const seeded = await seedTerminalWorkspace();
+    const projectWorkspaceId = randomUUID();
+    await db.insert(projectWorkspaces).values({
+      id: projectWorkspaceId,
+      companyId: seeded.companyId,
+      projectId: seeded.projectId,
+      name: "Primary",
+      sourceType: "local_path",
+      isPrimary: true,
+      cwd: seeded.repoRoot,
+    });
+    await db
+      .update(executionWorkspaces)
+      .set({
+        projectWorkspaceId,
+        metadata: {
+          createdByRuntime: true,
+          gitBranchOwnershipVersion: 1,
+        },
+      })
+      .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+    await fs.rm(seeded.worktreePath, { recursive: true, force: true });
+
+    const sweep = await svc.sweepTerminalWorkspaces();
+    const [workspace] = await db
+      .select({
+        status: executionWorkspaces.status,
+        cleanupReason: executionWorkspaces.cleanupReason,
+      })
+      .from(executionWorkspaces)
+      .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+    const operations = await db
+      .select({ command: workspaceOperations.command, status: workspaceOperations.status })
+      .from(workspaceOperations)
+      .where(eq(workspaceOperations.executionWorkspaceId, seeded.executionWorkspaceId));
+    const branchDeletes = operations.filter((operation) => operation.command?.includes("branch -d "));
+    const cleanupFailures = await db
+      .select({ id: activityLog.id })
+      .from(activityLog)
+      .where(eq(activityLog.action, "execution_workspace.issue_terminal_cleanup_failed"));
+
+    expect(sweep).toMatchObject({ cleanupFailed: 0 });
+    expect(workspace?.status).toBe("archived");
+    expect(workspace?.cleanupReason?.startsWith("issue_terminal")).toBe(true);
+    expect(branchDeletes.length).toBeGreaterThan(0);
+    expect(branchDeletes.every((operation) => !operation.command?.includes("branch -D"))).toBe(true);
+    expect(operations.every((operation) => !operation.command?.includes("--force"))).toBe(true);
+    await expect(readGit(seeded.repoRoot, ["show-ref", "--verify", "refs/heads/PAP-16015-delivery"])).resolves.toContain("refs/heads/PAP-16015-delivery");
+    expect(cleanupFailures).toEqual([]);
+  }, 20_000);
 
   it("counts large untracked worktrees without allowing destructive cleanup", async () => {
     const seeded = await seedTerminalWorkspace({ mergedPr: true });
