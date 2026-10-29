@@ -4313,7 +4313,19 @@ rl.on("line", (line) => {
     }
   });
 
-  const remoteFailureCases = [
+  const remoteFailureCases: Array<{
+    name: string;
+    reasonCode: string;
+    status: number;
+    timeoutMs?: number;
+    response: (request: FakeMcpRequest) => {
+      status?: number;
+      headers?: Record<string, string>;
+      body?: unknown;
+      rawBody?: string;
+      delayMs?: number;
+    };
+  }> = [
     {
       name: "HTTP status",
       reasonCode: "mcp_remote_status",
@@ -4325,6 +4337,18 @@ rl.on("line", (line) => {
       reasonCode: "mcp_remote_invalid_json",
       status: 502,
       response: () => ({ rawBody: "not json" }),
+    },
+    {
+      name: "JSON-RPC error",
+      reasonCode: "remote_mcp_error",
+      status: 502,
+      response: ({ body }) => ({
+        body: {
+          jsonrpc: "2.0",
+          id: body?.id ?? "error",
+          error: { code: -32000, message: "upstream unavailable" },
+        },
+      }),
     },
     {
       name: "malformed MCP response",
@@ -4355,9 +4379,9 @@ rl.on("line", (line) => {
       const company = await createCompany(db);
       const agent = await createAgent(db, company.id);
       const { run } = await createIssueAndRun(db, company.id, agent.id);
-      const fake = await startFakeRemoteMcpServer(() => scenario.response());
+      const fake = await startFakeRemoteMcpServer((request) => scenario.response(request));
       try {
-        await createRemoteMcpTool(db, company.id, {
+        const { connection } = await createRemoteMcpTool(db, company.id, {
           applicationKey: `failure-${scenario.reasonCode}`,
           toolName: "kv_set",
           url: fake.url,
@@ -4407,6 +4431,32 @@ rl.on("line", (line) => {
           expect(failureAudit.details).toMatchObject({
             execution: { response: { httpStatus: 503 } },
           });
+        }
+
+        // A remote failure is scoped to the call, not to the connection. The
+        // connection stays discoverable, so the retry fails at call time with
+        // the real remote error instead of 404 tool_not_found at lookup.
+        const [failedConnection] = await db
+          .select()
+          .from(toolConnections)
+          .where(eq(toolConnections.id, connection.id));
+        expect(failedConnection.healthStatus).toBe(
+          scenario.status === 504 ? "tool_timeout" : "remote_failed",
+        );
+        const afterFailure = await gateway.listToolsForSession(session.token);
+        expect(afterFailure.map((tool) => tool.name)).toContain(connectedTool!.name);
+        if (scenario.status === 502) {
+          await gateway.executeTool({
+            sessionToken: session.token,
+            tool: connectedTool!.name,
+            parameters: { key: "alpha", value: "two" },
+            timeoutMs: scenario.timeoutMs,
+          }).then(
+            () => {
+              throw new Error("Expected the remote MCP retry to fail");
+            },
+            (error) => expectGatewayError(error, 502, scenario.reasonCode),
+          );
         }
       } finally {
         await fake.close();
@@ -4500,6 +4550,96 @@ rl.on("line", (line) => {
     }
   });
 
+  it("keeps a connection discoverable after a remote fetch failure, and fails the retry at call time", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    // The transport fails on every call, which is the 502
+    // mcp_remote_fetch_failed path seen in production.
+    const url = "http://127.0.0.1:9/mcp";
+    const failed = await createRemoteMcpTool(db, company.id, {
+      applicationKey: "remote-fetch-failure",
+      toolName: "kv_get",
+      url,
+    });
+    const condemned = await createRemoteMcpTool(db, company.id, {
+      applicationKey: "remote-fetch-failure-condemned",
+      toolName: "kv_set",
+      url,
+      healthStatus: "error",
+    });
+    const revoked = await createRemoteMcpTool(db, company.id, {
+      applicationKey: "remote-fetch-failure-revoked",
+      toolName: "kv_list",
+      url,
+      healthStatus: "missing_secret",
+    });
+    await allowAllToolsForAgent(db, company.id, agent.id);
+    const gateway = createTestToolGatewayService(db, {
+      remoteHttpRequest: async () => {
+        throw new Error("fetch failed");
+      },
+    });
+    const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+
+    const failedName = expectedConnectedToolName({
+      applicationKey: "remote-fetch-failure",
+      connectionId: failed.connection.id,
+      toolName: failed.catalogEntry.toolName,
+    });
+    const condemnedName = expectedConnectedToolName({
+      applicationKey: "remote-fetch-failure-condemned",
+      connectionId: condemned.connection.id,
+      toolName: condemned.catalogEntry.toolName,
+    });
+    const revokedName = expectedConnectedToolName({
+      applicationKey: "remote-fetch-failure-revoked",
+      connectionId: revoked.connection.id,
+      toolName: revoked.catalogEntry.toolName,
+    });
+
+    const before = await gateway.listToolsForSession(session.token);
+    expect(before.map((tool) => tool.name)).toContain(failedName);
+    expect(before.map((tool) => tool.name)).not.toContain(condemnedName);
+    expect(before.map((tool) => tool.name)).not.toContain(revokedName);
+
+    await gateway.executeTool({
+      sessionToken: session.token,
+      tool: failedName,
+      parameters: { key: "alpha" },
+      timeoutMs: 5000,
+    }).then(
+      () => {
+        throw new Error("Expected remote MCP fetch to fail");
+      },
+      (error) => expectGatewayError(error, 502, "mcp_remote_fetch_failed"),
+    );
+
+    // A failed remote call is scoped to that call, so the connection is not
+    // condemned. The next call fails at call time, not at 404 lookup.
+    const [connection] = await db
+      .select()
+      .from(toolConnections)
+      .where(eq(toolConnections.id, failed.connection.id));
+    expect(connection.healthStatus).toBe("remote_failed");
+    const after = await gateway.listToolsForSession(session.token);
+    expect(after.map((tool) => tool.name)).toContain(failedName);
+    expect(after.map((tool) => tool.name)).not.toContain(condemnedName);
+    expect(after.map((tool) => tool.name)).not.toContain(revokedName);
+
+    await gateway.executeTool({
+      sessionToken: session.token,
+      tool: failedName,
+      parameters: { key: "beta" },
+      timeoutMs: 5000,
+    }).then(
+      () => {
+        throw new Error("Expected the remote MCP retry to fail");
+      },
+      (error) => expectGatewayError(error, 502, "mcp_remote_fetch_failed"),
+    );
+  });
+
   it("keeps a connection discoverable after a background health probe fails, and fails the call at call time", async () => {
     const company = await createCompany(db);
     const agent = await createAgent(db, company.id);
@@ -4589,6 +4729,91 @@ rl.on("line", (line) => {
         expectGatewayError(error, 502, "mcp_remote_status");
         return true;
       });
+    } finally {
+      await fake.close();
+    }
+  });
+
+  it("re-admits a connection an earlier error hid once a later probe restores its health", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    // The remote answers a tools/list probe. The connection was hidden by a
+    // remote call that failed before this change shipped, so its stored
+    // health is the hiding "error" status.
+    const fake = await startFakeRemoteMcpServer(({ body }) => ({
+      body: body?.method === "tools/list"
+        ? {
+            jsonrpc: "2.0",
+            id: body?.id,
+            result: {
+              tools: [
+                { name: "kv_get", inputSchema: { type: "object" } },
+              ],
+            },
+          }
+        : {
+            jsonrpc: "2.0",
+            id: body?.id,
+            result: { content: [{ type: "text", text: "ok" }] },
+          },
+    }));
+    try {
+      const hidden = await createRemoteMcpTool(db, company.id, {
+        applicationKey: "hidden-readmission",
+        toolName: "kv_get",
+        url: fake.url,
+        healthStatus: "error",
+      });
+      await allowAllToolsForAgent(db, company.id, agent.id);
+      // The failing call happened 16 minutes ago, so the next sweep probes
+      // this connection. Every other connection is not due.
+      await db
+        .update(toolConnections)
+        .set({ healthCheckedAt: new Date(Date.now() - 16 * 60 * 1000) })
+        .where(eq(toolConnections.id, hidden.connection.id));
+      await db
+        .update(toolConnections)
+        .set({ healthCheckedAt: new Date() })
+        .where(ne(toolConnections.id, hidden.connection.id));
+
+      const gateway = createTestToolGatewayService(db);
+      const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+      const toolName = expectedConnectedToolName({
+        applicationKey: "hidden-readmission",
+        connectionId: hidden.connection.id,
+        toolName: hidden.catalogEntry.toolName,
+      });
+
+      // The hiding status keeps the tool out of every catalogue, which is the
+      // remaining half of the class for a connection hidden before the fix.
+      const before = await gateway.listToolsForSession(session.token);
+      expect(before.map((tool) => tool.name)).not.toContain(toolName);
+
+      // The background probe is the automatic clear. It writes "ok", which
+      // the catalogue filter keeps.
+      const access = toolAccessService(db);
+      const sweep = await access.sweepConnectionHealth();
+      expect(sweep.failedConnectionIds).not.toContain(hidden.connection.id);
+      const [connection] = await db
+        .select()
+        .from(toolConnections)
+        .where(eq(toolConnections.id, hidden.connection.id));
+      expect(connection.healthStatus).toBe("ok");
+
+      const after = await gateway.listToolsForSession(session.token);
+      expect(after.map((tool) => tool.name)).toContain(toolName);
+
+      // Re-admission is real, not a catalogue row that looks present: the
+      // name now runs at call time instead of answering 404 at lookup.
+      await expect(
+        gateway.executeTool({
+          sessionToken: session.token,
+          tool: toolName,
+          parameters: { key: "alpha", value: "beta" },
+          timeoutMs: 5000,
+        }),
+      ).resolves.toBeTruthy();
     } finally {
       await fake.close();
     }

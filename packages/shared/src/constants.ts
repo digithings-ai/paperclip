@@ -1052,6 +1052,12 @@ export const TOOL_CONNECTION_HEALTH_STATUSES = [
   // a call that really fails answers with the real error at call time. The
   // precise reason stays in the health message and in the audit record.
   "probe_failed",
+  // A remote MCP call failed at the transport or protocol level (HTTP error,
+  // invalid JSON, JSON-RPC error, oversized response, fetch failure). Scoped
+  // to that call, not to the connection: the connection stays discoverable so
+  // its other tools keep working and the next successful call restores "ok".
+  // The precise reason stays in the health message and in the audit record.
+  "remote_failed",
 ] as const;
 export type ToolConnectionHealthStatus = (typeof TOOL_CONNECTION_HEALTH_STATUSES)[number];
 
