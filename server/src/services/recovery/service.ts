@@ -78,6 +78,7 @@ import {
   isProcessGroupAlive,
 } from "../local-service-supervisor.js";
 import { redactSensitiveText } from "../../redaction.js";
+import { redactContextSnapshotForPersistence } from "../run-output-redaction.js";
 import { isUniqueViolation } from "../../db-errors.js";
 import {
   logActivity,
@@ -2667,15 +2668,17 @@ export function recoveryService(
           scheduledRetryAt: retryAt,
           scheduledRetryAttempt: 1,
           scheduledRetryReason: "provider_quota_recovery",
-          contextSnapshot: withRecoveryContext(
-            {
-              issueId: input.issue.id,
-              taskId: input.issue.id,
-              wakeReason: "provider_quota_recovery",
-              retryReason: "provider_quota_recovery",
-              providerQuotaRetryNotBefore: retryAt.toISOString(),
-            },
-            "normal_model",
+          contextSnapshot: redactContextSnapshotForPersistence(
+            withRecoveryContext(
+              {
+                issueId: input.issue.id,
+                taskId: input.issue.id,
+                wakeReason: "provider_quota_recovery",
+                retryReason: "provider_quota_recovery",
+                providerQuotaRetryNotBefore: retryAt.toISOString(),
+              },
+              "normal_model",
+            ),
           ),
           updatedAt: now,
         })
@@ -3256,7 +3259,7 @@ export function recoveryService(
                 scheduledRetryAttempt: input.attempt,
                 scheduledRetryReason: ISSUE_DISPOSITION_REPAIR_RETRY_REASON,
                 responsibleUserId: sourceRun?.responsibleUserId ?? null,
-                contextSnapshot: context,
+                contextSnapshot: redactContextSnapshotForPersistence(context),
                 updatedAt: now,
               })
               .returning()

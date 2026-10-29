@@ -3,6 +3,7 @@ import { and, eq } from "drizzle-orm";
 import { agentWakeupRequests, heartbeatRuns, type Db } from "@paperclipai/db";
 import { accountingForScheduledRetry, executionFailureRetryCount } from "../execution-recovery-attempt.js";
 import { NATIVE_PROVIDER_CAPACITY_MAX_RETRIES, NATIVE_PROVIDER_OVERLOADED_CODE, NATIVE_PROVIDER_OVERLOADED_MESSAGE } from "./native-provider-failure.js";
+import { redactContextSnapshotForPersistence } from "../run-output-redaction.js";
 
 /** Called under the finalizer's issue/coordinator locks, in the status-effect transaction. */
 export async function materializeNativeProviderCapacityRetry(input: {
@@ -63,7 +64,7 @@ export async function materializeNativeProviderCapacityRetry(input: {
     retryOfRunId: run.id, scheduledRetryReason: NATIVE_PROVIDER_OVERLOADED_CODE,
     scheduledRetryAttempt: attempt, scheduledRetryAt: dueAt,
     error: NATIVE_PROVIDER_OVERLOADED_MESSAGE, errorCode: NATIVE_PROVIDER_OVERLOADED_CODE,
-    contextSnapshot,
+    contextSnapshot: redactContextSnapshotForPersistence(contextSnapshot),
   });
   return retryId;
 }

@@ -10,6 +10,7 @@ import {
   withQueuedCommentIdsInWakePayload,
 } from "../../../services/issue-queued-comment-queue.js";
 import { logActivity as persistActivityLogRow, type ActivityPublication } from "../../../services/activity-log.js";
+import { redactContextSnapshotForPersistence } from "../../../services/run-output-redaction.js";
 import { decideQueuedCommentWakeLookup } from "../domain/policy.js";
 import { parseObject, readNonEmptyString } from "../domain/values.js";
 import { QueuedCommentMutationError } from "../application/queued-comment-use-cases.js";
@@ -74,7 +75,12 @@ function buildTransaction(tx: Db, companyId: string, deps: QueuedCommentQueuePos
     async updateQueueRunCommentIds({ queueRunId, contextSnapshot, ids, updatedAt }) {
       const row = await tx
         .update(heartbeatRuns)
-        .set({ contextSnapshot: withQueuedCommentIdsInRunContext(contextSnapshot, ids), updatedAt })
+        .set({
+          contextSnapshot: redactContextSnapshotForPersistence(
+            withQueuedCommentIdsInRunContext(contextSnapshot, ids),
+          ),
+          updatedAt,
+        })
         .where(and(eq(heartbeatRuns.id, queueRunId), eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.status, "queued")))
         .returning()
         .then((rows) => rows[0] ?? null);
