@@ -3763,6 +3763,80 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
     });
   });
 
+  it("records the reuse of a workspace named without a preference", async () => {
+    const companyId = randomUUID();
+    const projectId = randomUUID();
+    const projectWorkspaceId = randomUUID();
+    const executionWorkspaceId = randomUUID();
+    const otherIssueId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
+
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Workspace project",
+      status: "in_progress",
+    });
+
+    await db.insert(projectWorkspaces).values({
+      id: projectWorkspaceId,
+      companyId,
+      projectId,
+      name: "Primary workspace",
+      isPrimary: true,
+    });
+
+    await db.insert(issues).values({
+      id: otherIssueId,
+      companyId,
+      projectId,
+      projectWorkspaceId,
+      title: "Owner issue",
+      status: "in_progress",
+      priority: "medium",
+    });
+
+    await db.insert(executionWorkspaces).values({
+      id: executionWorkspaceId,
+      companyId,
+      projectId,
+      projectWorkspaceId,
+      mode: "isolated_workspace",
+      strategyType: "git_worktree",
+      name: "Other issue worktree",
+      status: "active",
+      providerType: "git_worktree",
+      sourceIssueId: otherIssueId,
+    });
+
+    // The request names the workspace and no preference. The binding is the
+    // request's intent, so the preference must say that the run reuses it.
+    // Without this the issue is born with a concrete mode and no preference,
+    // which the audit reports as DROP.
+    const created = await svc.create(companyId, {
+      projectId,
+      title: "Issue on a named workspace",
+      projectWorkspaceId,
+      executionWorkspaceId,
+      executionWorkspaceSettings: {
+        mode: "isolated_workspace",
+      },
+    });
+
+    expect(created.executionWorkspaceId).toBe(executionWorkspaceId);
+    expect(created.executionWorkspacePreference).toBe("reuse_existing");
+    expect(created.executionWorkspaceSettings).toEqual({
+      mode: "isolated_workspace",
+    });
+  });
+
   it("inherits workspace linkage from an explicit source issue without creating a parent-child relationship", async () => {
     const companyId = randomUUID();
     const projectId = randomUUID();
@@ -3992,7 +4066,9 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
     expect(child.projectId).toBe(projectId);
     expect(child.projectWorkspaceId).toBe(projectWorkspaceId);
     expect(child.executionWorkspaceId).toBeNull();
-    expect(child.executionWorkspacePreference).toBeNull();
+    // The child inherits the parent's workspace strategy, not a workspace: the
+    // resolved mode lands as the preference as well, so the two fields agree.
+    expect(child.executionWorkspacePreference).toBe("isolated_workspace");
     expect(child.executionWorkspaceSettings).toEqual({
       mode: "isolated_workspace",
       environmentId,

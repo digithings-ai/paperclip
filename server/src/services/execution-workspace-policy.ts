@@ -85,7 +85,153 @@ export function resolvePinnedIssueWorkspaceStrategyType(input: {
 }
 
 export function hasReusableExecutionWorkspaceBinding(issue: UnrunnableWorktreeIssueRef): boolean {
-  return Boolean(issue.executionWorkspaceId && issue.executionWorkspacePreference === "reuse_existing");
+  if (!issue.executionWorkspaceId) return false;
+  if (issue.executionWorkspacePreference === "reuse_existing") return true;
+  // A bound workspace with a preference that names a concrete mode is the
+  // issue's own checkout, and the runtime restores it instead of realizing it
+  // again. Reading only "reuse_existing" here would make the unrunnable
+  // worktree guard refuse a pinned issue that owns its workspace, as soon as
+  // the runtime wrote a preference that agrees with the mode.
+  return isCommittedExecutionWorkspacePreference(issue.executionWorkspacePreference);
+}
+
+/**
+ * A preference that names a concrete mode is the issue's own commitment to
+ * that mode.
+ *
+ * A null preference is the legacy state of an issue that was never given one,
+ * and `inherit` is unresolved: neither says anything about the workspace the
+ * issue is bound to.
+ */
+export function isCommittedExecutionWorkspacePreference(
+  preference: string | null | undefined,
+): boolean {
+  return (
+    preference === "isolated_workspace" ||
+    preference === "operator_branch" ||
+    preference === "shared_workspace"
+  );
+}
+
+/**
+ * Whether a persisted workspace row is the workspace of this issue.
+ *
+ * The runtime binds an issue to a workspace the run just provisioned, and the
+ * row records the issue that owns it in `sourceIssueId`. A row without an
+ * owner belongs to no issue, and a row owned by a different issue is a
+ * cross-issue share. Both are not this issue's workspace.
+ *
+ * This comparison decides whether the write-back keeps the isolated preference
+ * or keeps `reuse_existing`. It is a pure function so the decision is pinned by
+ * a suite that runs on every host, not only by the embedded-Postgres suite
+ * that covers the whole bind.
+ */
+export function isExecutionWorkspaceOwnedByIssue(input: {
+  workspaceSourceIssueId: string | null | undefined;
+  issueId: string | null | undefined;
+}): boolean {
+  const source =
+    typeof input.workspaceSourceIssueId === "string"
+      ? input.workspaceSourceIssueId.trim()
+      : "";
+  const issue = typeof input.issueId === "string" ? input.issueId.trim() : "";
+  return source.length > 0 && source === issue;
+}
+
+/**
+ * The preference an issue keeps after the runtime binds it to a persisted
+ * workspace.
+ *
+ * An issue that owns its own isolated workspace keeps the isolated preference
+ * it was created with. `reuse_existing` next to `settings.mode:
+ * isolated_workspace` is the pair that reads as "this work belongs to another
+ * issue's worktree" (DIG-1636), and the runtime wrote that pair on every
+ * issue it bound to its own worktree.
+ *
+ * A workspace owned by another issue keeps the reuse preference: that binding
+ * is the only honest description of it, and the pair stays visible so the
+ * cross-issue binding can be repaired.
+ */
+export function resolveIssueExecutionWorkspacePreferenceWriteBack(input: {
+  nextIssueWorkspaceMode: string;
+  boundWorkspaceOwnedByThisIssue: boolean;
+}): "isolated_workspace" | "operator_branch" | "reuse_existing" {
+  if (input.boundWorkspaceOwnedByThisIssue) {
+    // The workspace is the issue's own checkout. The preference keeps naming
+    // the mode that workspace has, so the preference and the settings cannot
+    // read as a conflict after the bind. `operator_branch` is the same case as
+    // `isolated_workspace`: the mode describes the issue's own checkout.
+    if (input.nextIssueWorkspaceMode === "isolated_workspace") {
+      return "isolated_workspace";
+    }
+    if (input.nextIssueWorkspaceMode === "operator_branch") {
+      return "operator_branch";
+    }
+  }
+  // A workspace another issue owns keeps the reuse preference: that binding is
+  // the only honest description of it, and it stays visible so the cross-issue
+  // binding can be repaired. A shared workspace keeps it as well: the checkout
+  // belongs to the project, and the mode already says so.
+  return "reuse_existing";
+}
+
+/**
+ * The preference a new issue gets when the platform resolved an isolation
+ * mode for it.
+ *
+ * The request's own preference always wins. When the request named a
+ * workspace and no preference, the preference is the reuse of that binding.
+ * When the request named no preference and the issue has no workspace of its
+ * own, the mode the platform resolved becomes the preference: an issue that
+ * carries a concrete mode next to a null preference cannot be told apart from
+ * a request that asked for nothing (DIG-1636).
+ */
+export function resolveIssueExecutionWorkspacePreferenceForCreate(input: {
+  effectivePreference?: string | null;
+  requestNamedPreference: boolean;
+  hasBoundWorkspace: boolean;
+  resolvedMode?: unknown;
+}): string | null {
+  if (input.effectivePreference != null) return input.effectivePreference;
+  if (input.requestNamedPreference) return null;
+  // The request named a workspace and no preference. The binding is the
+  // request's intent, so the preference says the run reuses that workspace.
+  // A null preference here is the state the audit calls DROP: the issue
+  // carries a concrete mode and no preference, and nothing says what the
+  // binding is for.
+  if (input.hasBoundWorkspace) return "reuse_existing";
+  const mode = input.resolvedMode;
+  if (mode === "isolated_workspace" || mode === "operator_branch") {
+    return mode;
+  }
+  // A shared workspace is the project's checkout, not the issue's own, and the
+  // shared path keeps the reuse preference it has always carried. Writing
+  // "shared_workspace" here would store a value the runtime replaces on the
+  // first run, so the created issue and the bound issue would disagree about
+  // the same field.
+  return null;
+}
+
+/**
+ * Whether the settings of an issue may be merged into the config of the
+ * workspace row it is bound to.
+ *
+ * A reuse binding keeps the behaviour the platform had: the settings of the
+ * issue that shares the checkout are merged into that checkout. A workspace
+ * the issue owns tracks the settings of the issue that owns it, so the
+ * checkout does not keep the config it was created with. A workspace owned by
+ * another issue is left alone: its config belongs to that other issue.
+ */
+export function shouldMergeExecutionWorkspaceConfigIntoWorkspace(input: {
+  nextExecutionWorkspacePreference: string | null | undefined;
+  workspaceSourceIssueId: string | null | undefined;
+  issueId: string | null | undefined;
+}): boolean {
+  if (input.nextExecutionWorkspacePreference === "reuse_existing") return true;
+  return isExecutionWorkspaceOwnedByIssue({
+    workspaceSourceIssueId: input.workspaceSourceIssueId,
+    issueId: input.issueId,
+  });
 }
 
 export function isUnrunnableWorktreeCombo(input: {
