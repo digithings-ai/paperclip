@@ -48,6 +48,10 @@ import detectPort from "detect-port";
 import { createApp } from "./app.js";
 import { loadConfig } from "./config.js";
 import { logger } from "./middleware/logger.js";
+import {
+  runStartupNativeRecoveryFailClosed,
+  runStartupRecoverableSteps,
+} from "./startup-heartbeat-recovery.js";
 import { setStartupRecoveryPhase } from "./startup-recovery-state.js";
 import {
   StartupRefusalError,
@@ -1463,32 +1467,9 @@ async function startServerWithDatabaseTeardown(
         // Legacy remote recovery releases sandbox leases. Wait for provider
         // workers before cleanup or retry admission, including unmanaged installs.
         await app.locals.bundledPluginsStartup;
-        try {
-          const nativeRecovery =
-            await heartbeat.recoverNativeRunsAfterRestart();
-          if (nativeRecovery.dispositions.length > 0) {
-            logger.info(
-              {
-                restartKind: nativeRecovery.restartKind,
-                claims: nativeRecovery.claims.map((claim) => ({
-                  runId: claim.runId,
-                  disposition: claim.kind,
-                  controllerGeneration: claim.controllerGeneration,
-                })),
-                awaitingEvidenceRunIds:
-                  nativeRecovery.awaitingEvidenceRunIds,
-                blockedRunIds: nativeRecovery.blockedRunIds,
-              },
-              "startup native runner restart recovery classified",
-            );
-          }
-        } catch (err) {
-          logger.error(
-            { err },
-            "startup native runner restart recovery failed closed",
-          );
-          throw err;
-        }
+        // Fail-closed: a native runner recovery failure rethrows and aborts
+        // startup recovery (see runStartupNativeRecoveryFailClosed).
+        await runStartupNativeRecoveryFailClosed({ heartbeat, logger });
         try {
           const hotRestart = await heartbeat.reconcileHotRestartAdoption();
           if (hotRestart.mode === "reported") {
@@ -1524,75 +1505,14 @@ async function startServerWithDatabaseTeardown(
           }
         }
 
-        const promotion = await heartbeat.promoteDueScheduledRetries();
-        await heartbeat.resumeQueuedRuns();
-        const recoveredGoalActions = await heartbeat.recoverPendingSessionGoalActions();
-        if (
-          recoveredGoalActions.enqueued > 0 ||
-          recoveredGoalActions.invalid > 0
-        ) {
-          logger.warn(
-            recoveredGoalActions,
-            "startup session-goal action outbox recovery reconciled pending controls",
-          );
-        }
-        const recoveredGoals = await heartbeat.recoverActiveSessionGoals();
-        if (recoveredGoals.enqueued > 0) {
-          logger.warn(
-            recoveredGoals,
-            "startup session-goal recovery resumed durable agent goals",
-          );
-        }
-        const reconciled = await heartbeat.reconcileStrandedAssignedIssues();
-        if (
-          promotion.promoted > 0 ||
-          reconciled.assignmentDispatched > 0 ||
-          reconciled.dispatchRequeued > 0 ||
-          reconciled.continuationRequeued > 0 ||
-          reconciled.successfulRunHandoffEscalated > 0 ||
-          reconciled.successfulRunHandoffRetried > 0 ||
-          reconciled.escalated > 0
-        ) {
-          logger.warn(
-            { promotedScheduledRetries: promotion.promoted, promotedScheduledRetryRunIds: promotion.runIds, ...reconciled },
-            "startup heartbeat recovery changed assigned issue state",
-          );
-        }
-
-        const dependencyWakesReconciled = await heartbeat.reconcileResolvedDependencyWakes();
-        if (dependencyWakesReconciled.healed > 0) {
-          logger.warn(
-            { ...dependencyWakesReconciled },
-            "startup dependency-wake reconciliation restored task execution paths",
-          );
-        }
-
-        const taskWatchdogsReconciled = await heartbeat.reconcileTaskWatchdogs();
-        if (taskWatchdogsReconciled.triggered > 0) {
-          logger.warn(
-            { ...taskWatchdogsReconciled },
-            "startup task-watchdog reconciliation triggered watchdog work",
-          );
-        }
-
-        const scanned = await heartbeat.scanSilentActiveRuns();
-        if (scanned.created > 0 || scanned.escalated > 0) {
-          logger.warn({ ...scanned }, "startup active-run output watchdog created review work");
-        }
-
-        const swept = await heartbeat.sweepStaleIssueLocks();
-        if (swept.cleared > 0) {
-          logger.warn({ ...swept }, "startup stale-lock sweeper cleared issue locks");
-        }
-
-        const continued = await heartbeat.sweepOrphanedRunContinuations();
-        if (continued.continued > 0) {
-          logger.warn(
-            { ...continued },
-            "startup orphaned-run sweeper continued terminalized runs",
-          );
-        }
+        // Every step below is recoverable: each runs in its own try/catch
+        // (see runStartupRecoverableSteps) so one failing pass, such as a
+        // wake for a paused seat, cannot abort startup. Only the native runner
+        // restart recovery above stays fail-closed.
+        await runStartupRecoverableSteps({ heartbeat, logger });
       })().catch((err) => {
+        // Only fail-closed steps (native runner restart recovery, bundled
+        // plugin startup) reach here; recoverable steps log and continue.
         logger.error({ err }, "startup heartbeat recovery failed");
         throw err;
       });
