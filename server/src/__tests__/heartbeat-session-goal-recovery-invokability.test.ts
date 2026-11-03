@@ -8,6 +8,7 @@ import {
   agentTaskSessions,
   agentWakeupRequests,
   agents,
+  budgetPolicies,
   companies,
   companyMemberships,
   companySkills,
@@ -70,6 +71,8 @@ if (!embeddedPostgresSupport.supported) {
 
 const SKIP_MESSAGE = "heartbeat recovery skipped wake for non-invokable agent";
 const SUMMARY_MESSAGE = "heartbeat recovery pass skipped non-invokable agents";
+const FAILED_MESSAGE = "heartbeat recovery wake failed - continuing with the next item";
+const FAILED_SUMMARY_MESSAGE = "heartbeat recovery pass finished with failed items";
 
 describeEmbeddedPostgres("session-goal recovery skips non-invokable agents", () => {
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
@@ -100,6 +103,7 @@ describeEmbeddedPostgres("session-goal recovery skips non-invokable agents", () 
     await db.delete(agentWakeupRequests);
     await db.delete(agentRuntimeState);
     await db.delete(agents);
+    await db.delete(budgetPolicies);
     await db.delete(companyMemberships);
     await db.delete(companySkills);
     await db.delete(companies);
@@ -169,6 +173,29 @@ describeEmbeddedPostgres("session-goal recovery skips non-invokable agents", () 
     return { agentId, issueId, sessionId: session!.id };
   }
 
+  // An exceeded agent-scope hard-stop budget makes enqueueWakeup throw a
+  // budget 409. That isn't an invokability reason, so it is not a skip.
+  async function exceedAgentBudget(companyId: string, agentId: string) {
+    await db.insert(budgetPolicies).values({
+      companyId,
+      scopeType: "agent",
+      scopeId: agentId,
+      metric: "billed_cents",
+      windowKind: "calendar_month_utc",
+      amount: 1,
+      hardStopEnabled: true,
+      isActive: true,
+    });
+    await db.insert(costEvents).values({
+      companyId,
+      agentId,
+      provider: "test",
+      model: "test-model",
+      costCents: 5,
+      occurredAt: new Date(),
+    });
+  }
+
   async function wakeCount(agentId: string) {
     const rows = await db
       .select({ id: agentWakeupRequests.id })
@@ -215,6 +242,30 @@ describeEmbeddedPostgres("session-goal recovery skips non-invokable agents", () 
       expect(result).toMatchObject({ scanned: 2, enqueued: 1, notInvokableSkipped: 1 });
       expect(await wakeCount(parked.agentId)).toBe(0);
       expect(await wakeCount(active.agentId)).toBe(1);
+    });
+
+    it("counts a budget 409 as failed and still wakes the rest of the pass", async () => {
+      const error = vi.spyOn(logger, "error");
+      const warn = vi.spyOn(logger, "warn");
+      // The budget 409 is not an invokability skip, so it must be counted as
+      // failed, and it must not stop the other agent in the pass.
+      const companyId = await seedCompany();
+      const blocked = await seedAgentWithGoalSession(companyId, "idle");
+      await exceedAgentBudget(companyId, blocked.agentId);
+      const active = await seedAgentWithGoalSession(companyId, "idle");
+
+      const result = await heartbeatService(db).recoverActiveSessionGoals();
+
+      expect(result).toMatchObject({ scanned: 2, enqueued: 1, notInvokableSkipped: 0, failed: 1 });
+      expect(await wakeCount(active.agentId)).toBe(1);
+      expect(error).toHaveBeenCalledWith(
+        expect.objectContaining({ agentId: blocked.agentId, sessionId: blocked.sessionId, pass: "session_goal_recovery" }),
+        FAILED_MESSAGE,
+      );
+      expect(warn).toHaveBeenCalledWith(
+        expect.objectContaining({ failed: 1, pass: "session_goal_recovery" }),
+        FAILED_SUMMARY_MESSAGE,
+      );
     });
   });
 
@@ -271,6 +322,30 @@ describeEmbeddedPostgres("session-goal recovery skips non-invokable agents", () 
       expect(result).toMatchObject({ scanned: 2, enqueued: 1, notInvokableSkipped: 1 });
       expect(await wakeCount(parked.agentId)).toBe(0);
       expect(await wakeCount(active.agentId)).toBe(1);
+    });
+
+    it("counts a budget 409 as failed, keeps that action pending, and still delivers the rest", async () => {
+      const error = vi.spyOn(logger, "error");
+      const companyId = await seedCompany();
+      const blocked = await seedAgentWithGoalSession(companyId, "idle");
+      await exceedAgentBudget(companyId, blocked.agentId);
+      const active = await seedAgentWithGoalSession(companyId, "idle");
+      const blockedAction = await seedPendingAction(companyId, blocked.sessionId);
+      await seedPendingAction(companyId, active.sessionId);
+
+      const result = await heartbeatService(db).recoverPendingSessionGoalActions();
+
+      expect(result).toMatchObject({ scanned: 2, enqueued: 1, notInvokableSkipped: 0, failed: 1 });
+      expect(await wakeCount(active.agentId)).toBe(1);
+      const [stored] = await db
+        .select({ status: agentSessionGoalActions.status })
+        .from(agentSessionGoalActions)
+        .where(eq(agentSessionGoalActions.id, blockedAction.id));
+      expect(stored?.status).toBe("pending");
+      expect(error).toHaveBeenCalledWith(
+        expect.objectContaining({ actionId: blockedAction.id, agentId: blocked.agentId, pass: "session_goal_action_recovery" }),
+        FAILED_MESSAGE,
+      );
     });
   });
 });

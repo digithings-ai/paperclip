@@ -20078,7 +20078,7 @@ export function heartbeatService(
 
   async function recoverActiveSessionGoals() {
     if ((await getSchedulingSuppression()).suppressed) {
-      return { scanned: 0, enqueued: 0, notInvokableSkipped: 0 };
+      return { scanned: 0, enqueued: 0, notInvokableSkipped: 0, failed: 0 };
     }
     const sessions = await db
       .select({
@@ -20105,40 +20105,57 @@ export function heartbeatService(
         ),
       );
     let enqueued = 0;
-    const gate = createRecoveryWakeGate("session_goal_recovery");
+    let failed = 0;
+    const pass = "session_goal_recovery";
+    const gate = createRecoveryWakeGate(pass);
     for (const session of sessions) {
       const logContext = { sessionId: session.id, issueId: session.issueId };
-      if (await gate.skip(session.agentId, logContext)) continue;
-      const outcome = await gate.wakeOrSkip(session.agentId, logContext, () =>
-        enqueueWakeup(session.agentId, {
-          source: "automation",
-          triggerDetail: "system",
-          reason: "goal_control",
-          payload: { issueId: session.issueId, intent: "goal_recovery" },
-          idempotencyKey: `goal_recovery:${session.id}:${session.revision}`,
-          requestedByActorType: "system",
-          contextSnapshot: {
-            issueId: session.issueId,
-            taskKey: session.issueId,
-            resumeSessionGoalHeartbeat: true,
-            skipIssueComment: true,
-          },
-        }),
-      );
-      if (!outcome.skipped && outcome.value) enqueued += 1;
+      // Per-item isolation: one agent's error (for example a budget 409, which
+      // is not an invokability skip) is counted as failed and logged, and the
+      // rest of the pass still runs. The next pass retries it.
+      try {
+        if (await gate.skip(session.agentId, logContext)) continue;
+        const outcome = await gate.wakeOrSkip(session.agentId, logContext, () =>
+          enqueueWakeup(session.agentId, {
+            source: "automation",
+            triggerDetail: "system",
+            reason: "goal_control",
+            payload: { issueId: session.issueId, intent: "goal_recovery" },
+            idempotencyKey: `goal_recovery:${session.id}:${session.revision}`,
+            requestedByActorType: "system",
+            contextSnapshot: {
+              issueId: session.issueId,
+              taskKey: session.issueId,
+              resumeSessionGoalHeartbeat: true,
+              skipIssueComment: true,
+            },
+          }),
+        );
+        if (!outcome.skipped && outcome.value) enqueued += 1;
+      } catch (err) {
+        failed += 1;
+        logger.error(
+          { ...logContext, err, agentId: session.agentId, pass },
+          "heartbeat recovery wake failed - continuing with the next item",
+        );
+      }
     }
     const result = {
       scanned: sessions.length,
       enqueued,
       notInvokableSkipped: gate.notInvokableSkipped,
+      failed,
     };
     gate.summarize(result);
+    if (failed > 0) {
+      logger.warn({ ...result, pass }, "heartbeat recovery pass finished with failed items");
+    }
     return result;
   }
 
   async function recoverPendingSessionGoalActions() {
     if ((await getSchedulingSuppression()).suppressed) {
-      return { scanned: 0, enqueued: 0, alreadyQueued: 0, invalid: 0, notInvokableSkipped: 0 };
+      return { scanned: 0, enqueued: 0, alreadyQueued: 0, invalid: 0, notInvokableSkipped: 0, failed: 0 };
     }
     const pending = await db
       .select({
@@ -20175,80 +20192,93 @@ export function heartbeatService(
     let enqueued = 0;
     let alreadyQueued = 0;
     let invalid = 0;
-    const gate = createRecoveryWakeGate("session_goal_action_recovery");
+    let failed = 0;
+    const pass = "session_goal_action_recovery";
+    const gate = createRecoveryWakeGate(pass);
     for (const action of pending) {
-      const control = parseNativeSessionGoalControl(action.payload);
-      if (!control || control.requestId !== action.requestId) {
-        invalid += 1;
-        await failRunnerGoalAction(
-          db,
-          {
-            companyId: action.companyId,
+      // Per-item isolation: one action's error (for example a budget 409) is
+      // counted as failed and logged, the action stays as it was, and the rest
+      // of the pass still runs. The next pass retries it.
+      try {
+        const control = parseNativeSessionGoalControl(action.payload);
+        if (!control || control.requestId !== action.requestId) {
+          invalid += 1;
+          await failRunnerGoalAction(
+            db,
+            {
+              companyId: action.companyId,
+              issueId: action.issueId,
+              agentId: action.agentId,
+              adapterType: action.adapterType,
+            },
+            action.requestId,
+            "session_goal_control_payload_invalid",
+          ).catch(() => undefined);
+          continue;
+        }
+
+        const inFlight = await db
+          .select({ contextSnapshot: heartbeatRuns.contextSnapshot })
+          .from(heartbeatRuns)
+          .where(
+            and(
+              eq(heartbeatRuns.companyId, action.companyId),
+              eq(heartbeatRuns.agentId, action.agentId),
+              inArray(heartbeatRuns.status, [
+                "queued",
+                "scheduled_retry",
+                "running",
+              ]),
+            ),
+          )
+          .then((runs) =>
+            runs.some(
+              (run) =>
+                readNonEmptyString(
+                  parseObject(run.contextSnapshot).goalControlRequestId,
+                ) === action.requestId,
+            ),
+          );
+        if (inFlight) {
+          alreadyQueued += 1;
+          continue;
+        }
+
+        // A parked seat keeps its pending action; it is delivered on a later
+        // pass once the agent is invokable again.
+        const logContext = { actionId: action.id, issueId: action.issueId };
+        if (await gate.skip(action.agentId, logContext)) continue;
+        const outcome = await gate.wakeOrSkip(action.agentId, logContext, () => enqueueWakeup(action.agentId, {
+          source: "automation",
+          triggerDetail: "system",
+          reason: "goal_control",
+          payload: {
             issueId: action.issueId,
-            agentId: action.agentId,
-            adapterType: action.adapterType,
+            requestId: action.requestId,
+            intent: "goal_control_recovery",
           },
-          action.requestId,
-          "session_goal_control_payload_invalid",
-        ).catch(() => undefined);
-        continue;
-      }
-
-      const inFlight = await db
-        .select({ contextSnapshot: heartbeatRuns.contextSnapshot })
-        .from(heartbeatRuns)
-        .where(
-          and(
-            eq(heartbeatRuns.companyId, action.companyId),
-            eq(heartbeatRuns.agentId, action.agentId),
-            inArray(heartbeatRuns.status, [
-              "queued",
-              "scheduled_retry",
-              "running",
-            ]),
-          ),
-        )
-        .then((runs) =>
-          runs.some(
-            (run) =>
-              readNonEmptyString(
-                parseObject(run.contextSnapshot).goalControlRequestId,
-              ) === action.requestId,
-          ),
+          idempotencyKey: `goal_control_recovery:${action.id}`,
+          requestedByActorType: "system",
+          contextSnapshot: {
+            issueId: action.issueId,
+            taskKey: action.issueId,
+            // Goal controls reconcile the provider session itself and remain
+            // valid after issue terminalization (for example, clearing a
+            // completed goal from its retained widget).
+            resumeIntent: true,
+            goalControlRequestId: action.requestId,
+            runnerGoalControl: control,
+            skipIssueComment: true,
+          },
+        }));
+        if (!outcome.skipped && outcome.value) enqueued += 1;
+      } catch (err) {
+        failed += 1;
+        logger.error(
+          { err, actionId: action.id, issueId: action.issueId, agentId: action.agentId, pass },
+          "heartbeat recovery wake failed - continuing with the next item",
         );
-      if (inFlight) {
-        alreadyQueued += 1;
-        continue;
       }
-
-      // A parked seat keeps its pending action; it is delivered on a later
-      // pass once the agent is invokable again.
-      const logContext = { actionId: action.id, issueId: action.issueId };
-      if (await gate.skip(action.agentId, logContext)) continue;
-      const outcome = await gate.wakeOrSkip(action.agentId, logContext, () => enqueueWakeup(action.agentId, {
-        source: "automation",
-        triggerDetail: "system",
-        reason: "goal_control",
-        payload: {
-          issueId: action.issueId,
-          requestId: action.requestId,
-          intent: "goal_control_recovery",
-        },
-        idempotencyKey: `goal_control_recovery:${action.id}`,
-        requestedByActorType: "system",
-        contextSnapshot: {
-          issueId: action.issueId,
-          taskKey: action.issueId,
-          // Goal controls reconcile the provider session itself and remain
-          // valid after issue terminalization (for example, clearing a
-          // completed goal from its retained widget).
-          resumeIntent: true,
-          goalControlRequestId: action.requestId,
-          runnerGoalControl: control,
-          skipIssueComment: true,
-        },
-      }));
-      if (!outcome.skipped && outcome.value) enqueued += 1;
     }
     const result = {
       scanned: pending.length,
@@ -20256,8 +20286,12 @@ export function heartbeatService(
       alreadyQueued,
       invalid,
       notInvokableSkipped: gate.notInvokableSkipped,
+      failed,
     };
     gate.summarize(result);
+    if (failed > 0) {
+      logger.warn({ ...result, pass }, "heartbeat recovery pass finished with failed items");
+    }
     return result;
   }
 
