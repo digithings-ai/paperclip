@@ -314,6 +314,45 @@ function agentActor(agentId = "22222222-2222-4222-8222-222222222222") {
   };
 }
 
+// Automation writes (pc.sh and other scripts) authenticate with the board API
+// key. They are board actors, but they are not a signed-in human asking for
+// follow-up work.
+function boardKeyActor() {
+  return {
+    type: "board",
+    userId: "local-board",
+    companyIds: ["company-1"],
+    source: "board_key",
+    keyId: "board-key-1",
+    isInstanceAdmin: false,
+  };
+}
+
+// A public-MCP OAuth user is a signed-in human, not board automation. The
+// reopen suppression is scoped to the board API key, so this path must keep
+// reopening closed issues.
+function mcpOauthBoardActor(userId = "55555555-5555-4555-8555-555555555555") {
+  return {
+    type: "board",
+    userId,
+    sessionId: "session-mcp-1",
+    companyIds: ["company-1"],
+    source: "mcp_oauth",
+    isInstanceAdmin: false,
+  };
+}
+
+function sessionBoardActor(userId = "44444444-4444-4444-8444-444444444444") {
+  return {
+    type: "board",
+    userId,
+    sessionId: "session-1",
+    companyIds: ["company-1"],
+    source: "session",
+    isInstanceAdmin: false,
+  };
+}
+
 async function waitForWakeup(assertion: () => void) {
   await vi.waitFor(assertion);
 }
@@ -761,6 +800,299 @@ describe("issue comment reopen routes", () => {
             reopenedFrom: "done",
           }),
         }),
+      ),
+    );
+  });
+
+  // A board-key comment is automation output (for example a closing note
+  // posted by pc.sh), not a human asking for follow-up work. It used to flip a
+  // done issue back to todo and wake the assignee, who then found nothing to do
+  // and closed the issue again. The closing note could keep that loop alive.
+  it("does not reopen a closed issue for a board-key POST comment with no explicit ask", async () => {
+    const issue = makeIssue("done");
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(
+      async (_id: string, patch: Record<string, unknown>) =>
+        makeIssueUpdateReceipt(issue, patch),
+    );
+
+    const res = await request(await installActor(createApp(), boardKeyActor()))
+      .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
+      .send({ body: "Closed - acceptance met. No further work." });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(mockIssueService.addComment).toHaveBeenCalled();
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+  });
+
+  it("does not reopen a closed issue for a board-key PATCH comment with no explicit ask", async () => {
+    const issue = makeIssue("done");
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(
+      async (_id: string, patch: Record<string, unknown>) =>
+        makeIssueUpdateReceipt(issue, patch),
+    );
+
+    const res = await request(await installActor(createApp(), boardKeyActor()))
+      .patch("/api/issues/11111111-1111-4111-8111-111111111111")
+      .send({ comment: "Closed - acceptance met. No further work." });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    const lastPatch =
+      mockIssueService.update.mock.calls[
+        mockIssueService.update.mock.calls.length - 1
+      ]?.[1];
+    expect(lastPatch).not.toMatchObject({ status: "todo" });
+    expect(mockLogActivity).not.toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: "issue.updated",
+        details: expect.objectContaining({ reopened: true }),
+      }),
+    );
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+  });
+
+  it("still reopens a closed issue for a board-key comment with an explicit reopen ask", async () => {
+    const issue = makeIssue("done");
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(
+      async (_id: string, patch: Record<string, unknown>) =>
+        makeIssueUpdateReceipt(issue, patch),
+    );
+
+    const res = await request(await installActor(createApp(), boardKeyActor()))
+      .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
+      .send({ body: "New work: continue with the follow-up.", reopen: true });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      "11111111-1111-4111-8111-111111111111",
+      { status: "todo" },
+    );
+    await waitForWakeup(() =>
+      expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+        "22222222-2222-4222-8222-222222222222",
+        expect.objectContaining({
+          reason: "issue_reopened_via_comment",
+          payload: expect.objectContaining({
+            reopenedFrom: "done",
+          }),
+        }),
+      ),
+    );
+    // An explicit ask is real work. The wake must not be marked as board-key
+    // automation, or a deferred release would ignore the reopen.
+    const reopenWake = mockHeartbeatService.wakeup.mock.calls.find(
+      ([, wakeup]: [string, { reason?: string }]) =>
+        wakeup?.reason === "issue_reopened_via_comment",
+    )?.[1];
+    expect(
+      (reopenWake as { contextSnapshot?: Record<string, unknown> })
+        ?.contextSnapshot,
+    ).not.toHaveProperty("boardKeyCommentIds");
+  });
+
+  it("marks a board-key comment wake as automation so a deferred release does not reopen", async () => {
+    const issue = makeIssue("in_progress");
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(
+      async (_id: string, patch: Record<string, unknown>) =>
+        makeIssueUpdateReceipt(issue, patch),
+    );
+
+    const res = await request(await installActor(createApp(), boardKeyActor()))
+      .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
+      .send({ body: "Progress note from automation." });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    await waitForWakeup(() =>
+      expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+        "22222222-2222-4222-8222-222222222222",
+        expect.objectContaining({ reason: "issue_commented" }),
+      ),
+    );
+    const commentWake = mockHeartbeatService.wakeup.mock.calls.find(
+      ([, wakeup]: [string, { reason?: string }]) =>
+        wakeup?.reason === "issue_commented",
+    )?.[1];
+    expect(
+      (commentWake as { contextSnapshot?: Record<string, unknown> })
+        ?.contextSnapshot,
+    ).toMatchObject({ boardKeyCommentIds: ["comment-1"] });
+  });
+
+  // The issue-update route carries the same guard as the comments route. A
+  // board-key PATCH comment on an in_progress issue still queues a
+  // user-requested comment wake; when the owning run is still active the
+  // heartbeat defers it, and promoting the deferred wake would reopen the
+  // issue the run had already finished.
+  it("marks a board-key PATCH comment wake as automation so a deferred release does not reopen", async () => {
+    const issue = makeIssue("in_progress");
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(
+      async (_id: string, patch: Record<string, unknown>) =>
+        makeIssueUpdateReceipt(issue, patch),
+    );
+
+    const res = await request(await installActor(createApp(), boardKeyActor()))
+      .patch("/api/issues/11111111-1111-4111-8111-111111111111")
+      .send({ comment: "Progress note from automation." });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    await waitForWakeup(() =>
+      expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+        "22222222-2222-4222-8222-222222222222",
+        expect.objectContaining({ reason: "issue_commented" }),
+      ),
+    );
+    const commentWake = mockHeartbeatService.wakeup.mock.calls.find(
+      ([, wakeup]: [string, { reason?: string }]) =>
+        wakeup?.reason === "issue_commented",
+    )?.[1];
+    expect(
+      (commentWake as { contextSnapshot?: Record<string, unknown> })
+        ?.contextSnapshot,
+    ).toMatchObject({ boardKeyCommentIds: ["comment-1"] });
+  });
+
+  it("does not mark a signed-in human PATCH comment wake as board-key automation", async () => {
+    const issue = makeIssue("in_progress");
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(
+      async (_id: string, patch: Record<string, unknown>) =>
+        makeIssueUpdateReceipt(issue, patch),
+    );
+
+    const res = await request(await installActor(createApp(), sessionBoardActor()))
+      .patch("/api/issues/11111111-1111-4111-8111-111111111111")
+      .send({ comment: "Please continue with the follow-up." });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    await waitForWakeup(() =>
+      expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+        "22222222-2222-4222-8222-222222222222",
+        expect.objectContaining({ reason: "issue_commented" }),
+      ),
+    );
+    const commentWake = mockHeartbeatService.wakeup.mock.calls.find(
+      ([, wakeup]: [string, { reason?: string }]) =>
+        wakeup?.reason === "issue_commented",
+    )?.[1];
+    expect(
+      (commentWake as { contextSnapshot?: Record<string, unknown> })
+        ?.contextSnapshot,
+    ).not.toHaveProperty("boardKeyCommentIds");
+  });
+
+  it("still reopens a closed issue for a board-key PATCH comment with an explicit reopen ask", async () => {
+    const issue = makeIssue("done");
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(
+      async (_id: string, patch: Record<string, unknown>) =>
+        makeIssueUpdateReceipt(issue, patch),
+    );
+
+    const res = await request(await installActor(createApp(), boardKeyActor()))
+      .patch("/api/issues/11111111-1111-4111-8111-111111111111")
+      .send({
+        comment: "New work: continue with the follow-up.",
+        reopen: true,
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    await waitForWakeup(() =>
+      expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+        "22222222-2222-4222-8222-222222222222",
+        expect.objectContaining({ reason: "issue_reopened_via_comment" }),
+      ),
+    );
+    // An explicit ask is real work. The wake must not be marked as board-key
+    // automation, or a deferred release would ignore the reopen.
+    const reopenWake = mockHeartbeatService.wakeup.mock.calls.find(
+      ([, wakeup]: [string, { reason?: string }]) =>
+        wakeup?.reason === "issue_reopened_via_comment",
+    )?.[1];
+    expect(
+      (reopenWake as { contextSnapshot?: Record<string, unknown> })
+        ?.contextSnapshot,
+    ).not.toHaveProperty("boardKeyCommentIds");
+  });
+
+  // The board-key guard sits above the closed-or-blocked status check, so a
+  // board-key comment no longer performs the implicit blocked-to-todo move
+  // either. An explicit resume ask still performs it.
+  it("does not move a blocked issue to todo for a board-key PATCH comment with no explicit ask", async () => {
+    const issue = makeIssue("blocked");
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(
+      async (_id: string, patch: Record<string, unknown>) =>
+        makeIssueUpdateReceipt(issue, patch),
+    );
+
+    const res = await request(await installActor(createApp(), boardKeyActor()))
+      .patch("/api/issues/11111111-1111-4111-8111-111111111111")
+      .send({ comment: "Still working on it." });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    const lastPatch =
+      mockIssueService.update.mock.calls[
+        mockIssueService.update.mock.calls.length - 1
+      ]?.[1];
+    expect(lastPatch).not.toMatchObject({ status: "todo" });
+  });
+
+  it("still implicitly reopens a closed issue for a signed-in board user comment", async () => {
+    const issue = makeIssue("done");
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(
+      async (_id: string, patch: Record<string, unknown>) =>
+        makeIssueUpdateReceipt(issue, patch),
+    );
+
+    const res = await request(
+      await installActor(createApp(), sessionBoardActor()),
+    )
+      .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
+      .send({ body: "Please continue with the follow-up." });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      "11111111-1111-4111-8111-111111111111",
+      { status: "todo" },
+    );
+    await waitForWakeup(() =>
+      expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+        "22222222-2222-4222-8222-222222222222",
+        expect.objectContaining({ reason: "issue_reopened_via_comment" }),
+      ),
+    );
+  });
+
+  it("still implicitly reopens a closed issue for a public-MCP OAuth user comment", async () => {
+    const issue = makeIssue("done");
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(
+      async (_id: string, patch: Record<string, unknown>) =>
+        makeIssueUpdateReceipt(issue, patch),
+    );
+
+    const res = await request(
+      await installActor(createApp(), mcpOauthBoardActor()),
+    )
+      .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
+      .send({ body: "Please continue with the follow-up." });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      "11111111-1111-4111-8111-111111111111",
+      { status: "todo" },
+    );
+    await waitForWakeup(() =>
+      expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+        "22222222-2222-4222-8222-222222222222",
+        expect.objectContaining({ reason: "issue_reopened_via_comment" }),
       ),
     );
   });

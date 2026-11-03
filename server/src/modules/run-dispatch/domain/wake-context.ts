@@ -23,6 +23,16 @@ export const INTERACTION_CONTINUATION_INFRA_RETRY_REASON = "interaction_continua
 export const INTERACTION_CONTINUATION_INFRA_WAKE_REASON = "interaction_continuation_infra_retry";
 export const WAKE_COMMENT_IDS_KEY = "wakeCommentIds";
 /**
+ * Comment ids on this wake that were written with the board API key and
+ * carried no explicit reopen/resume ask. Such a comment is automation output
+ * (for example a script's closing note), not a human follow-up, so a deferred
+ * release must not revive a completed issue because of it. The producer writes
+ * this key; `mergeCoalescedContextSnapshot` unions it across coalesced wakes
+ * and the wake queue only suppresses the reopen when every deferred comment id
+ * is listed here.
+ */
+export const BOARD_KEY_COMMENT_IDS_KEY = "boardKeyCommentIds";
+/**
  * Wake reason the platform stamps on the run it queues for a card's
  * addressee when an issue-thread interaction is created (the `heartbeat
  * .wakeup` call in `routes/issues.ts`). It lives here so the producer and

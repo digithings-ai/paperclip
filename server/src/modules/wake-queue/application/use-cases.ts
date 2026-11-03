@@ -1,4 +1,7 @@
-import { enrichPromotedWakeContext } from "../domain/context.js";
+import {
+  deferredCommentsAreBoardKeyAutomation,
+  enrichPromotedWakeContext,
+} from "../domain/context.js";
 import {
   decideQueuedCommentAction,
   decideReleaseRecovery,
@@ -340,8 +343,16 @@ async function promoteDeferredWake(
       finishingRunId: run.id,
       commentIds: workingCandidate.deferredCommentIds,
     });
+    // A wake whose only comments are board-key automation output carries no
+    // human follow-up request. Releasing it must not revive the completed
+    // issue, or a closing note would reopen the task and wake the assignee
+    // for work that does not exist.
+    const boardKeyOnlyFeedback = deferredCommentsAreBoardKeyAutomation(
+      workingCandidate.deferredContextSeed,
+    );
     shouldReopen =
       !selfAuthorship.allSelfAuthored &&
+      !boardKeyOnlyFeedback &&
       (workingCandidate.requestedByActorType === "user" ||
         workingCandidate.wakeReason === "issue_reopened_via_comment" ||
         (currentIssue.status === "done" &&
