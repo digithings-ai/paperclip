@@ -134,7 +134,7 @@ describeEmbeddedPostgres("decision expiry sweep with non-invokable origin agents
   }
 
   let issueNumber = 0;
-  async function seedOriginAgent(companyId: string, status: AgentStatus) {
+  async function seedOriginAgent(companyId: string, status: AgentStatus, reportsTo: string | null = null) {
     const agentId = randomUUID();
     const issueId = randomUUID();
     const runId = randomUUID();
@@ -145,6 +145,7 @@ describeEmbeddedPostgres("decision expiry sweep with non-invokable origin agents
       name: `Origin agent ${status}`,
       role: "engineer",
       status,
+      reportsTo,
       adapterType: "test_adapter",
       adapterConfig: {},
       runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
@@ -174,8 +175,9 @@ describeEmbeddedPostgres("decision expiry sweep with non-invokable origin agents
 
   // An expired decision whose continuation was never delivered (for example,
   // the wake failed before a restart).
-  async function seedPendingExpiredDecision(origin: Origin) {
+  async function seedPendingExpiredDecision(origin: Origin, updatedAt?: Date) {
     const [row] = await db.insert(decisions).values({
+      ...(updatedAt ? { updatedAt } : {}),
       companyId: origin.companyId,
       originAgentId: origin.agentId,
       originIssueId: origin.issueId,
@@ -247,11 +249,13 @@ describeEmbeddedPostgres("decision expiry sweep with non-invokable origin agents
 
       const result = await service.sweepExpired();
 
+      // The already-pending continuation is left out of the query (parked
+      // origin), and the newly expired one is caught by the pre-check.
       expect(result).toMatchObject({
         expired: 1,
         resumed: 0,
         continuationsDelivered: 0,
-        continuationsNotInvokableSkipped: 2,
+        continuationsNotInvokableSkipped: 1,
         continuationsFailed: 0,
       });
       expect(await storedMetadata(pendingExpired.id)).toMatchObject({
@@ -263,13 +267,15 @@ describeEmbeddedPostgres("decision expiry sweep with non-invokable origin agents
         metadata: { continuationPending: true, expiredReason: "ttl" },
       });
       expect(warn).toHaveBeenCalledWith(
-        expect.objectContaining({ decisionId: pendingExpired.id, agentId: parked.agentId, reason: status }),
+        expect.objectContaining({ decisionId: openPastExpiry.id, agentId: parked.agentId, reason: status }),
         SKIP_MESSAGE,
       );
       expect(warn).toHaveBeenCalledWith(
-        expect.objectContaining({ continuationsNotInvokableSkipped: 2 }),
+        expect.objectContaining({ continuationsNotInvokableSkipped: 1 }),
         SUMMARY_MESSAGE,
       );
+      // The skip happens before the wake, so no wakeup-request row is written.
+      expect(await wakeCount(parked.agentId)).toBe(0);
 
       // The startup call completes too, and the continuations stay pending
       // for a later sweep once the agent is invokable again.
@@ -277,6 +283,7 @@ describeEmbeddedPostgres("decision expiry sweep with non-invokable origin agents
       expect(error).not.toHaveBeenCalledWith(expect.anything(), expect.stringContaining("startup decision expiry sweep failed"));
       expect(await storedMetadata(pendingExpired.id)).toMatchObject({ metadata: { continuationPending: true } });
       expect(await storedMetadata(openPastExpiry.id)).toMatchObject({ metadata: { continuationPending: true } });
+      expect(await wakeCount(parked.agentId)).toBe(0);
     });
   }
 
@@ -290,12 +297,14 @@ describeEmbeddedPostgres("decision expiry sweep with non-invokable origin agents
 
     const result = await decisionService(db, { wakeOriginAgent: realWake() }).sweepExpired();
 
+    // The paused agent's pending continuation is left out of the query.
     expect(result).toMatchObject({
       expired: 1,
       continuationsDelivered: 2,
-      continuationsNotInvokableSkipped: 1,
+      continuationsNotInvokableSkipped: 0,
       continuationsFailed: 0,
     });
+    expect(await wakeCount(parked.agentId)).toBe(0);
     expect(await storedMetadata(parkedDecision.id)).toMatchObject({ metadata: { continuationPending: true } });
     expect(await storedMetadata(activeDecision.id)).toMatchObject({ metadata: { continuationPending: false } });
     expect(await storedMetadata(activeOpenDecision.id)).toMatchObject({
@@ -333,5 +342,117 @@ describeEmbeddedPostgres("decision expiry sweep with non-invokable origin agents
       expect.objectContaining({ decisionId: brokenDecision.id, agentId: broken.agentId }),
       FAILED_MESSAGE,
     );
+  });
+  describe("with a small sweep batch", () => {
+    const previousBatchSize = process.env.PAPERCLIP_DECISIONS_SWEEP_BATCH_SIZE;
+    beforeAll(() => {
+      process.env.PAPERCLIP_DECISIONS_SWEEP_BATCH_SIZE = "3";
+    });
+    afterAll(() => {
+      if (previousBatchSize === undefined) delete process.env.PAPERCLIP_DECISIONS_SWEEP_BATCH_SIZE;
+      else process.env.PAPERCLIP_DECISIONS_SWEEP_BATCH_SIZE = previousBatchSize;
+    });
+
+    it("does not let more than a batch of parked continuations starve an active one", async () => {
+      const warn = vi.spyOn(logger, "warn");
+      const companyId = await seedCompany();
+      const statuses = ["paused", "terminated", "pending_approval", "paused", "terminated"] as const;
+      const parkedOrigins: Origin[] = [];
+      const parkedDecisions: Array<{ id: string }> = [];
+      for (const [index, status] of statuses.entries()) {
+        const origin = await seedOriginAgent(companyId, status);
+        parkedOrigins.push(origin);
+        // Older than the active row, so they sort first by updated_at.
+        parkedDecisions.push(await seedPendingExpiredDecision(origin, new Date(Date.now() - (60 - index) * 60_000)));
+      }
+      const active = await seedOriginAgent(companyId, "idle");
+      const activeDecision = await seedPendingExpiredDecision(active, new Date());
+      const service = decisionService(db, { wakeOriginAgent: realWake() });
+
+      const result = await service.sweepExpired();
+
+      expect(result).toMatchObject({
+        continuationsDelivered: 1,
+        continuationsNotInvokableSkipped: 0,
+        continuationsFailed: 0,
+      });
+      expect(await storedMetadata(activeDecision.id)).toMatchObject({ metadata: { continuationPending: false } });
+      for (const decision of parkedDecisions) {
+        expect(await storedMetadata(decision.id)).toMatchObject({ metadata: { continuationPending: true } });
+      }
+
+      // Repeated ticks write no wake rows and no WARN for the parked rows.
+      await service.sweepExpired();
+      await service.sweepExpired();
+      for (const origin of parkedOrigins) expect(await wakeCount(origin.agentId)).toBe(0);
+      expect(warn).not.toHaveBeenCalledWith(expect.anything(), SKIP_MESSAGE);
+      expect(warn).not.toHaveBeenCalledWith(expect.anything(), SUMMARY_MESSAGE);
+    });
+  });
+
+  it("pre-checks a broken reporting chain: no wake row, and the skip log is throttled", async () => {
+    const warn = vi.spyOn(logger, "warn");
+    const companyId = await seedCompany();
+    const manager = await seedOriginAgent(companyId, "terminated");
+    const orphan = await seedOriginAgent(companyId, "idle", manager.agentId);
+    const orphanDecision = await seedPendingExpiredDecision(orphan);
+    const service = decisionService(db, { wakeOriginAgent: realWake() });
+
+    const first = await service.sweepExpired();
+    const second = await service.sweepExpired();
+
+    expect(first).toMatchObject({ continuationsDelivered: 0, continuationsNotInvokableSkipped: 1, continuationsFailed: 0 });
+    expect(second).toMatchObject({ continuationsDelivered: 0, continuationsNotInvokableSkipped: 1, continuationsFailed: 0 });
+    expect(await storedMetadata(orphanDecision.id)).toMatchObject({ metadata: { continuationPending: true } });
+    expect(await wakeCount(orphan.agentId)).toBe(0);
+    const skipLines = warn.mock.calls.filter(([, message]) => message === SKIP_MESSAGE);
+    expect(skipLines).toHaveLength(1);
+    expect(skipLines[0]![0]).toMatchObject({ decisionId: orphanDecision.id, reason: "manager_terminated" });
+    expect(warn.mock.calls.filter(([, message]) => message === SUMMARY_MESSAGE)).toHaveLength(1);
+  });
+
+  it("isolates runEffects per resumed decision: one failure is logged and the rest still run", async () => {
+    const error = vi.spyOn(logger, "error");
+    const companyId = await seedCompany();
+    const brokenOrigin = await seedOriginAgent(companyId, "idle");
+    const healthyOrigin = await seedOriginAgent(companyId, "idle");
+    const staleUpdatedAt = new Date(Date.now() - 10 * 60_000);
+    const runningDecision = (origin: Origin, chosenOptionId: string, updatedAt: Date) => ({
+      companyId: origin.companyId,
+      originAgentId: origin.agentId,
+      originIssueId: origin.issueId,
+      originRunId: origin.runId,
+      title: "Decided decision with effects in flight",
+      body: "Body",
+      options: [{ id: "ok", label: "OK", effects: [] }] as unknown as (typeof decisions.$inferInsert)["options"],
+      status: "decided" as const,
+      executionStatus: "running" as const,
+      chosenOptionId,
+      decidedByUserId: "owner-user",
+      decidedAt: updatedAt,
+      expiresAt: new Date(Date.now() + 60 * 60_000),
+      signedSpec: "unused-by-the-sweep",
+      targetSnapshots: {},
+      continuationPolicy: "wake_origin_agent" as const,
+      metadata: { continuationPending: true },
+      updatedAt,
+    });
+    // The broken row sorts first and its stored option is gone, so runEffects throws.
+    const [broken] = await db.insert(decisions)
+      .values(runningDecision(brokenOrigin, "missing-option", new Date(staleUpdatedAt.getTime() - 60_000))).returning();
+    const [healthy] = await db.insert(decisions)
+      .values(runningDecision(healthyOrigin, "ok", staleUpdatedAt)).returning();
+
+    const result = await decisionService(db, { wakeOriginAgent: realWake() }).sweepExpired();
+
+    expect(result).toMatchObject({ resumed: 1, resumeFailed: 1, continuationsDelivered: 1, continuationsFailed: 0 });
+    expect(error).toHaveBeenCalledWith(
+      expect.objectContaining({ decisionId: broken!.id }),
+      "decision effect recovery failed - decision stays running, continuing with the next one",
+    );
+    const [brokenRow] = await db.select({ executionStatus: decisions.executionStatus }).from(decisions).where(eq(decisions.id, broken!.id));
+    expect(brokenRow).toMatchObject({ executionStatus: "running" });
+    expect(await storedMetadata(healthy!.id)).toMatchObject({ metadata: { continuationPending: false } });
+    expect(await wakeCount(healthyOrigin.agentId)).toBeGreaterThanOrEqual(1);
   });
 });

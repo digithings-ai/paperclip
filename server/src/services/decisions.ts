@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
-import { and, asc, count, desc, eq, gt, gte, inArray, lte, or, sql } from "drizzle-orm";
+import { and, asc, count, desc, eq, gt, gte, inArray, lte, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { companyMemberships, decisionBundles, decisionEffectExecutions, decisionRetention, decisions, decisionTargetIssues, heartbeatRuns, issueRelations, issues } from "@paperclipai/db";
+import { agents, companyMemberships, decisionBundles, decisionEffectExecutions, decisionRetention, decisions, decisionTargetIssues, heartbeatRuns, issueRelations, issues } from "@paperclipai/db";
 import { ATTENTION_SOURCE_KINDS, decisionEffectTargetIssueIds } from "@paperclipai/shared";
 import type { AttentionArchiveManifestEntry, DecisionEffect, DecisionInput, DecisionOption, DecisionStatsCounts, DecisionStatsResponse } from "@paperclipai/shared";
 import { conflict, forbidden, notFound, tooManyRequests, unprocessable } from "../errors.js";
@@ -13,7 +13,12 @@ import {
   type IssuePostCommitAction,
 } from "./issues.js";
 import { decisionRetentionService, hashAttentionArchiveManifest } from "./decision-retention.js";
-import { isAgentNotInvokableConflict } from "./agent-invokability.js";
+import {
+  DIRECT_NON_INVOKABLE_STATUSES,
+  evaluateAgentInvokabilityFromDb,
+  isAgentNotInvokableConflict,
+  type AgentInvokability,
+} from "./agent-invokability.js";
 import { logger } from "../middleware/logger.js";
 
 type Snapshot = { status: string; assigneeAgentId: string | null; assigneeUserId: string | null; updatedAt: string;
@@ -21,6 +26,11 @@ type Snapshot = { status: string; assigneeAgentId: string | null; assigneeUserId
 type Wake = (input: { companyId: string; agentId: string; issueId: string; decisionId: string; outcome: "decided" | "expired" | "cancelled" }) => Promise<unknown>;
 export type DecisionServiceOptions = { wakeOriginAgent: Wake };
 const DAY = 86_400_000;
+// Origin statuses that can never take a continuation wake. The pending-
+// continuation query leaves these rows out so they cannot fill the batch.
+const PARKED_ORIGIN_STATUSES = [...DIRECT_NON_INVOKABLE_STATUSES];
+// A parked continuation is logged at most once per decision per interval.
+const PARKED_CONTINUATION_LOG_INTERVAL_MS = 60 * 60_000;
 
 function targetIds(options: DecisionOption[]) {
   const result = new Set<string>();
@@ -637,19 +647,72 @@ export function decisionService(db: Db, options: DecisionServiceOptions) {
     continuationsFailed: number;
   };
 
+  type ContinuationSweepContext = {
+    counts: ContinuationSweepCounts;
+    // One invokability lookup per origin agent per sweep.
+    invokability: Map<string, Promise<AgentInvokability>>;
+    // Whether any skip was logged this sweep (the per-decision log is throttled).
+    skipLogged: boolean;
+  };
+
+  // decisionId -> when its "parked continuation" line was last logged.
+  const parkedContinuationLoggedAt = new Map<string, number>();
+
+  function logParkedContinuation(
+    ctx: ContinuationSweepContext,
+    logContext: Record<string, unknown> & { decisionId: string },
+    reason: unknown,
+  ) {
+    const now = Date.now();
+    const last = parkedContinuationLoggedAt.get(logContext.decisionId);
+    if (last !== undefined && now - last < PARKED_CONTINUATION_LOG_INTERVAL_MS) return;
+    if (parkedContinuationLoggedAt.size >= 10_000) {
+      for (const [id, at] of parkedContinuationLoggedAt) {
+        if (now - at >= PARKED_CONTINUATION_LOG_INTERVAL_MS) parkedContinuationLoggedAt.delete(id);
+      }
+    }
+    parkedContinuationLoggedAt.set(logContext.decisionId, now);
+    ctx.skipLogged = true;
+    logger.warn(
+      { ...logContext, reason },
+      "decision continuation skipped for non-invokable origin agent - continuation stays pending",
+    );
+  }
+
+  function originInvokability(ctx: ContinuationSweepContext, agentId: string) {
+    let cached = ctx.invokability.get(agentId);
+    if (!cached) {
+      cached = db.select({
+        id: agents.id,
+        companyId: agents.companyId,
+        name: agents.name,
+        reportsTo: agents.reportsTo,
+        status: agents.status,
+      }).from(agents).where(eq(agents.id, agentId))
+        .then((rows) => evaluateAgentInvokabilityFromDb(db, rows[0] ?? null));
+      ctx.invokability.set(agentId, cached);
+    }
+    return cached;
+  }
+
   // The sweep runs at startup and on every scheduler tick. One undeliverable
   // continuation must not abort it: a paused, terminated or pending_approval
   // origin agent makes the wake throw a 409, which used to escape the startup
   // call and exit the server. Each delivery is isolated here. A failed wake is
   // never acknowledged, so continuationPending stays true and a later sweep
   // delivers it once the origin agent can be invoked again.
+  //
+  // The origin agent's invokability is checked before the wake, so a parked
+  // continuation never reaches enqueueWakeup and writes no wakeup-request row.
+  // The skip is logged at most once per decision per hour.
   async function deliverSweepContinuation(
     decision: typeof decisions.$inferSelect,
     outcome: "decided" | "expired" | "cancelled",
-    counts: ContinuationSweepCounts,
+    ctx: ContinuationSweepContext,
   ) {
     const metadata = decision.metadata as Record<string, unknown>;
     if (decision.continuationPolicy !== "wake_origin_agent" || metadata.continuationPending !== true) return;
+    const { counts } = ctx;
     const logContext = {
       decisionId: decision.id,
       companyId: decision.companyId,
@@ -658,16 +721,21 @@ export function decisionService(db: Db, options: DecisionServiceOptions) {
       outcome,
     };
     try {
+      const invokability = await originInvokability(ctx, decision.originAgentId);
+      if (!invokability.invokable) {
+        counts.continuationsNotInvokableSkipped += 1;
+        logParkedContinuation(ctx, logContext, invokability.reason);
+        return;
+      }
       await deliverContinuation(decision, outcome);
       counts.continuationsDelivered += 1;
+      parkedContinuationLoggedAt.delete(decision.id);
     } catch (err) {
       if (isAgentNotInvokableConflict(err)) {
+        // The agent became non-invokable between the check and the wake.
         counts.continuationsNotInvokableSkipped += 1;
         const reason = (err.details as { reason?: unknown } | undefined)?.reason ?? null;
-        logger.warn(
-          { ...logContext, reason },
-          "decision continuation skipped for non-invokable origin agent - continuation stays pending",
-        );
+        logParkedContinuation(ctx, logContext, reason);
         return;
       }
       counts.continuationsFailed += 1;
@@ -781,26 +849,50 @@ export function decisionService(db: Db, options: DecisionServiceOptions) {
         lte(decisions.updatedAt, new Date(now.getTime() - recoveryGraceMs))))
       .orderBy(asc(decisions.updatedAt)).limit(batchSize);
     let resumed = 0;
+    let resumeFailed = 0;
     const counts: ContinuationSweepCounts = {
       continuationsDelivered: 0,
       continuationsNotInvokableSkipped: 0,
       continuationsFailed: 0,
     };
+    const ctx: ContinuationSweepContext = { counts, invokability: new Map(), skipLogged: false };
     for (const decision of runningRows) {
       if (!decision.decidedByUserId) continue;
-      const recovered = await runEffects(decision, await recoveryActor(decision.companyId, decision.decidedByUserId));
+      // Per-item isolation: one decision whose effects throw is logged and
+      // left running for a later sweep, and the rest of the batch still runs.
+      let recovered: Awaited<ReturnType<typeof runEffects>>;
+      try {
+        recovered = await runEffects(decision, await recoveryActor(decision.companyId, decision.decidedByUserId));
+      } catch (err) {
+        resumeFailed += 1;
+        logger.error(
+          { decisionId: decision.id, companyId: decision.companyId, err },
+          "decision effect recovery failed - decision stays running, continuing with the next one",
+        );
+        continue;
+      }
       if (recovered.executionStatus === "running") continue;
       resumed += 1;
-      await deliverSweepContinuation(recovered, "decided", counts);
+      await deliverSweepContinuation(recovered, "decided", ctx);
     }
-    const pendingContinuations = await db.select().from(decisions)
+    // Continuations whose origin agent is paused, terminated or
+    // pending_approval are left out here. A skip does not touch updated_at, so
+    // without this filter more than batchSize parked rows would hold the oldest
+    // slots on every tick and starve deliverable continuations. They are
+    // picked up again once the agent's status changes. Other non-invokable
+    // origins (for example a broken reporting chain) are caught by the
+    // pre-check in deliverSweepContinuation.
+    const pendingContinuations = await db.select({ decision: decisions }).from(decisions)
+      .innerJoin(agents, eq(agents.id, decisions.originAgentId))
       .where(and(eq(decisions.continuationPolicy, "wake_origin_agent"),
         sql`${decisions.metadata} ->> 'continuationPending' = 'true'`,
         or(inArray(decisions.status, ["expired", "cancelled"]), and(eq(decisions.status, "decided"),
-          inArray(decisions.executionStatus, ["succeeded", "partial", "failed"])))))
-      .orderBy(asc(decisions.updatedAt)).limit(batchSize);
+          inArray(decisions.executionStatus, ["succeeded", "partial", "failed"]))),
+        notInArray(agents.status, PARKED_ORIGIN_STATUSES)))
+      .orderBy(asc(decisions.updatedAt)).limit(batchSize)
+      .then((rows) => rows.map((row) => row.decision));
     for (const decision of pendingContinuations) {
-      await deliverSweepContinuation(decision, decision.status === "expired" ? "expired" : decision.status === "cancelled" ? "cancelled" : "decided", counts);
+      await deliverSweepContinuation(decision, decision.status === "expired" ? "expired" : decision.status === "cancelled" ? "cancelled" : "decided", ctx);
     }
     const ttlRows = await db.select().from(decisions)
       .where(and(eq(decisions.status, "open"), lte(decisions.expiresAt, now)))
@@ -832,14 +924,16 @@ export function decisionService(db: Db, options: DecisionServiceOptions) {
         ...(decision.continuationPolicy === "wake_origin_agent" ? { continuationPending: true } : {}) } }).where(and(eq(decisions.id, decision.id), eq(decisions.status, "open"))).returning();
       if (!updated) continue; expired += 1;
       await logActivity(db, { companyId: updated.companyId, actorType: "system", actorId: "decision-expiry-sweeper", agentId: updated.originAgentId, runId: updated.originRunId, action: "decision.expired", entityType: "decision", entityId: updated.id, details: { expiredReason: reason } });
-      await deliverSweepContinuation(updated, "expired", counts); }
-    if (counts.continuationsNotInvokableSkipped > 0 || counts.continuationsFailed > 0) {
+      await deliverSweepContinuation(updated, "expired", ctx); }
+    // Skips alone only warn when a (throttled) skip line was logged this sweep,
+    // so a parked continuation does not add a WARN on every tick.
+    if (counts.continuationsFailed > 0 || resumeFailed > 0 || ctx.skipLogged) {
       logger.warn(
-        { expired, resumed, ...counts },
+        { expired, resumed, resumeFailed, ...counts },
         "decision expiry sweep left continuations pending",
       );
     }
-    return { expired, resumed, ...counts };
+    return { expired, resumed, resumeFailed, ...counts };
   }
 
   return { create, createBundle, get, list, stats, outcome, decide, cancel, dismiss, sweepExpired };
