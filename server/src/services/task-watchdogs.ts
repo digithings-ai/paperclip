@@ -1531,9 +1531,14 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
 
     // A paused, terminated or otherwise non-invokable watchdog agent makes
     // enqueueWakeup throw a 409, which aborted the whole reconcile pass (and
-    // startup with it). Skip before creating review work, so nothing is
-    // recorded for this stop and the next pass triggers normally once the
-    // agent can be invoked again.
+    // startup with it). This check is not the first write in this function:
+    // markTerminalWatchdogIssueReviewed above, and the live/open-review
+    // branches, may already have updated the watchdog row. It runs before the
+    // trigger is recorded, though: no review issue is created or reused, and
+    // lastTriggeredAt, triggerCount and the observed fingerprint are not
+    // updated and no trigger activity is logged. So this stop is not marked as
+    // triggered, and a later pass triggers normally once the agent can be
+    // invoked again.
     if (deps.enqueueWakeup) {
       const watchdogAgent = await db
         .select({

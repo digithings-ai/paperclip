@@ -52,7 +52,23 @@ pnpm typecheck
 pnpm test:run:general            # or target the suites you changed with vitest
 ```
 
-## 3. Stop the running install
+## 3. Back up the database (before you switch)
+
+Take a one-off backup while the **old** install is still running. The backup connects to the
+configured database, and the embedded Postgres only runs while the server runs
+(`scripts/backup-db.sh`):
+
+```sh
+paperclipai db:backup            # the installed CLI; from a checkout: pnpm db:backup
+# options (cli/src/index.ts): --dir <path>, --retention-days <n>, --filename-prefix <prefix>, --json
+```
+
+With no `--dir`, it writes to `database.backup.dir` from the config, or
+`~/.paperclip/instances/<instance-id>/data/backups` by default. Note the backup file it prints
+before you go on. `paperclipai update` takes the same backup automatically, but the
+`install --ref` route in step 5b doesn't, so run it by hand.
+
+## 4. Stop the running install
 
 `releases/v2026.1012.0.md` lists a breaking change: workspace-restore locks are now SQLite
 file locks. An old process and a new one must never write to the same instance root at the
@@ -60,11 +76,25 @@ same time. Drain and stop every server and worker process that uses the instance
 start the fork build. Never delete or move the `.lock.sqlite` files under
 `<instance root>/locks/directory-merge/`.
 
-- **Unverified (Mac):** how the current install is supervised. It could be a terminal, tmux, a
-  launchd agent, or something else. Stop it through that same mechanism so it doesn't respawn
-  the old build.
+- If it runs as the CLI's background service on macOS, the launchd label comes from
+  `launchdServiceName` in `cli/src/services/service-manager.ts`:
+  `ing.paperclip.paperclipai` for the `default` instance, or
+  `ing.paperclip.paperclipai.<instance-id>` for any other. The plist is
+  `~/Library/LaunchAgents/<label>.plist` and the service logs are
+  `<PAPERCLIP_HOME>/instances/<instance-id>/logs/service.log` and `service.err.log`. The plist
+  sets `KeepAlive`, so a plain `kill` respawns the old build. Stop it through the CLI instead:
 
-## 4. Run the fork build
+  ```sh
+  paperclipai service status       # supervisor, pid and health
+  paperclipai service stop         # launchctl bootout gui/<uid>/<label>
+  ```
+
+- **Unverified (Mac):** that the current install actually runs as that service, and which
+  instance id it uses. It could also run in a terminal or tmux. Check with
+  `paperclipai service status` and `launchctl print gui/$(id -u)/ing.paperclip.paperclipai`
+  before you stop anything. If it isn't the service, stop it through whatever started it.
+
+## 5. Run the fork build
 
 The CLI (`cli/src/commands/run.ts`) tries two places for the server:
 
@@ -93,22 +123,77 @@ described in `docs/deploy/local-development.md` and `docs/deploy/environment-var
   `npm i -g ./paperclipai-*.tgz ./paperclipai-server-*.tgz`. This route was not tried.
   Running from the checkout is the path these scripts support directly.
 
-## 5. Verify
+### 5b. Managed install from a commit (`paperclipai install --ref`)
+
+If the install is the CLI's managed install (the `paperclipai install` store and shim, the one
+the background service runs), you can install the fork at an exact commit instead of running
+from a checkout. From `cli/src/commands/install.ts`:
+
+```sh
+paperclipai install --repo digithings-ai/paperclip --ref <full-commit-sha> --yes
+paperclipai --version            # the shim now points at the new payload
+```
+
+- `--repo` requires `--ref`, and `--ref` can't be combined with `--canary` or `--version`.
+- Use the full 40-character merge commit SHA, so the install is pinned (`channel: "pinned"`)
+  and can't drift with a branch.
+- The ref is resolved through the GitHub API. The repo is public, so no token is needed; an
+  ambient `GH_TOKEN` / `GITHUB_TOKEN` is used if set, to avoid anonymous rate limits.
+- `--yes` consents to downloading and running repository code. Without it, the command asks
+  in a TTY and fails in a non-interactive shell.
+- It flips the managed `current` payload atomically and keeps the previous one. It doesn't
+  back up the database (step 3) and doesn't restart the service. Start the service afterwards
+  with `paperclipai service start`.
+- **Unverified (Mac):** this route wasn't run against the Mac install.
+
+## 6. Verify
 
 ```sh
 curl -s http://127.0.0.1:3100/api/health    # expect {"status":"ok"}; use your configured host/port
+paperclipai service status                  # if it runs as the background service
 ```
 
-Then check the startup log:
+Then check the startup log (for the service: `paperclipai service logs`, or the `service.log`
+and `service.err.log` files from step 4). These are the exact messages.
 
-- No "startup heartbeat recovery failed" exit.
-- Any skipped seats show up as `... skipped wake for non-invokable agent` WARN lines.
-- Any failed step shows up as one `startup heartbeat recovery finished with failed steps` WARN.
+The process must still be running. These must **not** appear:
+
+- `startup heartbeat recovery failed` (only the fail-closed native runner recovery can still
+  reach it; if it does, the message before it is
+  `startup native runner restart recovery failed closed`);
+- `startup decision expiry sweep failed - continuing startup; the scheduler tick retries it`
+  (logged instead of exiting, but it means a decision sweep error escaped; report it).
+
+Expected for paused, terminated or pending_approval seats (WARN, one per skipped item, then
+a per-pass summary):
+
+- `heartbeat recovery skipped wake for non-invokable agent` with `agentId`, `agentStatus`,
+  `reason` and `pass` (`session_goal_recovery` or `session_goal_action_recovery`), then
+  `heartbeat recovery pass skipped non-invokable agents`;
+- `issue graph liveness backstop skipped dependency wake for non-invokable agent`;
+- `task watchdog skipped wake for non-invokable agent`, then
+  `task watchdog pass skipped non-invokable agents`;
+- `decision continuation skipped for non-invokable origin agent - continuation stays pending`
+  with `decisionId`, `agentId` and `reason`, then
+  `decision expiry sweep left continuations pending`.
+
+Possible and worth reporting, but not a startup failure:
+
+- `startup heartbeat recovery finished with failed steps` with `failedSteps`, after one
+  `startup heartbeat recovery step failed - continuing with the next step` ERROR per step;
+- `heartbeat recovery wake failed - continuing with the next item` (for example, a budget
+  block) and `heartbeat recovery pass finished with failed items`;
+- `decision continuation delivery failed - continuation stays pending`.
+
+The skip lines repeat on each scheduler tick while the seats stay paused. That's expected:
+the work stays pending and is delivered once the seat is unpaused.
 
 ## Rolling back
 
 1. Stop the fork build.
 2. Wait until no process from it is left.
-3. Start the previous install the same way it was started before.
+3. Start the previous install the same way it was started before. For the managed install,
+   `paperclipai update --rollback` flips back to the retained previous payload and restarts an
+   active service. Database migrations aren't reversed; restore the step 3 backup if needed.
 
-The no-concurrent-writers rule in step 3 applies here too.
+The no-concurrent-writers rule in step 4 applies here too.
