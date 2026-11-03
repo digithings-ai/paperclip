@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { and, eq } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
   agentWakeupRequests,
@@ -23,6 +23,8 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { taskWatchdogService } from "../services/task-watchdogs.ts";
+import { conflict } from "../errors.ts";
+import { logger } from "../middleware/logger.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -798,5 +800,88 @@ describeEmbeddedPostgres("task watchdog scheduler", () => {
     });
 
     expect(result).toMatchObject({ checked: 0, triggered: 0 });
+  });
+
+  describe("non-invokable watchdog agents", () => {
+    // Mirrors heartbeat enqueueWakeup: a non-invokable agent gets the
+    // invoke-path 409 "Agent is not invokable in its current state".
+    function createInvokabilityAwareService(overrides: { throwFor?: Set<string>; budgetBlockFor?: Set<string> } = {}) {
+      const wakes: string[] = [];
+      const service = taskWatchdogService(db, {
+        enqueueWakeup: async (agentId) => {
+          if (overrides.budgetBlockFor?.has(agentId)) {
+            throw conflict("Budget exhausted", { scopeType: "company", scopeId: "budget-scope" });
+          }
+          const [agent] = await db.select({ status: agents.status }).from(agents).where(eq(agents.id, agentId));
+          if (overrides.throwFor?.has(agentId) || agent?.status === "paused") {
+            throw conflict("Agent is not invokable in its current state", { status: "paused", reason: "paused" });
+          }
+          wakes.push(agentId);
+          return { id: randomUUID() };
+        },
+      });
+      return { service, wakes };
+    }
+
+    it("skips a paused watchdog agent, logs it, and still triggers an active one in the same pass", async () => {
+      const warn = vi.spyOn(logger, "warn");
+      const companyId = await seedCompany();
+      const pausedSource = await seedIssue(companyId, { identifier: "WDOG-P1", status: "done" });
+      const activeSource = await seedIssue(companyId, { identifier: "WDOG-A1", status: "done" });
+      const pausedAgentId = await seedAgent(companyId, { status: "paused", name: "Paused watchdog" });
+      const activeAgentId = await seedAgent(companyId, { name: "Active watchdog" });
+      await seedWatchdog(companyId, pausedSource, pausedAgentId);
+      await seedWatchdog(companyId, activeSource, activeAgentId);
+      const { service, wakes } = createInvokabilityAwareService();
+
+      const result = await service.reconcileTaskWatchdogs({ companyId });
+
+      expect(result).toMatchObject({ checked: 2, triggered: 1, skipped: 1, notInvokableSkipped: 1 });
+      expect(wakes).toEqual([activeAgentId]);
+      // Nothing is recorded for the parked watchdog, so a later pass triggers normally.
+      const [pausedWatchdog] = await db.select().from(issueWatchdogs).where(eq(issueWatchdogs.issueId, pausedSource));
+      expect(pausedWatchdog?.watchdogIssueId).toBeNull();
+      expect(pausedWatchdog?.triggerCount).toBe(0);
+      expect(warn).toHaveBeenCalledWith(
+        expect.objectContaining({ agentId: pausedAgentId, agentStatus: "paused", reason: "paused" }),
+        "task watchdog skipped wake for non-invokable agent",
+      );
+      expect(warn).toHaveBeenCalledWith(
+        expect.objectContaining({ notInvokableSkipped: 1 }),
+        "task watchdog pass skipped non-invokable agents",
+      );
+      warn.mockRestore();
+    });
+
+    it("treats an invoke-path 409 after the check as a logged skip", async () => {
+      const warn = vi.spyOn(logger, "warn");
+      const companyId = await seedCompany();
+      const sourceId = await seedIssue(companyId, { identifier: "WDOG-R1", status: "done" });
+      const agentId = await seedAgent(companyId);
+      await seedWatchdog(companyId, sourceId, agentId);
+      const { service } = createInvokabilityAwareService({ throwFor: new Set([agentId]) });
+
+      const result = await service.reconcileTaskWatchdogs({ companyId });
+
+      expect(result).toMatchObject({ checked: 1, triggered: 1, notInvokableSkipped: 1 });
+      expect(warn).toHaveBeenCalledWith(
+        expect.objectContaining({ agentId }),
+        "task watchdog skipped wake after invoke conflict",
+      );
+      warn.mockRestore();
+    });
+
+    it("keeps a budget 409 propagating instead of counting it as a non-invokable skip", async () => {
+      const companyId = await seedCompany();
+      const sourceId = await seedIssue(companyId, { identifier: "WDOG-B1", status: "done" });
+      const agentId = await seedAgent(companyId);
+      await seedWatchdog(companyId, sourceId, agentId);
+      const { service } = createInvokabilityAwareService({ budgetBlockFor: new Set([agentId]) });
+
+      await expect(service.reconcileTaskWatchdogs({ companyId })).rejects.toMatchObject({
+        status: 409,
+        message: "Budget exhausted",
+      });
+    });
   });
 });

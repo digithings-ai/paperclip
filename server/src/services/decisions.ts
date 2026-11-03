@@ -13,6 +13,8 @@ import {
   type IssuePostCommitAction,
 } from "./issues.js";
 import { decisionRetentionService, hashAttentionArchiveManifest } from "./decision-retention.js";
+import { isAgentNotInvokableConflict } from "./agent-invokability.js";
+import { logger } from "../middleware/logger.js";
 
 type Snapshot = { status: string; assigneeAgentId: string | null; assigneeUserId: string | null; updatedAt: string;
   descendantCount?: number; descendantIds?: string[]; childCount?: number; attentionArchive?: unknown };
@@ -629,6 +631,53 @@ export function decisionService(db: Db, options: DecisionServiceOptions) {
     }).where(and(eq(decisions.id, decision.id), sql`${decisions.metadata} ->> 'continuationPending' = 'true'`));
   }
 
+  type ContinuationSweepCounts = {
+    continuationsDelivered: number;
+    continuationsNotInvokableSkipped: number;
+    continuationsFailed: number;
+  };
+
+  // The sweep runs at startup and on every scheduler tick. One undeliverable
+  // continuation must not abort it: a paused, terminated or pending_approval
+  // origin agent makes the wake throw a 409, which used to escape the startup
+  // call and exit the server. Each delivery is isolated here. A failed wake is
+  // never acknowledged, so continuationPending stays true and a later sweep
+  // delivers it once the origin agent can be invoked again.
+  async function deliverSweepContinuation(
+    decision: typeof decisions.$inferSelect,
+    outcome: "decided" | "expired" | "cancelled",
+    counts: ContinuationSweepCounts,
+  ) {
+    const metadata = decision.metadata as Record<string, unknown>;
+    if (decision.continuationPolicy !== "wake_origin_agent" || metadata.continuationPending !== true) return;
+    const logContext = {
+      decisionId: decision.id,
+      companyId: decision.companyId,
+      agentId: decision.originAgentId,
+      issueId: decision.originIssueId,
+      outcome,
+    };
+    try {
+      await deliverContinuation(decision, outcome);
+      counts.continuationsDelivered += 1;
+    } catch (err) {
+      if (isAgentNotInvokableConflict(err)) {
+        counts.continuationsNotInvokableSkipped += 1;
+        const reason = (err.details as { reason?: unknown } | undefined)?.reason ?? null;
+        logger.warn(
+          { ...logContext, reason },
+          "decision continuation skipped for non-invokable origin agent - continuation stays pending",
+        );
+        return;
+      }
+      counts.continuationsFailed += 1;
+      logger.error(
+        { ...logContext, err },
+        "decision continuation delivery failed - continuation stays pending",
+      );
+    }
+  }
+
   async function resumeDecision(decision: typeof decisions.$inferSelect, userActor: AuthorizationActor) {
     const result = decision.executionStatus === "running" ? await runEffects(decision, userActor) : await outcome(decision.id);
     await deliverContinuation(result, "decided");
@@ -732,12 +781,17 @@ export function decisionService(db: Db, options: DecisionServiceOptions) {
         lte(decisions.updatedAt, new Date(now.getTime() - recoveryGraceMs))))
       .orderBy(asc(decisions.updatedAt)).limit(batchSize);
     let resumed = 0;
+    const counts: ContinuationSweepCounts = {
+      continuationsDelivered: 0,
+      continuationsNotInvokableSkipped: 0,
+      continuationsFailed: 0,
+    };
     for (const decision of runningRows) {
       if (!decision.decidedByUserId) continue;
       const recovered = await runEffects(decision, await recoveryActor(decision.companyId, decision.decidedByUserId));
       if (recovered.executionStatus === "running") continue;
       resumed += 1;
-      await deliverContinuation(recovered, "decided");
+      await deliverSweepContinuation(recovered, "decided", counts);
     }
     const pendingContinuations = await db.select().from(decisions)
       .where(and(eq(decisions.continuationPolicy, "wake_origin_agent"),
@@ -746,7 +800,7 @@ export function decisionService(db: Db, options: DecisionServiceOptions) {
           inArray(decisions.executionStatus, ["succeeded", "partial", "failed"])))))
       .orderBy(asc(decisions.updatedAt)).limit(batchSize);
     for (const decision of pendingContinuations) {
-      await deliverContinuation(decision, decision.status === "expired" ? "expired" : decision.status === "cancelled" ? "cancelled" : "decided");
+      await deliverSweepContinuation(decision, decision.status === "expired" ? "expired" : decision.status === "cancelled" ? "cancelled" : "decided", counts);
     }
     const ttlRows = await db.select().from(decisions)
       .where(and(eq(decisions.status, "open"), lte(decisions.expiresAt, now)))
@@ -778,8 +832,14 @@ export function decisionService(db: Db, options: DecisionServiceOptions) {
         ...(decision.continuationPolicy === "wake_origin_agent" ? { continuationPending: true } : {}) } }).where(and(eq(decisions.id, decision.id), eq(decisions.status, "open"))).returning();
       if (!updated) continue; expired += 1;
       await logActivity(db, { companyId: updated.companyId, actorType: "system", actorId: "decision-expiry-sweeper", agentId: updated.originAgentId, runId: updated.originRunId, action: "decision.expired", entityType: "decision", entityId: updated.id, details: { expiredReason: reason } });
-      await deliverContinuation(updated, "expired"); }
-    return { expired, resumed };
+      await deliverSweepContinuation(updated, "expired", counts); }
+    if (counts.continuationsNotInvokableSkipped > 0 || counts.continuationsFailed > 0) {
+      logger.warn(
+        { expired, resumed, ...counts },
+        "decision expiry sweep left continuations pending",
+      );
+    }
+    return { expired, resumed, ...counts };
   }
 
   return { create, createBundle, get, list, stats, outcome, decide, cancel, dismiss, sweepExpired };

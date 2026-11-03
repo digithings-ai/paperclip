@@ -427,7 +427,8 @@ describePg("decisionService", () => {
     await db.insert(decisionEffectExecutions).values({ decisionId: created.id, effectIndex: 0, effectType: "comment_on_issue",
       targetIssueId, status: "claimed" });
 
-    expect(await service().sweepExpired()).toEqual({ expired: 0, resumed: 1 });
+    expect(await service().sweepExpired()).toEqual({ expired: 0, resumed: 1, continuationsDelivered: 1,
+      continuationsNotInvokableSkipped: 0, continuationsFailed: 0 });
     expect((await service().get(created.id))?.executionStatus).toBe("succeeded");
     expect(await db.select().from(issueComments).where(eq(issueComments.issueId, targetIssueId))).toHaveLength(1);
     expect(wakes).toEqual([{ companyId, agentId, issueId: originIssueId, decisionId: created.id, outcome: "decided" }]);

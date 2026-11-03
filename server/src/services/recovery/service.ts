@@ -117,7 +117,11 @@ import {
   buildIssueBlockersResolvedWakeStateKey,
   findExistingIssueBlockersResolvedWakeForReadyState,
 } from "../issue-dependency-wakeups.js";
-import { evaluateAgentInvokabilityFromDb } from "../agent-invokability.js";
+import {
+  evaluateAgentInvokabilityFromDb,
+  isAgentNotInvokableConflict,
+  type AgentInvokability,
+} from "../agent-invokability.js";
 import { isHeartbeatWakeOnDemandEnabled } from "../heartbeat-policy.js";
 import {
   DEFAULT_MAX_SUCCESSFUL_RUN_HANDOFF_ATTEMPTS,
@@ -5586,6 +5590,7 @@ export function recoveryService(
       livePathSkipped: 0,
       interactionSkipped: 0,
       pauseHoldSkipped: 0,
+      notInvokableSkipped: 0,
       notReadySkipped: 0,
       candidateLimitSkipped: 0,
       deferredOrFailed: 0,
@@ -5703,6 +5708,14 @@ export function recoveryService(
       candidatesByCompany.set(candidate.companyId, companyCandidates);
     }
 
+    // A paused, terminated or otherwise non-invokable assignee makes
+    // enqueueWakeup throw a 409. Check once per agent per pass and skip it, so
+    // one parked seat cannot abort the startup reconciliation pass.
+    const invokabilityByAgentId = new Map<
+      string,
+      { invokability: AgentInvokability; agentStatus: string | null }
+    >();
+
     for (const [
       companyId,
       companyCandidates,
@@ -5776,6 +5789,33 @@ export function recoveryService(
         }
 
         try {
+          // The invokability lookup sits inside the try so a lookup failure is
+          // counted like any other enqueue failure instead of aborting the pass.
+          let agentInvokability = invokabilityByAgentId.get(agentId);
+          if (!agentInvokability) {
+            const agent = await getAgent(agentId);
+            agentInvokability = {
+              invokability: await evaluateAgentInvokabilityFromDb(db, agent),
+              agentStatus: agent?.status ?? null,
+            };
+            invokabilityByAgentId.set(agentId, agentInvokability);
+          }
+          const { invokability, agentStatus } = agentInvokability;
+          if (!invokability.invokable) {
+            result.notInvokableSkipped += 1;
+            logger.warn(
+              {
+                issueId: candidate.id,
+                agentId,
+                agentStatus,
+                reason: invokability.reason,
+                source,
+              },
+              "issue graph liveness backstop skipped dependency wake for non-invokable agent",
+            );
+            continue;
+          }
+
           const wake = await deps.enqueueWakeup(agentId, {
             source: "automation",
             triggerDetail: "system",
@@ -5827,6 +5867,17 @@ export function recoveryService(
             },
           });
         } catch (err) {
+          // The agent can become non-invokable between the check above and
+          // the invoke (for example a pause that lands mid-pass). Treat that
+          // 409 as a skip; every other error keeps the enqueueFailed path.
+          if (isAgentNotInvokableConflict(err)) {
+            result.notInvokableSkipped += 1;
+            logger.warn(
+              { err, issueId: candidate.id, agentId, idempotencyKey, source },
+              "issue graph liveness backstop skipped dependency wake after invoke conflict",
+            );
+            continue;
+          }
           result.deferredOrFailed += 1;
           result.enqueueFailed += 1;
           logger.warn(
@@ -5846,6 +5897,19 @@ export function recoveryService(
           blockerIssueId: opts?.blockerIssueId ?? null,
         },
         "issue graph liveness backstop healed resolved blocked dependency wakes",
+      );
+    }
+    if (result.enqueueFailed > 0 || result.notInvokableSkipped > 0) {
+      logger.warn(
+        {
+          checked: result.checked,
+          healed: result.healed,
+          enqueueFailed: result.enqueueFailed,
+          notInvokableSkipped: result.notInvokableSkipped,
+          source,
+          blockerIssueId: opts?.blockerIssueId ?? null,
+        },
+        "issue graph liveness backstop pass finished with skipped or failed dependency wakes",
       );
     }
 
