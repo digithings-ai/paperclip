@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { parseOpenCodeJsonl, isOpenCodeUnknownSessionError, stripDcpSystemReminders } from "./parse.js";
+import {
+  parseOpenCodeJsonl,
+  isOpenCodeSessionReadError,
+  isOpenCodeUnknownSessionError,
+  stripDcpSystemReminders,
+} from "./parse.js";
 
 describe("parseOpenCodeJsonl", () => {
   it("parses assistant text, usage, cost, and errors", () => {
@@ -168,6 +173,36 @@ describe("parseOpenCodeJsonl", () => {
     expect(isOpenCodeUnknownSessionError("Session not found: s_123", "")).toBe(true);
     expect(isOpenCodeUnknownSessionError("", "unknown session id")).toBe(true);
     expect(isOpenCodeUnknownSessionError("all good", "")).toBe(false);
+  });
+});
+
+describe("isOpenCodeSessionReadError", () => {
+  // The error text OpenCode prints when a stored session holds a message row it
+  // cannot decode: the storage read of `session_message` fails and the client
+  // reports the reason as UnsupportedContentType.
+  const sessionReadFailure =
+    'UnsupportedContentType: Failed query: select "id", "session_id", "type", "seq", "time_created", "time_updated", "data" from "session_message" where "session_message"."session_id" = ? order by "session_message"."seq" asc\nparams: ["ses_1"]';
+
+  it("detects a session storage read failure in the output, the error log, or the error message", () => {
+    expect(isOpenCodeSessionReadError(sessionReadFailure, "")).toBe(true);
+    expect(isOpenCodeSessionReadError("", sessionReadFailure)).toBe(true);
+    expect(isOpenCodeSessionReadError("", "", sessionReadFailure)).toBe(true);
+  });
+
+  it("detects a storage read failure that names the session table", () => {
+    expect(
+      isOpenCodeSessionReadError(
+        'Failed query: select "id" from "session_message" where "session_id" = ?',
+        "",
+      ),
+    ).toBe(true);
+  });
+
+  it("does not match failures that are not a session read", () => {
+    expect(isOpenCodeSessionReadError("model unavailable", "")).toBe(false);
+    expect(isOpenCodeSessionReadError("UnsupportedContentType", "")).toBe(false);
+    expect(isOpenCodeSessionReadError('Failed query: select "id" from "kv"', "")).toBe(false);
+    expect(isOpenCodeSessionReadError("", "", "connection reset")).toBe(false);
   });
 });
 

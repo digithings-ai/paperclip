@@ -131,3 +131,30 @@ export function isOpenCodeUnknownSessionError(stdout: string, stderr: string): b
     haystack,
   );
 }
+
+// A stored session can exist and still be unreadable. OpenCode keeps every message of
+// a session as one JSON document in its `session_message` table and decodes that
+// document when it reads the session back. When one row holds content the running
+// OpenCode cannot decode, the read of the whole session fails: the server reports a
+// failed query on `session_message` and the client reports `UnsupportedContentType`.
+// The session id stays valid, so every attempt that resumes that session fails in the
+// same way. The two signals must appear together: a failed query on another table, or
+// an `UnsupportedContentType` without a storage read, are other failures.
+export function isOpenCodeSessionReadError(
+  stdout: string,
+  stderr: string,
+  errorMessage?: string | null,
+): boolean {
+  const haystack = `${stdout}\n${stderr}\n${errorMessage ?? ""}`.toLowerCase();
+  const storageReadFailure =
+    haystack.includes("failed query") || haystack.includes("drizzlequeryerror");
+  const sessionTable =
+    haystack.includes("session_message") || haystack.includes("session_v2");
+  const clientReason = haystack.includes("unsupportedcontenttype");
+
+  return (
+    (storageReadFailure && sessionTable) ||
+    (clientReason && storageReadFailure) ||
+    (clientReason && sessionTable)
+  );
+}
