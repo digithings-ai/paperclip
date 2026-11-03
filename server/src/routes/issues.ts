@@ -553,6 +553,7 @@ function noopTaskWatchdogService(): TaskWatchdogService {
       pendingFirstRun: 0,
       alreadyReviewed: 0,
       skipped: 0,
+      notInvokableSkipped: 0,
       watchdogIssueIds: [],
     }),
     reconcileForIssueAndAncestors: async () => ({
@@ -560,6 +561,7 @@ function noopTaskWatchdogService(): TaskWatchdogService {
       triggered: 0,
       pendingFirstRun: 0,
       skipped: 0,
+      notInvokableSkipped: 0,
       watchdogIssueIds: [],
     }),
     revalidateMutationScope: async () => ({

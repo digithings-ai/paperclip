@@ -1007,6 +1007,8 @@ describeEmbeddedPostgres("heartbeat resolved dependency wake reconciliation", ()
       "issue graph liveness backstop skipped dependency wake for non-invokable agent";
     const INVOKE_CONFLICT_SKIP_MESSAGE =
       "issue graph liveness backstop skipped dependency wake after invoke conflict";
+    const PASS_SUMMARY_MESSAGE =
+      "issue graph liveness backstop pass finished with skipped or failed dependency wakes";
 
     async function countWakeRequests(agentId: string) {
       const rows = await db
@@ -1143,6 +1145,41 @@ describeEmbeddedPostgres("heartbeat resolved dependency wake reconciliation", ()
       expect(result.notInvokableSkipped).toBe(0);
       expect(result.enqueueFailed).toBe(1);
       expect(result.deferredOrFailed).toBe(1);
+    });
+
+    it("keeps a budget 409 on the enqueueFailed path instead of counting it as a skip", async () => {
+      const warn = vi.spyOn(logger, "warn");
+      await seedResolvedDependencyBackstopFixture({ workspaceState: "none" });
+      const enqueueWakeup = vi.fn(async () => {
+        throw conflict("Budget exhausted", { scopeType: "company", scopeId: randomUUID() });
+      });
+
+      const result = await recoveryService(db, { enqueueWakeup })
+        .reconcileResolvedDependencyWakeBackstop();
+
+      expect(result.notInvokableSkipped).toBe(0);
+      expect(result.enqueueFailed).toBe(1);
+      expect(warn).not.toHaveBeenCalledWith(expect.anything(), INVOKE_CONFLICT_SKIP_MESSAGE);
+      expect(warn).toHaveBeenCalledWith(
+        expect.objectContaining({ enqueueFailed: 1, notInvokableSkipped: 0 }),
+        PASS_SUMMARY_MESSAGE,
+      );
+      warn.mockRestore();
+    });
+
+    it("logs a pass summary WARN when dependency wakes are skipped", async () => {
+      const warn = vi.spyOn(logger, "warn");
+      const { agentId } = await seedResolvedDependencyBackstopFixture({ workspaceState: "none" });
+      await db.update(agents).set({ status: "paused" }).where(eq(agents.id, agentId));
+      const enqueueWakeup = vi.fn(async () => ({ id: randomUUID() }) as never);
+
+      await recoveryService(db, { enqueueWakeup }).reconcileResolvedDependencyWakeBackstop();
+
+      expect(warn).toHaveBeenCalledWith(
+        expect.objectContaining({ notInvokableSkipped: 1, enqueueFailed: 0 }),
+        PASS_SUMMARY_MESSAGE,
+      );
+      warn.mockRestore();
     });
   });
 

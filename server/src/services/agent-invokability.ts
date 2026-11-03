@@ -2,6 +2,7 @@ import type { Db } from "@paperclipai/db";
 import { agents } from "@paperclipai/db";
 import { getAgentWorkEligibility, type AgentEligibilityAgent, type AgentOrgChainHealth } from "@paperclipai/shared";
 import { eq } from "drizzle-orm";
+import { HttpError } from "../errors.js";
 
 type AgentStatus = (typeof agents.$inferSelect)["status"];
 
@@ -31,6 +32,33 @@ export type AgentInvokability =
       details: Record<string, unknown>;
       invalidOrgChain: boolean;
     };
+
+const AGENT_INVOKABILITY_BLOCK_REASONS = new Set<string>([
+  "missing",
+  "paused",
+  "terminated",
+  "pending_approval",
+  "unknown_status",
+  "manager_missing",
+  "manager_company_mismatch",
+  "manager_terminated",
+  "reporting_cycle",
+  "reporting_chain_too_deep",
+] satisfies AgentInvokabilityBlockReason[]);
+
+/**
+ * True for the 409 that enqueueWakeup throws when the target agent is not
+ * invokable (paused, terminated, pending approval, broken reporting chain...).
+ * Other 409s, such as a budget block, carry no invokability reason and return
+ * false so callers keep their existing handling for them.
+ */
+export function isAgentNotInvokableConflict(err: unknown): err is HttpError {
+  if (!(err instanceof HttpError) || err.status !== 409) return false;
+  const details = err.details;
+  if (!details || typeof details !== "object") return false;
+  const reason = (details as { reason?: unknown }).reason;
+  return typeof reason === "string" && AGENT_INVOKABILITY_BLOCK_REASONS.has(reason);
+}
 
 export const DIRECT_NON_INVOKABLE_STATUSES = new Set<AgentStatus>([
   "paused",

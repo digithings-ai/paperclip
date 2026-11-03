@@ -603,6 +603,7 @@ import {
   evaluateAgentInvokability,
   evaluateAgentInvokabilityFromDb,
   shouldCancelRunsForNonInvokableAgent,
+  isAgentNotInvokableConflict,
   DIRECT_NON_INVOKABLE_STATUSES,
   type AgentOrgRow,
 } from "./agent-invokability.js";
@@ -20013,9 +20014,71 @@ export function heartbeatService(
     }
   }
 
+  // Recovery passes wake agents in bulk. A paused, terminated or otherwise
+  // non-invokable seat makes enqueueWakeup throw a 409, which used to abort the
+  // whole pass (and startup with it). The gate checks each agent once per pass
+  // and logs a skip; recoverWakeOrSkip also turns a late invoke-path 409 (agent
+  // paused mid-pass) into a logged skip. Every other error still propagates.
+  function createRecoveryWakeGate(pass: string) {
+    const cache = new Map<
+      string,
+      { invokable: boolean; agentStatus: string | null; reason: string | null }
+    >();
+    let notInvokableSkipped = 0;
+    return {
+      get notInvokableSkipped() {
+        return notInvokableSkipped;
+      },
+      async skip(agentId: string, context: Record<string, unknown>) {
+        let entry = cache.get(agentId);
+        if (!entry) {
+          const agent = await getAgent(agentId);
+          const invokability = await getAgentInvokability(agent);
+          entry = {
+            invokable: invokability.invokable,
+            agentStatus: agent?.status ?? null,
+            reason: invokability.invokable ? null : invokability.reason,
+          };
+          cache.set(agentId, entry);
+        }
+        if (entry.invokable) return false;
+        notInvokableSkipped += 1;
+        logger.warn(
+          { ...context, agentId, agentStatus: entry.agentStatus, reason: entry.reason, pass },
+          "heartbeat recovery skipped wake for non-invokable agent",
+        );
+        return true;
+      },
+      async wakeOrSkip<T>(
+        agentId: string,
+        context: Record<string, unknown>,
+        wake: () => Promise<T>,
+      ): Promise<{ skipped: true } | { skipped: false; value: T }> {
+        try {
+          return { skipped: false, value: await wake() };
+        } catch (err) {
+          if (!isAgentNotInvokableConflict(err)) throw err;
+          notInvokableSkipped += 1;
+          logger.warn(
+            { ...context, err, agentId, pass },
+            "heartbeat recovery skipped wake after invoke conflict",
+          );
+          return { skipped: true };
+        }
+      },
+      summarize(summary: Record<string, unknown>) {
+        if (notInvokableSkipped === 0) return;
+        logger.warn(
+          { ...summary, notInvokableSkipped, pass },
+          "heartbeat recovery pass skipped non-invokable agents",
+        );
+      },
+    };
+  }
+
   async function recoverActiveSessionGoals() {
     if ((await getSchedulingSuppression()).suppressed) {
-      return { scanned: 0, enqueued: 0 };
+      return { scanned: 0, enqueued: 0, notInvokableSkipped: 0 };
     }
     const sessions = await db
       .select({
@@ -20042,29 +20105,40 @@ export function heartbeatService(
         ),
       );
     let enqueued = 0;
+    const gate = createRecoveryWakeGate("session_goal_recovery");
     for (const session of sessions) {
-      const run = await enqueueWakeup(session.agentId, {
-        source: "automation",
-        triggerDetail: "system",
-        reason: "goal_control",
-        payload: { issueId: session.issueId, intent: "goal_recovery" },
-        idempotencyKey: `goal_recovery:${session.id}:${session.revision}`,
-        requestedByActorType: "system",
-        contextSnapshot: {
-          issueId: session.issueId,
-          taskKey: session.issueId,
-          resumeSessionGoalHeartbeat: true,
-          skipIssueComment: true,
-        },
-      });
-      if (run) enqueued += 1;
+      const logContext = { sessionId: session.id, issueId: session.issueId };
+      if (await gate.skip(session.agentId, logContext)) continue;
+      const outcome = await gate.wakeOrSkip(session.agentId, logContext, () =>
+        enqueueWakeup(session.agentId, {
+          source: "automation",
+          triggerDetail: "system",
+          reason: "goal_control",
+          payload: { issueId: session.issueId, intent: "goal_recovery" },
+          idempotencyKey: `goal_recovery:${session.id}:${session.revision}`,
+          requestedByActorType: "system",
+          contextSnapshot: {
+            issueId: session.issueId,
+            taskKey: session.issueId,
+            resumeSessionGoalHeartbeat: true,
+            skipIssueComment: true,
+          },
+        }),
+      );
+      if (!outcome.skipped && outcome.value) enqueued += 1;
     }
-    return { scanned: sessions.length, enqueued };
+    const result = {
+      scanned: sessions.length,
+      enqueued,
+      notInvokableSkipped: gate.notInvokableSkipped,
+    };
+    gate.summarize(result);
+    return result;
   }
 
   async function recoverPendingSessionGoalActions() {
     if ((await getSchedulingSuppression()).suppressed) {
-      return { scanned: 0, enqueued: 0, alreadyQueued: 0, invalid: 0 };
+      return { scanned: 0, enqueued: 0, alreadyQueued: 0, invalid: 0, notInvokableSkipped: 0 };
     }
     const pending = await db
       .select({
@@ -20101,6 +20175,7 @@ export function heartbeatService(
     let enqueued = 0;
     let alreadyQueued = 0;
     let invalid = 0;
+    const gate = createRecoveryWakeGate("session_goal_action_recovery");
     for (const action of pending) {
       const control = parseNativeSessionGoalControl(action.payload);
       if (!control || control.requestId !== action.requestId) {
@@ -20146,7 +20221,11 @@ export function heartbeatService(
         continue;
       }
 
-      const run = await enqueueWakeup(action.agentId, {
+      // A parked seat keeps its pending action; it is delivered on a later
+      // pass once the agent is invokable again.
+      const logContext = { actionId: action.id, issueId: action.issueId };
+      if (await gate.skip(action.agentId, logContext)) continue;
+      const outcome = await gate.wakeOrSkip(action.agentId, logContext, () => enqueueWakeup(action.agentId, {
         source: "automation",
         triggerDetail: "system",
         reason: "goal_control",
@@ -20168,10 +20247,18 @@ export function heartbeatService(
           runnerGoalControl: control,
           skipIssueComment: true,
         },
-      });
-      if (run) enqueued += 1;
+      }));
+      if (!outcome.skipped && outcome.value) enqueued += 1;
     }
-    return { scanned: pending.length, enqueued, alreadyQueued, invalid };
+    const result = {
+      scanned: pending.length,
+      enqueued,
+      alreadyQueued,
+      invalid,
+      notInvokableSkipped: gate.notInvokableSkipped,
+    };
+    gate.summarize(result);
+    return result;
   }
 
   async function reconcileStrandedAssignedIssues() {

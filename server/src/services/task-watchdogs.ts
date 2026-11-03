@@ -19,7 +19,11 @@ import type { IssueWatchdog, IssueWatchdogSummary } from "@paperclipai/shared";
 import { conflict, notFound } from "../errors.js";
 import { parseObject } from "../adapters/utils.js";
 import { logActivity } from "./activity-log.js";
-import { evaluateAgentInvokabilityFromDb } from "./agent-invokability.js";
+import {
+  evaluateAgentInvokabilityFromDb,
+  isAgentNotInvokableConflict,
+} from "./agent-invokability.js";
+import { logger } from "../middleware/logger.js";
 import { issueService } from "./issues.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
 import { TASK_WATCHDOG_ORIGIN_KIND } from "./task-watchdog-scope.js";
@@ -579,6 +583,29 @@ async function assertWatchdogAgentInvokable(dbOrTx: any, companyId: string, agen
     throw conflict("Cannot assign watchdog to an agent that is not invokable", invokability);
   }
   return agent;
+}
+
+function isWatchdogNotInvokableSkip(evaluated: { state: string; reason?: unknown; wakeSkippedNotInvokable?: unknown }) {
+  return (
+    (evaluated.state === "skipped" && evaluated.reason === "watchdog_agent_not_invokable") ||
+    (evaluated.state === "triggered" && evaluated.wakeSkippedNotInvokable === true)
+  );
+}
+
+function logWatchdogPassSummary(
+  pass: string,
+  result: { checked: number; triggered: number; notInvokableSkipped: number },
+) {
+  if (result.notInvokableSkipped === 0) return;
+  logger.warn(
+    {
+      pass,
+      checked: result.checked,
+      triggered: result.triggered,
+      notInvokableSkipped: result.notInvokableSkipped,
+    },
+    "task watchdog pass skipped non-invokable agents",
+  );
 }
 
 function readNonEmptyString(value: unknown): string | null {
@@ -1502,6 +1529,43 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
       };
     }
 
+    // A paused, terminated or otherwise non-invokable watchdog agent makes
+    // enqueueWakeup throw a 409, which aborted the whole reconcile pass (and
+    // startup with it). Skip before creating review work, so nothing is
+    // recorded for this stop and the next pass triggers normally once the
+    // agent can be invoked again.
+    if (deps.enqueueWakeup) {
+      const watchdogAgent = await db
+        .select({
+          id: agents.id,
+          companyId: agents.companyId,
+          name: agents.name,
+          reportsTo: agents.reportsTo,
+          status: agents.status,
+        })
+        .from(agents)
+        .where(eq(agents.id, watchdog.watchdogAgentId))
+        .then((rows) => rows[0] ?? null);
+      const invokability = await evaluateAgentInvokabilityFromDb(db, watchdogAgent);
+      if (!invokability.invokable) {
+        logger.warn(
+          {
+            watchdogId: watchdog.id,
+            issueId: sourceIssue.id,
+            agentId: watchdog.watchdogAgentId,
+            agentStatus: watchdogAgent?.status ?? null,
+            reason: invokability.reason,
+          },
+          "task watchdog skipped wake for non-invokable agent",
+        );
+        return {
+          state: "skipped" as const,
+          reason: "watchdog_agent_not_invokable",
+          classification,
+        };
+      }
+    }
+
     const watchdogIssue = await ensureReusableWatchdogIssue({
       watchdog,
       sourceIssue,
@@ -1546,24 +1610,44 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
       sourceIssue,
       classification,
     });
-    const wake = deps.enqueueWakeup
-      ? await deps.enqueueWakeup(watchdog.watchdogAgentId, {
-        source: "automation",
-        triggerDetail: "system",
-        reason: "task_watchdog_stopped_subtree",
-        payload: context,
-        contextSnapshot: context,
-        idempotencyKey: taskWatchdogWakeIdempotencyKey(watchdog.id, classification.stopFingerprint),
-        requestedByActorType: "system",
-        requestedByActorId: null,
-      })
-      : null;
+    let wake: Awaited<ReturnType<TaskWatchdogWakeup>> | null = null;
+    let wakeSkippedNotInvokable = false;
+    if (deps.enqueueWakeup) {
+      try {
+        wake = await deps.enqueueWakeup(watchdog.watchdogAgentId, {
+          source: "automation",
+          triggerDetail: "system",
+          reason: "task_watchdog_stopped_subtree",
+          payload: context,
+          contextSnapshot: context,
+          idempotencyKey: taskWatchdogWakeIdempotencyKey(watchdog.id, classification.stopFingerprint),
+          requestedByActorType: "system",
+          requestedByActorId: null,
+        });
+      } catch (err) {
+        // The agent became non-invokable after the check above (for example,
+        // paused mid-pass). The review issue exists; log and keep going.
+        // Every other error, including a budget 409, still propagates.
+        if (!isAgentNotInvokableConflict(err)) throw err;
+        wakeSkippedNotInvokable = true;
+        logger.warn(
+          {
+            err,
+            watchdogId: watchdog.id,
+            watchdogIssueId: watchdogIssue.id,
+            agentId: watchdog.watchdogAgentId,
+          },
+          "task watchdog skipped wake after invoke conflict",
+        );
+      }
+    }
 
     return {
       state: "triggered" as const,
       classification,
       watchdogIssueId: watchdogIssue.id,
       wakeupRunId: wake?.id ?? null,
+      wakeSkippedNotInvokable,
     };
   }
 
@@ -1751,11 +1835,13 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
         pendingFirstRun: 0,
         alreadyReviewed: 0,
         skipped: 0,
+        notInvokableSkipped: 0,
         watchdogIssueIds: [] as string[],
       };
       for (const row of rows) {
         result.checked += 1;
         const evaluated = await evaluateWatchdog(row, { runId: opts.runId ?? null });
+        if (isWatchdogNotInvokableSkip(evaluated)) result.notInvokableSkipped += 1;
         if (evaluated.state === "triggered") {
           result.triggered += 1;
           result.watchdogIssueIds.push(evaluated.watchdogIssueId);
@@ -1773,6 +1859,7 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
           result.skipped += 1;
         }
       }
+      logWatchdogPassSummary("reconcile", result);
       return result;
     },
 
@@ -1787,11 +1874,13 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
         triggered: 0,
         pendingFirstRun: 0,
         skipped: 0,
+        notInvokableSkipped: 0,
         watchdogIssueIds: [] as string[],
       };
       for (const row of rows) {
         result.checked += 1;
         const evaluated = await evaluateWatchdog(row, { runId: opts.runId ?? null });
+        if (isWatchdogNotInvokableSkip(evaluated)) result.notInvokableSkipped += 1;
         if (evaluated.state === "triggered") {
           result.triggered += 1;
           result.watchdogIssueIds.push(evaluated.watchdogIssueId);
@@ -1807,6 +1896,7 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
           result.skipped += 1;
         }
       }
+      logWatchdogPassSummary("reconcile_for_issue", result);
       return result;
     },
 
