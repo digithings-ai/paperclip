@@ -682,6 +682,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     runStatus?: "running" | "queued" | "failed" | "interrupted";
     processPid?: number | null;
     processGroupId?: number | null;
+    processStartedAt?: Date | null;
     processLossRetryCount?: number;
     runtimeMode?: "legacy" | "native";
     includeIssue?: boolean;
@@ -744,6 +745,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
           : { ...(input?.contextSnapshot ?? {}), issueId },
       processPid: input?.processPid ?? null,
       processGroupId: input?.processGroupId ?? null,
+      processStartedAt: input?.processStartedAt ?? null,
       processLossRetryCount: input?.processLossRetryCount ?? 0,
       ...(input?.runtimeMode ? { runtimeMode: input.runtimeMode } : {}),
       errorCode: input?.runErrorCode ?? null,
@@ -4156,6 +4158,98 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       expect(runs[0]?.error).toContain(
         `persisted process group ${orphan.processGroupId}`,
       );
+    },
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "reaps a detached run whose verified child outlived the previous server boot",
+    async () => {
+      const child = spawnAliveProcess();
+      childProcesses.add(child);
+      expect(child.pid).toBeGreaterThan(0);
+      const observedStartedAt = await readProcessStartedAt(child.pid!);
+      expect(observedStartedAt).not.toBeNull();
+
+      const { agentId, runId } = await seedRunFixture({
+        agentStatus: "running",
+        processPid: child.pid,
+        processGroupId: null,
+        processStartedAt: new Date(observedStartedAt!),
+        runErrorCode: "process_detached",
+        runError: `Lost in-memory process handle, but child pid ${child.pid} is still alive`,
+      });
+      const heartbeat = heartbeatService(db);
+
+      const result = await heartbeat.reapOrphanedRuns();
+      expect(result.reaped).toBe(1);
+      expect(result.runIds).toEqual([runId]);
+      expect(await waitForPidExit(child.pid!)).toBe(true);
+
+      const run = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId))
+        .then((rows) => rows[0] ?? null);
+      expect(run).toMatchObject({
+        id: runId,
+        status: "interrupted",
+        errorCode: "process_detached_reaped",
+        processPid: null,
+        processGroupId: null,
+        processStartedAt: null,
+      });
+      expect(run?.error).toContain(`pid ${child.pid}`);
+
+      const agent = await db
+        .select({ status: agents.status })
+        .from(agents)
+        .where(eq(agents.id, agentId))
+        .then((rows) => rows[0] ?? null);
+      expect(agent?.status).toBe("idle");
+    },
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "does not signal a recycled pid and still frees the detached run",
+    async () => {
+      const child = spawnAliveProcess();
+      childProcesses.add(child);
+      expect(child.pid).toBeGreaterThan(0);
+
+      const { agentId, runId } = await seedRunFixture({
+        agentStatus: "running",
+        processPid: child.pid,
+        processGroupId: null,
+        processStartedAt: new Date("2020-01-01T00:00:00.000Z"),
+      });
+      const heartbeat = heartbeatService(db);
+
+      const result = await heartbeat.reapOrphanedRuns();
+      expect(result.reaped).toBe(1);
+      expect(result.runIds).toEqual([runId]);
+      expect(mockTerminateLocalService).not.toHaveBeenCalled();
+      expect(isPidAlive(child.pid)).toBe(true);
+
+      const run = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId))
+        .then((rows) => rows[0] ?? null);
+      expect(run).toMatchObject({
+        id: runId,
+        status: "interrupted",
+        errorCode: "process_detached_reaped",
+        processPid: null,
+        processGroupId: null,
+        processStartedAt: null,
+      });
+
+      const agent = await db
+        .select({ status: agents.status })
+        .from(agents)
+        .where(eq(agents.id, agentId))
+        .then((rows) => rows[0] ?? null);
+      expect(agent?.status).toBe("idle");
     },
   );
 
