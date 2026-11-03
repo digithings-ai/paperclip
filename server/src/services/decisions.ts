@@ -29,8 +29,46 @@ const DAY = 86_400_000;
 // Origin statuses that can never take a continuation wake. The pending-
 // continuation query leaves these rows out so they cannot fill the batch.
 const PARKED_ORIGIN_STATUSES = [...DIRECT_NON_INVOKABLE_STATUSES];
-// A parked continuation is logged at most once per decision per interval.
-const PARKED_CONTINUATION_LOG_INTERVAL_MS = 60 * 60_000;
+// A parked continuation, or a running decision whose effect recovery keeps
+// failing, is logged at most once per decision per interval.
+const SWEEP_LOG_INTERVAL_MS = 60 * 60_000;
+// Hard cap on the per-decision log throttle; the oldest entries are evicted.
+const SWEEP_LOG_THROTTLE_MAX_ENTRIES = 5_000;
+
+/**
+ * Per-key log throttle with a hard size cap. `shouldLog(key)` returns true at
+ * most once per key per interval. Keys are kept in last-logged order, so when
+ * the map is over its cap the oldest entries are evicted first.
+ */
+export function createSweepLogThrottle(options: { intervalMs: number; maxEntries: number; now?: () => number }) {
+  const loggedAt = new Map<string, number>();
+  const now = options.now ?? Date.now;
+  const maxEntries = Math.max(1, Math.trunc(options.maxEntries));
+  return {
+    shouldLog(key: string) {
+      const at = now();
+      const last = loggedAt.get(key);
+      if (last !== undefined && at - last < options.intervalMs) return false;
+      loggedAt.delete(key);
+      loggedAt.set(key, at);
+      while (loggedAt.size > maxEntries) {
+        const oldest = loggedAt.keys().next().value as string;
+        loggedAt.delete(oldest);
+      }
+      return true;
+    },
+    forget(key: string) {
+      loggedAt.delete(key);
+    },
+    get size() {
+      return loggedAt.size;
+    },
+  };
+}
+
+// Keyset cursor for the sweep's (updated_at, id)-ordered queries. updatedAt is
+// the Postgres text form of the timestamp, so microseconds round-trip exactly.
+type SweepCursor = { updatedAt: string; id: string } | null;
 
 function targetIds(options: DecisionOption[]) {
   const result = new Set<string>();
@@ -132,6 +170,12 @@ function boardCanActDirectly(actor: AuthorizationActor, companyId: string) {
 export function decisionService(db: Db, options: DecisionServiceOptions) {
   const authz = authorizationService(db);
   let targetSweepCursor: string | null = null;
+  // Like targetSweepCursor: advance only when a batch is full, and wrap to the
+  // start when a batch comes back short. Without them, rows that are skipped
+  // or keep failing (a skip never touches updated_at) hold the oldest slots on
+  // every tick and starve the rest.
+  let pendingContinuationCursor: SweepCursor = null;
+  let runningRecoveryCursor: SweepCursor = null;
   type CreateInput = { companyId: string; actor: AuthorizationActor; agentId: string; runId: string; bundleId?: string | null;
     ruleKey?: string | null; title: string; body: string; options: DecisionOption[]; inputs?: DecisionInput[] | null; expiresAt?: Date | null;
     idempotencyKey?: string | null; continuationPolicy?: "none" | "wake_origin_agent"; metadata?: Record<string, unknown> };
@@ -651,32 +695,41 @@ export function decisionService(db: Db, options: DecisionServiceOptions) {
     counts: ContinuationSweepCounts;
     // One invokability lookup per origin agent per sweep.
     invokability: Map<string, Promise<AgentInvokability>>;
-    // Whether any skip was logged this sweep (the per-decision log is throttled).
-    skipLogged: boolean;
+    // Whether a throttled skip or effect-recovery line was logged this sweep.
+    throttledLineLogged: boolean;
   };
 
-  // decisionId -> when its "parked continuation" line was last logged.
-  const parkedContinuationLoggedAt = new Map<string, number>();
+  const parkedContinuationLog = createSweepLogThrottle({
+    intervalMs: SWEEP_LOG_INTERVAL_MS,
+    maxEntries: SWEEP_LOG_THROTTLE_MAX_ENTRIES,
+  });
+  const effectRecoveryFailureLog = createSweepLogThrottle({
+    intervalMs: SWEEP_LOG_INTERVAL_MS,
+    maxEntries: SWEEP_LOG_THROTTLE_MAX_ENTRIES,
+  });
 
   function logParkedContinuation(
     ctx: ContinuationSweepContext,
     logContext: Record<string, unknown> & { decisionId: string },
     reason: unknown,
   ) {
-    const now = Date.now();
-    const last = parkedContinuationLoggedAt.get(logContext.decisionId);
-    if (last !== undefined && now - last < PARKED_CONTINUATION_LOG_INTERVAL_MS) return;
-    if (parkedContinuationLoggedAt.size >= 10_000) {
-      for (const [id, at] of parkedContinuationLoggedAt) {
-        if (now - at >= PARKED_CONTINUATION_LOG_INTERVAL_MS) parkedContinuationLoggedAt.delete(id);
-      }
-    }
-    parkedContinuationLoggedAt.set(logContext.decisionId, now);
-    ctx.skipLogged = true;
+    if (!parkedContinuationLog.shouldLog(logContext.decisionId)) return;
+    ctx.throttledLineLogged = true;
     logger.warn(
       { ...logContext, reason },
       "decision continuation skipped for non-invokable origin agent - continuation stays pending",
     );
+  }
+
+  function afterSweepCursor(cursor: SweepCursor) {
+    return cursor
+      ? [sql`(${decisions.updatedAt}, ${decisions.id}) > (${cursor.updatedAt}::timestamptz, ${cursor.id}::uuid)`]
+      : [];
+  }
+
+  function nextSweepCursor(rows: Array<{ decision: { id: string }; cursorUpdatedAt: string }>, batchSize: number): SweepCursor {
+    const last = rows[rows.length - 1];
+    return rows.length === batchSize && last ? { updatedAt: last.cursorUpdatedAt, id: last.decision.id } : null;
   }
 
   function originInvokability(ctx: ContinuationSweepContext, agentId: string) {
@@ -729,7 +782,7 @@ export function decisionService(db: Db, options: DecisionServiceOptions) {
       }
       await deliverContinuation(decision, outcome);
       counts.continuationsDelivered += 1;
-      parkedContinuationLoggedAt.delete(decision.id);
+      parkedContinuationLog.forget(decision.id);
     } catch (err) {
       if (isAgentNotInvokableConflict(err)) {
         // The agent became non-invokable between the check and the wake.
@@ -844,10 +897,15 @@ export function decisionService(db: Db, options: DecisionServiceOptions) {
     const recoveryGraceMs = Number.isFinite(configuredRecoveryGraceMs) && configuredRecoveryGraceMs >= 0
       ? configuredRecoveryGraceMs
       : 60_000;
-    const runningRows = await db.select().from(decisions)
+    const cursorUpdatedAt = sql<string>`${decisions.updatedAt}::text`;
+    // A running row whose runEffects keeps failing keeps its old updated_at, so
+    // this query pages with a cursor too.
+    const runningPage = await db.select({ decision: decisions, cursorUpdatedAt }).from(decisions)
       .where(and(eq(decisions.status, "decided"), eq(decisions.executionStatus, "running"),
-        lte(decisions.updatedAt, new Date(now.getTime() - recoveryGraceMs))))
-      .orderBy(asc(decisions.updatedAt)).limit(batchSize);
+        lte(decisions.updatedAt, new Date(now.getTime() - recoveryGraceMs)), ...afterSweepCursor(runningRecoveryCursor)))
+      .orderBy(asc(decisions.updatedAt), asc(decisions.id)).limit(batchSize);
+    runningRecoveryCursor = nextSweepCursor(runningPage, batchSize);
+    const runningRows = runningPage.map((row) => row.decision);
     let resumed = 0;
     let resumeFailed = 0;
     const counts: ContinuationSweepCounts = {
@@ -855,7 +913,7 @@ export function decisionService(db: Db, options: DecisionServiceOptions) {
       continuationsNotInvokableSkipped: 0,
       continuationsFailed: 0,
     };
-    const ctx: ContinuationSweepContext = { counts, invokability: new Map(), skipLogged: false };
+    const ctx: ContinuationSweepContext = { counts, invokability: new Map(), throttledLineLogged: false };
     for (const decision of runningRows) {
       if (!decision.decidedByUserId) continue;
       // Per-item isolation: one decision whose effects throw is logged and
@@ -865,12 +923,16 @@ export function decisionService(db: Db, options: DecisionServiceOptions) {
         recovered = await runEffects(decision, await recoveryActor(decision.companyId, decision.decidedByUserId));
       } catch (err) {
         resumeFailed += 1;
-        logger.error(
-          { decisionId: decision.id, companyId: decision.companyId, err },
-          "decision effect recovery failed - decision stays running, continuing with the next one",
-        );
+        if (effectRecoveryFailureLog.shouldLog(decision.id)) {
+          ctx.throttledLineLogged = true;
+          logger.error(
+            { decisionId: decision.id, companyId: decision.companyId, err },
+            "decision effect recovery failed - decision stays running, continuing with the next one",
+          );
+        }
         continue;
       }
+      effectRecoveryFailureLog.forget(decision.id);
       if (recovered.executionStatus === "running") continue;
       resumed += 1;
       await deliverSweepContinuation(recovered, "decided", ctx);
@@ -881,16 +943,18 @@ export function decisionService(db: Db, options: DecisionServiceOptions) {
     // slots on every tick and starve deliverable continuations. They are
     // picked up again once the agent's status changes. Other non-invokable
     // origins (for example a broken reporting chain) are caught by the
-    // pre-check in deliverSweepContinuation.
-    const pendingContinuations = await db.select({ decision: decisions }).from(decisions)
+    // pre-check in deliverSweepContinuation, and the cursor moves past them so
+    // more than a batch of them cannot starve the rest either.
+    const pendingPage = await db.select({ decision: decisions, cursorUpdatedAt }).from(decisions)
       .innerJoin(agents, eq(agents.id, decisions.originAgentId))
       .where(and(eq(decisions.continuationPolicy, "wake_origin_agent"),
         sql`${decisions.metadata} ->> 'continuationPending' = 'true'`,
         or(inArray(decisions.status, ["expired", "cancelled"]), and(eq(decisions.status, "decided"),
           inArray(decisions.executionStatus, ["succeeded", "partial", "failed"]))),
-        notInArray(agents.status, PARKED_ORIGIN_STATUSES)))
-      .orderBy(asc(decisions.updatedAt)).limit(batchSize)
-      .then((rows) => rows.map((row) => row.decision));
+        notInArray(agents.status, PARKED_ORIGIN_STATUSES), ...afterSweepCursor(pendingContinuationCursor)))
+      .orderBy(asc(decisions.updatedAt), asc(decisions.id)).limit(batchSize);
+    pendingContinuationCursor = nextSweepCursor(pendingPage, batchSize);
+    const pendingContinuations = pendingPage.map((row) => row.decision);
     for (const decision of pendingContinuations) {
       await deliverSweepContinuation(decision, decision.status === "expired" ? "expired" : decision.status === "cancelled" ? "cancelled" : "decided", ctx);
     }
@@ -925,9 +989,9 @@ export function decisionService(db: Db, options: DecisionServiceOptions) {
       if (!updated) continue; expired += 1;
       await logActivity(db, { companyId: updated.companyId, actorType: "system", actorId: "decision-expiry-sweeper", agentId: updated.originAgentId, runId: updated.originRunId, action: "decision.expired", entityType: "decision", entityId: updated.id, details: { expiredReason: reason } });
       await deliverSweepContinuation(updated, "expired", ctx); }
-    // Skips alone only warn when a (throttled) skip line was logged this sweep,
-    // so a parked continuation does not add a WARN on every tick.
-    if (counts.continuationsFailed > 0 || resumeFailed > 0 || ctx.skipLogged) {
+    // Skips and effect-recovery failures only warn when a (throttled) line was
+    // logged this sweep, so a stuck decision does not add a WARN on every tick.
+    if (counts.continuationsFailed > 0 || ctx.throttledLineLogged) {
       logger.warn(
         { expired, resumed, resumeFailed, ...counts },
         "decision expiry sweep left continuations pending",
