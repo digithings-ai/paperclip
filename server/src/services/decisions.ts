@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { and, asc, count, desc, eq, gt, gte, inArray, lte, notInArray, or, sql } from "drizzle-orm";
+import { and, asc, count, desc, eq, gt, gte, inArray, lte, notInArray, or, sql, type SQLWrapper } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agents, companyMemberships, decisionBundles, decisionEffectExecutions, decisionRetention, decisions, decisionTargetIssues, heartbeatRuns, issueRelations, issues } from "@paperclipai/db";
 import { ATTENTION_SOURCE_KINDS, decisionEffectTargetIssueIds } from "@paperclipai/shared";
@@ -67,8 +67,23 @@ export function createSweepLogThrottle(options: { intervalMs: number; maxEntries
 }
 
 // Keyset cursor for the sweep's (updated_at, id)-ordered queries. updatedAt is
-// the Postgres text form of the timestamp, so microseconds round-trip exactly.
+// a fixed UTC ISO-8601 string with microseconds (for example
+// 2026-11-03T14:00:00.123456Z), so it round-trips exactly and does not depend
+// on the session's DateStyle or TimeZone.
 type SweepCursor = { updatedAt: string; id: string } | null;
+
+/** Encode a timestamptz column as the sweep cursor's UTC ISO-8601 string. */
+export function encodeSweepCursorTimestamp(column: SQLWrapper) {
+  return sql<string>`to_char(${column} AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')`;
+}
+
+/**
+ * Decode a sweep cursor string back to timestamptz. ISO-8601 input with an
+ * explicit Z is parsed the same way under every DateStyle and TimeZone.
+ */
+export function decodeSweepCursorTimestamp(value: string) {
+  return sql`${value}::timestamptz`;
+}
 
 function targetIds(options: DecisionOption[]) {
   const result = new Set<string>();
@@ -695,11 +710,15 @@ export function decisionService(db: Db, options: DecisionServiceOptions) {
     counts: ContinuationSweepCounts;
     // One invokability lookup per origin agent per sweep.
     invokability: Map<string, Promise<AgentInvokability>>;
-    // Whether a throttled skip or effect-recovery line was logged this sweep.
+    // Whether a throttled skip, delivery or effect-recovery line was logged this sweep.
     throttledLineLogged: boolean;
   };
 
   const parkedContinuationLog = createSweepLogThrottle({
+    intervalMs: SWEEP_LOG_INTERVAL_MS,
+    maxEntries: SWEEP_LOG_THROTTLE_MAX_ENTRIES,
+  });
+  const continuationDeliveryFailureLog = createSweepLogThrottle({
     intervalMs: SWEEP_LOG_INTERVAL_MS,
     maxEntries: SWEEP_LOG_THROTTLE_MAX_ENTRIES,
   });
@@ -723,7 +742,7 @@ export function decisionService(db: Db, options: DecisionServiceOptions) {
 
   function afterSweepCursor(cursor: SweepCursor) {
     return cursor
-      ? [sql`(${decisions.updatedAt}, ${decisions.id}) > (${cursor.updatedAt}::timestamptz, ${cursor.id}::uuid)`]
+      ? [sql`(${decisions.updatedAt}, ${decisions.id}) > (${decodeSweepCursorTimestamp(cursor.updatedAt)}, ${cursor.id}::uuid)`]
       : [];
   }
 
@@ -757,7 +776,8 @@ export function decisionService(db: Db, options: DecisionServiceOptions) {
   //
   // The origin agent's invokability is checked before the wake, so a parked
   // continuation never reaches enqueueWakeup and writes no wakeup-request row.
-  // The skip is logged at most once per decision per hour.
+  // The skip and a non-409 delivery failure are each logged at most once per
+  // decision per hour.
   async function deliverSweepContinuation(
     decision: typeof decisions.$inferSelect,
     outcome: "decided" | "expired" | "cancelled",
@@ -783,6 +803,7 @@ export function decisionService(db: Db, options: DecisionServiceOptions) {
       await deliverContinuation(decision, outcome);
       counts.continuationsDelivered += 1;
       parkedContinuationLog.forget(decision.id);
+      continuationDeliveryFailureLog.forget(decision.id);
     } catch (err) {
       if (isAgentNotInvokableConflict(err)) {
         // The agent became non-invokable between the check and the wake.
@@ -792,6 +813,8 @@ export function decisionService(db: Db, options: DecisionServiceOptions) {
         return;
       }
       counts.continuationsFailed += 1;
+      if (!continuationDeliveryFailureLog.shouldLog(decision.id)) return;
+      ctx.throttledLineLogged = true;
       logger.error(
         { ...logContext, err },
         "decision continuation delivery failed - continuation stays pending",
@@ -897,7 +920,7 @@ export function decisionService(db: Db, options: DecisionServiceOptions) {
     const recoveryGraceMs = Number.isFinite(configuredRecoveryGraceMs) && configuredRecoveryGraceMs >= 0
       ? configuredRecoveryGraceMs
       : 60_000;
-    const cursorUpdatedAt = sql<string>`${decisions.updatedAt}::text`;
+    const cursorUpdatedAt = encodeSweepCursorTimestamp(decisions.updatedAt);
     // A running row whose runEffects keeps failing keeps its old updated_at, so
     // this query pages with a cursor too.
     const runningPage = await db.select({ decision: decisions, cursorUpdatedAt }).from(decisions)
@@ -989,9 +1012,9 @@ export function decisionService(db: Db, options: DecisionServiceOptions) {
       if (!updated) continue; expired += 1;
       await logActivity(db, { companyId: updated.companyId, actorType: "system", actorId: "decision-expiry-sweeper", agentId: updated.originAgentId, runId: updated.originRunId, action: "decision.expired", entityType: "decision", entityId: updated.id, details: { expiredReason: reason } });
       await deliverSweepContinuation(updated, "expired", ctx); }
-    // Skips and effect-recovery failures only warn when a (throttled) line was
-    // logged this sweep, so a stuck decision does not add a WARN on every tick.
-    if (counts.continuationsFailed > 0 || ctx.throttledLineLogged) {
+    // Skips and failures only warn when a (throttled) line was logged this
+    // sweep, so a stuck decision does not add a WARN on every tick.
+    if (ctx.throttledLineLogged) {
       logger.warn(
         { expired, resumed, resumeFailed, ...counts },
         "decision expiry sweep left continuations pending",
