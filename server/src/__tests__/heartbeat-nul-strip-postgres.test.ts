@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import type { RunPresentationDecision } from "@paperclipai/shared";
 import {
   agents,
   companies,
@@ -8,6 +9,8 @@ import {
   heartbeatRuns,
 } from "@paperclipai/db";
 import {
+  buildLateFinalizationPatch,
+  buildPresentationResultJson,
   stripNulDeep,
   stripNulFromHeartbeatPatch,
 } from "../services/heartbeat.js";
@@ -110,7 +113,139 @@ describeEmbeddedPostgres("heartbeat NUL strip before finalization update (postgr
     expect(rows[0]?.stdoutExcerpt).toBe("out");
     expect(rows[0]?.stderrExcerpt).toBe("err");
     expect(rows[0]?.usageJson).toMatchObject({ note: "ab" });
-    expect(JSON.stringify(rows[0]?.usageJson)).not.toContain("\u0000");
-    expect(JSON.stringify(rows[0]?.resultJson)).not.toContain("\u0000");
+    expect(JSON.stringify(rows[0]?.usageJson)).not.toContain("\\u0000");
+    expect(JSON.stringify(rows[0]?.resultJson)).not.toContain("\\u0000");
+  });
+
+  // DIG-4392: after setRunStatusIfRunning loses the compare-and-set to the
+  // reconciler, the late metadata write re-binds the adapter-derived patch.
+  it("late finalization write strips NUL after the compare-and-set loses", async () => {
+    const { runId } = await seedRunningRun();
+    // The reconciler already committed the same terminal status.
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "succeeded", finishedAt: new Date() })
+      .where(eq(heartbeatRuns.id, runId));
+    const persistedRun = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0]!);
+
+    const finalRunPatch: Partial<typeof heartbeatRuns.$inferInsert> = {
+      finishedAt: new Date(),
+      error: "late\u0000error",
+      stdoutExcerpt: "out\u0000late",
+      stderrExcerpt: "err\u0000late",
+      usageJson: { input: 1, note: "a\u0000b" },
+      resultJson: { summary: "done\u0000", nested: { text: "x\u0000y" } },
+    };
+
+    // Guard-bite control: the pre-fix write re-binds the raw patch unsanitized
+    // and Postgres refuses it.
+    await expect(
+      db
+        .update(heartbeatRuns)
+        .set({ ...finalRunPatch, updatedAt: new Date() })
+        .where(
+          and(
+            eq(heartbeatRuns.id, runId),
+            eq(heartbeatRuns.status, "succeeded"),
+          ),
+        ),
+    ).rejects.toThrow();
+
+    const patch = buildLateFinalizationPatch({
+      finalRunPatch,
+      persistedRun,
+      status: "succeeded",
+      runErrorCode: null,
+      runErrorMessage: "late\u0000error",
+    });
+    const rows = await db
+      .update(heartbeatRuns)
+      .set(patch)
+      .where(
+        and(
+          eq(heartbeatRuns.id, runId),
+          eq(heartbeatRuns.status, "succeeded"),
+        ),
+      )
+      .returning();
+
+    expect(rows[0]?.status).toBe("succeeded");
+    expect(rows[0]?.error).toBe("lateerror");
+    expect(rows[0]?.stdoutExcerpt).toBe("outlate");
+    expect(rows[0]?.stderrExcerpt).toBe("errlate");
+    expect(JSON.stringify(rows[0]?.usageJson)).not.toContain("\\u0000");
+    expect(JSON.stringify(rows[0]?.resultJson)).not.toContain("\\u0000");
+    expect(rows[0]?.resultJson).toMatchObject({
+      summary: "done",
+      nested: { text: "xy" },
+    });
+    // The shared finalRunPatch must not be mutated in place.
+    expect((finalRunPatch.resultJson as Record<string, unknown>).summary).toBe("done\u0000");
+    expect(
+      ((finalRunPatch.resultJson as Record<string, unknown>).nested as Record<string, unknown>).text,
+    ).toBe("x\u0000y");
+  });
+
+  // DIG-4392: the presentation write re-binds the adapter resultJson, which
+  // still carries raw NUL text.
+  it("presentation write strips NUL without mutating the adapter resultJson", async () => {
+    const { runId } = await seedRunningRun();
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "succeeded", finishedAt: new Date() })
+      .where(eq(heartbeatRuns.id, runId));
+
+    const persistedResultJson: Record<string, unknown> = {
+      summary: "adapter\u0000summary",
+      nested: { note: "n\u0000" },
+    };
+    const presentationDecision: RunPresentationDecision = {
+      schema: "paperclip.run_presentation_decision.v1",
+      resolverVersion: "v1",
+      chosenSource: "semantic_result_summary",
+      sourceEventId: null,
+      commentAction: "none",
+      commentId: null,
+      activityDisposition: "collapse",
+      reasonCodes: ["no_issue"],
+    };
+
+    // Guard-bite control: the pre-fix write re-binds the raw adapter result and
+    // Postgres refuses it.
+    await expect(
+      db
+        .update(heartbeatRuns)
+        .set({
+          resultJson: { ...persistedResultJson, presentationDecision },
+          updatedAt: new Date(),
+        })
+        .where(eq(heartbeatRuns.id, runId)),
+    ).rejects.toThrow();
+
+    const rows = await db
+      .update(heartbeatRuns)
+      .set({
+        resultJson: buildPresentationResultJson(
+          persistedResultJson,
+          presentationDecision,
+        ),
+        updatedAt: new Date(),
+      })
+      .where(eq(heartbeatRuns.id, runId))
+      .returning();
+
+    expect(JSON.stringify(rows[0]?.resultJson)).not.toContain("\\u0000");
+    expect(rows[0]?.resultJson).toMatchObject({
+      summary: "adaptersummary",
+      nested: { note: "n" },
+      presentationDecision,
+    });
+    // The adapter result is reused after this write and must stay untouched.
+    expect(persistedResultJson.summary).toBe("adapter\u0000summary");
+    expect((persistedResultJson.nested as Record<string, unknown>).note).toBe("n\u0000");
   });
 });
