@@ -195,3 +195,30 @@ export async function runStartupRecoverableSteps(input: {
   }
   return outcomes;
 }
+
+export type StartupDecisionSweeper = {
+  sweepExpired: () => Promise<unknown>;
+};
+
+/**
+ * Runs the decision expiry sweep once at startup. The sweep isolates each
+ * continuation itself (a non-invokable origin agent is logged and left
+ * pending), so this catch is only a backstop: any error that still escapes is
+ * logged and startup continues. The scheduler tick runs the same sweep later.
+ * Returns true when the sweep completed.
+ */
+export async function runStartupDecisionSweep(input: {
+  decisions: StartupDecisionSweeper;
+  logger: StartupRecoveryLogger;
+}): Promise<boolean> {
+  try {
+    await input.decisions.sweepExpired();
+    return true;
+  } catch (err) {
+    input.logger.error(
+      { err },
+      "startup decision expiry sweep failed - continuing startup; the scheduler tick retries it",
+    );
+    return false;
+  }
+}

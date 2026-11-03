@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { conflict } from "../errors.ts";
 import {
+  runStartupDecisionSweep,
   runStartupNativeRecoveryFailClosed,
   runStartupRecoverableSteps,
   type StartupRecoveryHeartbeat,
@@ -138,5 +139,30 @@ describe("runStartupNativeRecoveryFailClosed", () => {
       expect.objectContaining({ claims: [{ runId: "run-1", disposition: "resume", controllerGeneration: 2 }] }),
       "startup native runner restart recovery classified",
     );
+  });
+});
+
+describe("runStartupDecisionSweep", () => {
+  it("logs and resolves when the decision sweep throws a not-invokable 409", async () => {
+    const logger = createLogger();
+    const err = conflict("Agent is not invokable", { reason: "paused" });
+    const decisions = { sweepExpired: vi.fn(async () => { throw err; }) };
+
+    await expect(runStartupDecisionSweep({ decisions, logger })).resolves.toBe(false);
+
+    expect(decisions.sweepExpired).toHaveBeenCalledTimes(1);
+    expect(logger.error).toHaveBeenCalledWith(
+      { err },
+      "startup decision expiry sweep failed - continuing startup; the scheduler tick retries it",
+    );
+  });
+
+  it("resolves true and logs nothing when the sweep completes", async () => {
+    const logger = createLogger();
+    const decisions = { sweepExpired: vi.fn(async () => ({ expired: 0, resumed: 0 })) };
+
+    await expect(runStartupDecisionSweep({ decisions, logger })).resolves.toBe(true);
+
+    expect(logger.error).not.toHaveBeenCalled();
   });
 });

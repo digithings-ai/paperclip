@@ -50,6 +50,7 @@ import { loadConfig } from "./config.js";
 import { logger } from "./middleware/logger.js";
 import {
   runStartupNativeRecoveryFailClosed,
+  runStartupDecisionSweep,
   runStartupRecoverableSteps,
 } from "./startup-heartbeat-recovery.js";
 import { setStartupRecoveryPhase } from "./startup-recovery-state.js";
@@ -1529,7 +1530,9 @@ async function startServerWithDatabaseTeardown(
     if (toolHealthSweep.failed > 0) {
       logger.warn({ ...toolHealthSweep }, "startup tool connection health sweep found failing connections");
     }
-    await decisionExecutor.sweepExpired();
+    // Backstop: a decision continuation for a paused origin agent must not
+    // exit startup. The sweep isolates each delivery; this catches the rest.
+    await runStartupDecisionSweep({ decisions: decisionExecutor, logger });
 
     // Run the adapter login reaper once at startup, so a login sandbox that
     // outlived a server restart is deleted before timer ticks start.
