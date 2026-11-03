@@ -2867,6 +2867,173 @@ export async function inspectManagedGitWorktreeBranch(input: {
   };
 }
 
+// A review issue names the pull-request head as `at <sha>` in its title or body.
+// Seven or more hex characters, and the match must not be the front of a longer
+// hex token. The sha is a prefix of the detached HEAD, never a new branch name.
+const REVIEW_HEAD_SHA_PATTERN = /(?:^|\s)at\s+([0-9a-f]{7,40})(?![0-9a-f])/gi;
+
+export function namedReviewHeadPrefixes(
+  title: string | null | undefined,
+  description: string | null | undefined,
+): string[] {
+  const text = `${title ?? ""}\n${description ?? ""}`;
+  const prefixes: string[] = [];
+  for (const match of text.matchAll(REVIEW_HEAD_SHA_PATTERN)) {
+    const prefix = match[1]?.toLowerCase();
+    if (prefix && !prefixes.includes(prefix)) prefixes.push(prefix);
+  }
+  return prefixes;
+}
+
+function fullShaMatchesNamedPrefix(fullSha: string, prefixes: readonly string[]): boolean {
+  const sha = fullSha.toLowerCase();
+  if (!/^[0-9a-f]{40}$/.test(sha)) return false;
+  return prefixes.some((prefix) => sha.startsWith(prefix));
+}
+
+async function recordedBranchCheckedOutInAnotherWorktree(
+  repoRoot: string,
+  worktreePath: string,
+  branchName: string,
+): Promise<boolean> {
+  const output = await runGit(["worktree", "list", "--porcelain"], repoRoot).catch(() => null);
+  if (output === null) return true;
+  const here = await resolvePathForWorktreeComparison(worktreePath);
+  const expectedRef = `refs/heads/${branchName}`;
+  for (const record of parseGitWorktreeListPorcelain(output)) {
+    if (record.branch !== expectedRef) continue;
+    const resolved = await resolvePathForWorktreeComparison(record.worktree);
+    if (resolved !== here) return true;
+  }
+  return false;
+}
+
+async function detachedShaReachableFromRemoteRef(repoRoot: string, fullSha: string): Promise<boolean> {
+  const listed = await runGit(
+    ["for-each-ref", "--contains", fullSha, "--format=%(refname)", "refs/remotes"],
+    repoRoot,
+  ).catch(() => null);
+  if (!listed) return false;
+  return listed.split("\n").some((line) => line.startsWith("refs/remotes/"));
+}
+
+export type SanctionedDetachedReviewRestore =
+  | { restored: false; blocked?: "dirty_detached_review" }
+  | {
+      restored: true;
+      expectedBranchName: string;
+      detachedHeadSha: string;
+      branchTipSha: string;
+    };
+
+// A clean detached HEAD is a sanctioned review read only when the run's own
+// issue names that sha, the recorded branch exists and is free, and the sha is
+// already on a remote ref. The restore checks out the recorded branch. It does
+// not move the branch ref, delete a commit, force, or rewrite branchName.
+export async function restoreSanctionedDetachedReviewHead(input: {
+  repoRoot: string;
+  worktreePath: string;
+  expectedBranchName: string;
+  issueTitle: string | null;
+  issueDescription: string | null;
+  executionWorkspaceId?: string | null;
+  sourceIssueId?: string | null;
+  recorder?: WorkspaceOperationRecorder | null;
+}): Promise<SanctionedDetachedReviewRestore> {
+  const expectedBranchName = input.expectedBranchName.trim();
+  if (!expectedBranchName || expectedBranchName.startsWith("-")) return { restored: false };
+
+  const currentBranch = await runGit(
+    ["symbolic-ref", "--quiet", "--short", "HEAD"],
+    input.worktreePath,
+  ).catch(() => null);
+  if (currentBranch) return { restored: false };
+
+  const detachedHeadSha = await runGit(["rev-parse", "HEAD"], input.worktreePath).catch(() => null);
+  const namedDetachedHead = Boolean(
+    detachedHeadSha &&
+    fullShaMatchesNamedPrefix(
+      detachedHeadSha,
+      namedReviewHeadPrefixes(input.issueTitle, input.issueDescription),
+    ),
+  );
+  const status = await runGit(
+    ["status", "--porcelain", "--untracked-files=all"],
+    input.worktreePath,
+  ).catch(() => null);
+  // A named review sha on a dirty tree is not a sanctioned read, and it must
+  // not fall through to dirty-quarantine repair. That repair would move the
+  // seat's uncommitted work off the detached HEAD.
+  if (status === null || status.length > 0) {
+    if (status && status.length > 0 && namedDetachedHead) {
+      return { restored: false, blocked: "dirty_detached_review" };
+    }
+    return { restored: false };
+  }
+  if (!detachedHeadSha || !namedDetachedHead) return { restored: false };
+  if (!await localBranchExists(input.repoRoot, expectedBranchName)) return { restored: false };
+  if (await recordedBranchCheckedOutInAnotherWorktree(
+    input.repoRoot,
+    input.worktreePath,
+    expectedBranchName,
+  )) {
+    return { restored: false };
+  }
+  if (!await detachedShaReachableFromRemoteRef(input.repoRoot, detachedHeadSha)) {
+    return { restored: false };
+  }
+
+  const branchTipSha = await runGit(
+    ["rev-parse", "--verify", `refs/heads/${expectedBranchName}^{commit}`],
+    input.repoRoot,
+  ).catch(() => null);
+  if (!branchTipSha) return { restored: false };
+
+  await recordGitOperation(input.recorder, {
+    phase: "workspace_finalize",
+    args: ["checkout", expectedBranchName],
+    cwd: input.worktreePath,
+    metadata: {
+      reason: "detached_review_head",
+      repoRoot: input.repoRoot,
+      worktreePath: input.worktreePath,
+      expectedBranchName,
+      detachedHeadSha,
+      branchTipSha,
+      executionWorkspaceId: input.executionWorkspaceId ?? null,
+      sourceIssueId: input.sourceIssueId ?? null,
+    },
+    successMessage: `Checked out recorded branch ${expectedBranchName} after a sanctioned detached review read at ${detachedHeadSha}\n`,
+    failureLabel: `git checkout ${expectedBranchName}`,
+  });
+
+  const tipAfter = await runGit(
+    ["rev-parse", "--verify", `refs/heads/${expectedBranchName}^{commit}`],
+    input.repoRoot,
+  ).catch(() => null);
+  if (tipAfter !== branchTipSha) {
+    throw new Error(
+      `Refusing detached review reattach because recorded branch ${expectedBranchName} moved`,
+    );
+  }
+  const repairedBranch = await runGit(
+    ["symbolic-ref", "--quiet", "--short", "HEAD"],
+    input.worktreePath,
+  ).catch(() => null);
+  if (repairedBranch !== expectedBranchName) {
+    throw new Error(
+      `Detached review reattach left HEAD on ${repairedBranch ?? "<detached>"}`,
+    );
+  }
+
+  return {
+    restored: true,
+    expectedBranchName,
+    detachedHeadSha,
+    branchTipSha,
+  };
+}
+
 async function validateLinkedGitWorktree(input: {
   repoRoot: string;
   worktreePath: string;

@@ -145,7 +145,54 @@ function readAdapterWorkspace(input: unknown) {
   return { cwd, branchName, executionWorkspaceId };
 }
 
-async function seedRunTarget(db: Db, repoRoot: string) {
+async function gitStdout(cwd: string, args: string[]) {
+  const { stdout } = await execFileAsync("git", args, { cwd });
+  return stdout.trim();
+}
+
+async function prepareDivergedReviewHead(repoRoot: string, options?: { publishRemote?: boolean }) {
+  const baseBranch = await gitStdout(repoRoot, ["branch", "--show-current"]);
+  const initial = await gitStdout(repoRoot, ["rev-parse", "HEAD"]);
+  await writeFile(path.join(repoRoot, "branch-tip.txt"), "recorded tip\n", "utf8");
+  await runGit(repoRoot, ["add", "branch-tip.txt"]);
+  await runGit(repoRoot, ["commit", "-m", "recorded branch tip"]);
+  const recordedTip = await gitStdout(repoRoot, ["rev-parse", "HEAD"]);
+
+  await runGit(repoRoot, ["checkout", "--detach", initial]);
+  await writeFile(path.join(repoRoot, "reviewed.txt"), "reviewed head\n", "utf8");
+  await runGit(repoRoot, ["add", "reviewed.txt"]);
+  await runGit(repoRoot, ["commit", "-m", "reviewed pull request head"]);
+  const reviewedSha = await gitStdout(repoRoot, ["rev-parse", "HEAD"]);
+  await runGit(repoRoot, ["checkout", baseBranch]);
+
+  let origin: string | null = null;
+  if (options?.publishRemote !== false) {
+    origin = await mkdtemp(path.join(os.tmpdir(), "paperclip-finalize-origin-"));
+    await runGit(origin, ["init", "--bare"]);
+    await runGit(repoRoot, ["remote", "add", "origin", origin]);
+    await runGit(repoRoot, ["push", "origin", `${reviewedSha}:refs/heads/reviewed-pr`]);
+  }
+
+  const recordedPrefix = recordedTip.slice(0, 8);
+  const wrongPrefix = reviewedSha.startsWith(recordedPrefix) ? "deadbeef1" : recordedPrefix;
+  return {
+    reviewedSha,
+    reviewedPrefix: reviewedSha.slice(0, 8),
+    recordedTip,
+    wrongPrefix,
+    origin,
+  };
+}
+
+function reviewTitle(prefix: string) {
+  return `Review: example#1 at ${prefix}`;
+}
+
+async function seedRunTarget(
+  db: Db,
+  repoRoot: string,
+  overrides?: { title?: string; description?: string | null },
+) {
   const companyId = randomUUID();
   const projectId = randomUUID();
   const projectWorkspaceId = randomUUID();
@@ -205,7 +252,8 @@ async function seedRunTarget(db: Db, repoRoot: string) {
     companyId,
     projectId,
     projectWorkspaceId,
-    title: "Publish without drifting managed workspace",
+    title: overrides?.title ?? "Publish without drifting managed workspace",
+    description: overrides?.description ?? null,
     status: "in_progress",
     workMode: "standard",
     priority: "medium",
@@ -534,4 +582,390 @@ describeEmbeddedPostgres("heartbeat workspace finalization branch guard", () => 
       },
     });
   }, 20_000);
+
+  it("finalizes a run when the managed worktree path is already gone", async () => {
+    const repoRoot = await createGitRepo();
+    tempRoots.push(repoRoot);
+    const { agentId, issueId } = await seedRunTarget(db, repoRoot);
+    let executionWorkspaceId: string | null = null;
+    let workspaceCwd: string | null = null;
+
+    adapterExecute.mockImplementationOnce(async (input) => {
+      const workspace = readAdapterWorkspace(input);
+      executionWorkspaceId = workspace.executionWorkspaceId;
+      workspaceCwd = workspace.cwd;
+      await rm(workspace.cwd, { recursive: true, force: true });
+      await db.update(issues).set({ status: "done", updatedAt: new Date() }).where(eq(issues.id, issueId));
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        summary: "Adapter completed after the worktree directory was removed.",
+        provider: "test",
+        model: "test-model",
+      };
+    });
+
+    const heartbeat = heartbeatService(db);
+    const run = await wakeIssue(heartbeat, agentId, issueId);
+    expect(run).not.toBeNull();
+
+    const finishedRun = await waitForRunToFinish(heartbeat, run!.id);
+    expect(finishedRun).toMatchObject({
+      status: "succeeded",
+      errorCode: null,
+      error: null,
+    });
+    expect(finishedRun?.error ?? "").not.toContain("does not exist");
+    await waitForRuntimeStateLastRun(db, agentId, run!.id);
+    expect(adapterExecute).toHaveBeenCalledTimes(1);
+    await expect(rm(workspaceCwd!, { recursive: true, force: true })).resolves.toBeUndefined();
+
+    const finalizeOps = await listFinalizeOperations(db, run!.id);
+    expect(finalizeOps).toHaveLength(1);
+    expect(finalizeOps[0]).toMatchObject({
+      status: "succeeded",
+      executionWorkspaceId,
+    });
+    expect(finalizeOps[0]?.metadata).toMatchObject({
+      managedGitWorktreeBranch: expect.objectContaining({
+        executionWorkspaceId,
+        valid: false,
+        reasonCode: "missing_worktree",
+      }),
+      deadWorktree: {
+        reasonCode: "missing_worktree",
+        archiveRoute: `PATCH /api/execution-workspaces/${executionWorkspaceId}`,
+        archiveBody: { status: "archived" },
+      },
+    });
+    expect(JSON.stringify(finalizeOps[0]?.metadata)).not.toContain("reconcile-branch");
+  }, 20_000);
+
+  async function detachAtReviewHead(cwd: string, reviewedSha: string, branchName: string) {
+    const tipBefore = await gitStdout(cwd, ["rev-parse", `refs/heads/${branchName}`]);
+    await runGit(cwd, ["checkout", "--detach", reviewedSha]);
+    return tipBefore;
+  }
+
+  function assertNoForcedCheckout(
+    operations: Array<{ command: string | null }>,
+    recordedBranch: string,
+  ) {
+    const commands = operations.map((operation) => operation.command ?? "").join("\n");
+    expect(commands).not.toContain(`git checkout ${recordedBranch}`);
+    expect(commands).not.toMatch(/checkout -B|checkout -f|branch -D|--force/);
+  }
+
+  it("reattaches a clean detached review read at the named sha and leaves the branch tip", async () => {
+    const repoRoot = await createGitRepo();
+    tempRoots.push(repoRoot);
+    const review = await prepareDivergedReviewHead(repoRoot);
+    if (review.origin) tempRoots.push(review.origin);
+    const { agentId, issueId } = await seedRunTarget(db, repoRoot, {
+      title: reviewTitle(review.reviewedPrefix),
+    });
+    let recordedBranch: string | null = null;
+    let executionWorkspaceId: string | null = null;
+    let workspaceCwd: string | null = null;
+    let tipBefore: string | null = null;
+
+    adapterExecute.mockImplementationOnce(async (input) => {
+      const workspace = readAdapterWorkspace(input);
+      recordedBranch = workspace.branchName;
+      executionWorkspaceId = workspace.executionWorkspaceId;
+      workspaceCwd = workspace.cwd;
+      tipBefore = await detachAtReviewHead(workspace.cwd, review.reviewedSha, workspace.branchName);
+      await db.update(issues).set({ status: "done", updatedAt: new Date() }).where(eq(issues.id, issueId));
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        summary: "Adapter completed after a detached review read.",
+        provider: "test",
+        model: "test-model",
+      };
+    });
+
+    const heartbeat = heartbeatService(db);
+    const run = await wakeIssue(heartbeat, agentId, issueId);
+    expect(run).not.toBeNull();
+    const finishedRun = await waitForRunToFinish(heartbeat, run!.id);
+    expect(finishedRun).toMatchObject({ status: "succeeded", errorCode: null, error: null });
+    await waitForRuntimeStateLastRun(db, agentId, run!.id);
+    expect(tipBefore).not.toBe(review.reviewedSha);
+    expect(await gitStdout(workspaceCwd!, ["branch", "--show-current"])).toBe(recordedBranch);
+    expect(await gitStdout(repoRoot, ["rev-parse", `refs/heads/${recordedBranch}`])).toBe(tipBefore);
+
+    const workspaceRow = await db
+      .select({ branchName: executionWorkspaces.branchName })
+      .from(executionWorkspaces)
+      .where(eq(executionWorkspaces.id, executionWorkspaceId!))
+      .then((rows) => rows[0] ?? null);
+    expect(workspaceRow?.branchName).toBe(recordedBranch);
+
+    const operations = await listRunWorkspaceOperations(db, run!.id);
+    expect(operations).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        command: `git checkout ${recordedBranch}`,
+        status: "succeeded",
+        metadata: expect.objectContaining({
+          reason: "detached_review_head",
+          detachedHeadSha: review.reviewedSha,
+          branchTipSha: tipBefore,
+        }),
+      }),
+    ]));
+    const commands = operations.map((operation) => operation.command ?? "").join("\n");
+    expect(commands).not.toMatch(/checkout -B|checkout -f|branch -D|--force/);
+
+    const finalizeOps = await listFinalizeOperations(db, run!.id);
+    expect(finalizeOps.map((operation) => operation.metadata)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          managedGitWorktreeBranchRepair: expect.objectContaining({
+            attempted: true,
+            succeeded: true,
+            reason: "detached_review_head",
+          }),
+        }),
+      ]),
+    );
+
+    await db.update(issues).set({ status: "in_progress", updatedAt: new Date() }).where(eq(issues.id, issueId));
+    let secondBranch: string | null = null;
+    adapterExecute.mockImplementationOnce(async (input) => {
+      const workspace = readAdapterWorkspace(input);
+      expect(workspace.cwd).toBe(workspaceCwd);
+      secondBranch = await gitStdout(workspace.cwd, ["branch", "--show-current"]);
+      await db.update(issues).set({ status: "done", updatedAt: new Date() }).where(eq(issues.id, issueId));
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        summary: "Second run starts on the recorded branch.",
+        provider: "test",
+        model: "test-model",
+      };
+    });
+    const secondRun = await wakeIssue(heartbeat, agentId, issueId);
+    expect(secondRun).not.toBeNull();
+    const finishedSecond = await waitForRunToFinish(heartbeat, secondRun!.id);
+    expect(finishedSecond).toMatchObject({ status: "succeeded", errorCode: null, error: null });
+    expect(secondBranch).toBe(recordedBranch);
+    expect(await gitStdout(repoRoot, ["rev-parse", `refs/heads/${recordedBranch}`])).toBe(tipBefore);
+    const secondFinalize = await listFinalizeOperations(db, secondRun!.id);
+    expect(JSON.stringify(secondFinalize)).not.toContain("detached_review_head");
+    expect(secondFinalize.map((operation) => operation.metadata)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          managedGitWorktreeBranch: expect.objectContaining({
+            valid: true,
+            expectedBranchName: recordedBranch,
+            actualBranchName: recordedBranch,
+          }),
+        }),
+      ]),
+    );
+  }, 40_000);
+
+  it("reattaches a clean detached review read named only in the issue body", async () => {
+    const repoRoot = await createGitRepo();
+    tempRoots.push(repoRoot);
+    const review = await prepareDivergedReviewHead(repoRoot);
+    if (review.origin) tempRoots.push(review.origin);
+    const { agentId, issueId } = await seedRunTarget(db, repoRoot, {
+      description: `Read the pull request at ${review.reviewedPrefix} before signing off.`,
+    });
+    let recordedBranch: string | null = null;
+    let workspaceCwd: string | null = null;
+    let tipBefore: string | null = null;
+
+    adapterExecute.mockImplementationOnce(async (input) => {
+      const workspace = readAdapterWorkspace(input);
+      recordedBranch = workspace.branchName;
+      workspaceCwd = workspace.cwd;
+      tipBefore = await detachAtReviewHead(workspace.cwd, review.reviewedSha, workspace.branchName);
+      await db.update(issues).set({ status: "done", updatedAt: new Date() }).where(eq(issues.id, issueId));
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        summary: "Adapter completed after a detached review read named in the body.",
+        provider: "test",
+        model: "test-model",
+      };
+    });
+
+    const heartbeat = heartbeatService(db);
+    const run = await wakeIssue(heartbeat, agentId, issueId);
+    const finishedRun = await waitForRunToFinish(heartbeat, run!.id);
+    expect(finishedRun).toMatchObject({ status: "succeeded", errorCode: null, error: null });
+    expect(await gitStdout(workspaceCwd!, ["branch", "--show-current"])).toBe(recordedBranch);
+    expect(await gitStdout(repoRoot, ["rev-parse", `refs/heads/${recordedBranch}`])).toBe(tipBefore);
+    const operations = await listRunWorkspaceOperations(db, run!.id);
+    expect(operations).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        command: `git checkout ${recordedBranch}`,
+        metadata: expect.objectContaining({ reason: "detached_review_head" }),
+      }),
+    ]));
+  }, 30_000);
+
+  it("fails a detached read when the issue does not name that sha", async () => {
+    const repoRoot = await createGitRepo();
+    tempRoots.push(repoRoot);
+    const review = await prepareDivergedReviewHead(repoRoot);
+    if (review.origin) tempRoots.push(review.origin);
+    const { agentId, issueId } = await seedRunTarget(db, repoRoot, {
+      title: reviewTitle(review.wrongPrefix),
+    });
+    let recordedBranch: string | null = null;
+    let workspaceCwd: string | null = null;
+    let tipBefore: string | null = null;
+
+    adapterExecute.mockImplementationOnce(async (input) => {
+      const workspace = readAdapterWorkspace(input);
+      recordedBranch = workspace.branchName;
+      workspaceCwd = workspace.cwd;
+      tipBefore = await detachAtReviewHead(workspace.cwd, review.reviewedSha, workspace.branchName);
+      await db.update(issues).set({ status: "done", updatedAt: new Date() }).where(eq(issues.id, issueId));
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        summary: "Adapter completed on an unnamed detached sha.",
+        provider: "test",
+        model: "test-model",
+      };
+    });
+
+    const heartbeat = heartbeatService(db);
+    const run = await wakeIssue(heartbeat, agentId, issueId);
+    const finishedRun = await waitForRunToFinish(heartbeat, run!.id);
+    expect(finishedRun?.status).toBe("failed");
+    expect(finishedRun?.error ?? "").toContain('found "<detached>"');
+    expect(await gitStdout(workspaceCwd!, ["rev-parse", "HEAD"])).toBe(review.reviewedSha);
+    expect(await gitStdout(repoRoot, ["rev-parse", `refs/heads/${recordedBranch}`])).toBe(tipBefore);
+    assertNoForcedCheckout(await listRunWorkspaceOperations(db, run!.id), recordedBranch!);
+  }, 30_000);
+
+  it("fails a detached read at the named sha when the tree is dirty", async () => {
+    const repoRoot = await createGitRepo();
+    tempRoots.push(repoRoot);
+    const review = await prepareDivergedReviewHead(repoRoot);
+    if (review.origin) tempRoots.push(review.origin);
+    const { agentId, issueId } = await seedRunTarget(db, repoRoot, {
+      title: reviewTitle(review.reviewedPrefix),
+    });
+    let recordedBranch: string | null = null;
+    let workspaceCwd: string | null = null;
+    let tipBefore: string | null = null;
+
+    adapterExecute.mockImplementationOnce(async (input) => {
+      const workspace = readAdapterWorkspace(input);
+      recordedBranch = workspace.branchName;
+      workspaceCwd = workspace.cwd;
+      tipBefore = await detachAtReviewHead(workspace.cwd, review.reviewedSha, workspace.branchName);
+      await writeFile(path.join(workspace.cwd, "reviewed.txt"), "seat work still in the tree\n", "utf8");
+      await db.update(issues).set({ status: "done", updatedAt: new Date() }).where(eq(issues.id, issueId));
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        summary: "Adapter completed with a dirty detached review tree.",
+        provider: "test",
+        model: "test-model",
+      };
+    });
+
+    const heartbeat = heartbeatService(db);
+    const run = await wakeIssue(heartbeat, agentId, issueId);
+    const finishedRun = await waitForRunToFinish(heartbeat, run!.id);
+    expect(finishedRun?.status).toBe("failed");
+    expect(finishedRun?.error ?? "").toContain('found "<detached>"');
+    expect(await gitStdout(workspaceCwd!, ["rev-parse", "HEAD"])).toBe(review.reviewedSha);
+    expect(await gitStdout(repoRoot, ["rev-parse", `refs/heads/${recordedBranch}`])).toBe(tipBefore);
+    assertNoForcedCheckout(await listRunWorkspaceOperations(db, run!.id), recordedBranch!);
+  }, 30_000);
+
+  it("fails a detached review read when the recorded branch is checked out elsewhere", async () => {
+    const repoRoot = await createGitRepo();
+    tempRoots.push(repoRoot);
+    const review = await prepareDivergedReviewHead(repoRoot);
+    if (review.origin) tempRoots.push(review.origin);
+    const { agentId, issueId } = await seedRunTarget(db, repoRoot, {
+      title: reviewTitle(review.reviewedPrefix),
+    });
+    let recordedBranch: string | null = null;
+    let workspaceCwd: string | null = null;
+    let tipBefore: string | null = null;
+    let otherWorktree: string | null = null;
+
+    adapterExecute.mockImplementationOnce(async (input) => {
+      const workspace = readAdapterWorkspace(input);
+      recordedBranch = workspace.branchName;
+      workspaceCwd = workspace.cwd;
+      tipBefore = await detachAtReviewHead(workspace.cwd, review.reviewedSha, workspace.branchName);
+      otherWorktree = await mkdtemp(path.join(os.tmpdir(), "paperclip-finalize-other-"));
+      tempRoots.push(otherWorktree);
+      await runGit(repoRoot, ["worktree", "add", otherWorktree, workspace.branchName]);
+      await db.update(issues).set({ status: "done", updatedAt: new Date() }).where(eq(issues.id, issueId));
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        summary: "Adapter completed while the recorded branch was checked out elsewhere.",
+        provider: "test",
+        model: "test-model",
+      };
+    });
+
+    const heartbeat = heartbeatService(db);
+    const run = await wakeIssue(heartbeat, agentId, issueId);
+    const finishedRun = await waitForRunToFinish(heartbeat, run!.id);
+    expect(finishedRun?.status).toBe("failed");
+    expect(finishedRun?.error ?? "").toContain('found "<detached>"');
+    expect(await gitStdout(workspaceCwd!, ["rev-parse", "HEAD"])).toBe(review.reviewedSha);
+    expect(await gitStdout(otherWorktree!, ["branch", "--show-current"])).toBe(recordedBranch);
+    expect(await gitStdout(repoRoot, ["rev-parse", `refs/heads/${recordedBranch}`])).toBe(tipBefore);
+    assertNoForcedCheckout(await listRunWorkspaceOperations(db, run!.id), recordedBranch!);
+  }, 30_000);
+
+  it("fails a detached review read when the named sha is not on a remote ref", async () => {
+    const repoRoot = await createGitRepo();
+    tempRoots.push(repoRoot);
+    const review = await prepareDivergedReviewHead(repoRoot, { publishRemote: false });
+    const { agentId, issueId } = await seedRunTarget(db, repoRoot, {
+      title: reviewTitle(review.reviewedPrefix),
+    });
+    let recordedBranch: string | null = null;
+    let workspaceCwd: string | null = null;
+    let tipBefore: string | null = null;
+
+    adapterExecute.mockImplementationOnce(async (input) => {
+      const workspace = readAdapterWorkspace(input);
+      recordedBranch = workspace.branchName;
+      workspaceCwd = workspace.cwd;
+      tipBefore = await detachAtReviewHead(workspace.cwd, review.reviewedSha, workspace.branchName);
+      await db.update(issues).set({ status: "done", updatedAt: new Date() }).where(eq(issues.id, issueId));
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        summary: "Adapter completed on a named sha that was never pushed.",
+        provider: "test",
+        model: "test-model",
+      };
+    });
+
+    const heartbeat = heartbeatService(db);
+    const run = await wakeIssue(heartbeat, agentId, issueId);
+    const finishedRun = await waitForRunToFinish(heartbeat, run!.id);
+    expect(finishedRun?.status).toBe("failed");
+    expect(finishedRun?.error ?? "").toContain('found "<detached>"');
+    expect(await gitStdout(workspaceCwd!, ["rev-parse", "HEAD"])).toBe(review.reviewedSha);
+    expect(await gitStdout(repoRoot, ["rev-parse", `refs/heads/${recordedBranch}`])).toBe(tipBefore);
+    assertNoForcedCheckout(await listRunWorkspaceOperations(db, run!.id), recordedBranch!);
+  }, 30_000);
 });

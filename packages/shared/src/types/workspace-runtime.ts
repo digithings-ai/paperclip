@@ -40,7 +40,8 @@ export type ExecutionWorkspaceDeliveryState =
   | "merged_via_pr"
   | "merged_by_ancestry"
   | "unmerged"
-  | "unknown";
+  | "unknown"
+  | "worktree_missing";
 
 export type ExecutionWorkspaceCloseReadinessState =
   | "ready"
