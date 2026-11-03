@@ -30,10 +30,20 @@ export const DEFAULT_STRANDED_RECOVERY_NOTICE_BODY =
 
 const DEFAULT_STRANDED_RECOVERY_NOTICE_TITLE = "Automatic recovery blocked";
 
+/**
+ * DIG-4075 (DIG-2152 design item 4): the notice title for a `routine_execution`
+ * issue whose automatic recovery has no competent owner. Exported because the
+ * escalation path dedupes this notice by its own first-class title rather than
+ * by the retained recovery-action id (the exhausted action may already carry an
+ * earlier notice for a different cause).
+ */
+export const ROUTINE_EXECUTION_STRANDED_NOTICE_TITLE = "Routine execution stranded";
+
 const STRANDED_RECOVERY_NOTICE_TITLES_BY_CAUSE: Record<string, string> = {
   workspace_validation_failed: "Workspace validation failed",
   configuration_incomplete: "Configuration incomplete",
   execution_review_participant_recovery: "Review recovery stalled",
+  routine_execution_stranded: ROUTINE_EXECUTION_STRANDED_NOTICE_TITLE,
 };
 
 // Titles keyed by the source run's classified error code. The raw failure text
@@ -163,6 +173,29 @@ export function buildExecutionReviewParticipantUnavailableNoticeSeed(): Stranded
       "intentional manual resolution.",
     title: "Review recovery stalled",
     tone: "danger",
+  };
+}
+
+/**
+ * DIG-4075 (DIG-2152 design item 4). Used when a `routine_execution` issue is
+ * skipped for a reason that does not mean another owner holds the work, and it
+ * has no live execution path. The skip reason is named so the board sees which
+ * ladder rung abandoned it, and the next action is an explicit decision rather
+ * than another automatic wake.
+ */
+export function buildRoutineExecutionStrandedNoticeSeed(
+  skipReason: string,
+): StrandedRecoveryNoticeSeed {
+  return {
+    body:
+      `Automatic recovery skipped this routine execution for \`${skipReason}\`, which does not mean another ` +
+      "owner holds the work, and the issue has no live execution path. Moving it to `blocked` for an explicit " +
+      "decision instead of dropping it silently on every sweep.",
+    title: ROUTINE_EXECUTION_STRANDED_NOTICE_TITLE,
+    tone: "danger",
+    nextAction:
+      "Board operator: this routine execution is stranded with no competent owner. Automatic recovery will not " +
+      "re-drive it; explicitly retry, reassign, or intentionally resolve the task.",
   };
 }
 
