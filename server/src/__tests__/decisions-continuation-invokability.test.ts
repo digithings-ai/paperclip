@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
@@ -56,7 +56,12 @@ vi.mock("../adapters/index.ts", async () => {
 });
 
 import { heartbeatService } from "../services/heartbeat.ts";
-import { decisionService } from "../services/decisions.ts";
+import {
+  createSweepLogThrottle,
+  decisionService,
+  decodeSweepCursorTimestamp,
+  encodeSweepCursorTimestamp,
+} from "../services/decisions.ts";
 import { createDecisionWakeOriginAgent } from "../services/decision-wakeup.ts";
 import { runStartupDecisionSweep } from "../startup-heartbeat-recovery.ts";
 import { runningProcesses } from "../adapters/index.ts";
@@ -343,6 +348,74 @@ describeEmbeddedPostgres("decision expiry sweep with non-invokable origin agents
       FAILED_MESSAGE,
     );
   });
+
+  it("throttles the non-409 delivery ERROR per decision across sweeps", async () => {
+    const error = vi.spyOn(logger, "error");
+    const warn = vi.spyOn(logger, "warn");
+    const companyId = await seedCompany();
+    const broken = await seedOriginAgent(companyId, "idle");
+    const brokenDecision = await seedPendingExpiredDecision(broken);
+    const service = decisionService(db, {
+      wakeOriginAgent: async () => {
+        throw new Error("simulated wake failure");
+      },
+    });
+
+    const first = await service.sweepExpired();
+    const second = await service.sweepExpired();
+
+    expect(first).toMatchObject({ continuationsDelivered: 0, continuationsFailed: 1 });
+    expect(second).toMatchObject({ continuationsDelivered: 0, continuationsFailed: 1 });
+    expect(await storedMetadata(brokenDecision.id)).toMatchObject({ metadata: { continuationPending: true } });
+    const failureLines = error.mock.calls.filter(([, message]) => message === FAILED_MESSAGE);
+    expect(failureLines).toHaveLength(1);
+    expect(failureLines[0]![0]).toMatchObject({ decisionId: brokenDecision.id });
+    expect(warn.mock.calls.filter(([, message]) => message === SUMMARY_MESSAGE)).toHaveLength(1);
+  });
+
+  describe("sweep cursor timestamp encoding", () => {
+    async function inSession<T>(dateStyle: string, timeZone: string, query: ReturnType<typeof sql>) {
+      return db.transaction(async (tx) => {
+        await tx.execute(sql.raw(`SET LOCAL DateStyle = '${dateStyle}'`));
+        await tx.execute(sql.raw(`SET LOCAL TimeZone = '${timeZone}'`));
+        const rows = await tx.execute(query);
+        return (rows as unknown as Array<Record<string, T>>)[0]!;
+      });
+    }
+
+    it("encodes the same UTC ISO string under any DateStyle and TimeZone, with microseconds", async () => {
+      const literal = sql`'2026-11-03 14:00:00.123456+00'::timestamptz`;
+      const expected = "2026-11-03T14:00:00.123456Z";
+      for (const [dateStyle, timeZone] of [["ISO, MDY", "UTC"], ["SQL, DMY", "America/New_York"], ["German, DMY", "Asia/Tokyo"], ["Postgres, MDY", "Europe/Rome"]]) {
+        const row = await inSession<string>(dateStyle!, timeZone!, sql`select ${encodeSweepCursorTimestamp(literal)} as encoded, (${literal})::text as plain`);
+        expect(row.encoded).toBe(expected);
+        if (dateStyle !== "ISO, MDY") expect(row.plain).not.toBe(row.encoded);
+      }
+      const whole = await inSession<string>("SQL, DMY", "UTC", sql`select ${encodeSweepCursorTimestamp(sql`'2026-11-03 14:00:00+00'::timestamptz`)} as encoded`);
+      expect(whole.encoded).toBe("2026-11-03T14:00:00.000000Z");
+    });
+
+    it("decodes back to the exact timestamp in another DateStyle, and keeps equal timestamps ordered by id", async () => {
+      const encoded = (await inSession<string>("SQL, DMY", "America/New_York",
+        sql`select ${encodeSweepCursorTimestamp(sql`'2026-11-03 14:00:00.000001+00'::timestamptz`)} as encoded`)).encoded!;
+      expect(encoded).toBe("2026-11-03T14:00:00.000001Z");
+      const lowId = "00000000-0000-0000-0000-000000000001";
+      const highId = "00000000-0000-0000-0000-000000000002";
+      for (const [dateStyle, timeZone] of [["ISO, MDY", "UTC"], ["German, DMY", "Asia/Tokyo"], ["SQL, DMY", "Pacific/Auckland"]]) {
+        const row = await inSession<boolean>(dateStyle!, timeZone!, sql`select
+          ${decodeSweepCursorTimestamp(encoded)} = '2026-11-03 14:00:00.000001+00'::timestamptz as exact,
+          ${decodeSweepCursorTimestamp(encoded)} > '2026-11-03 14:00:00+00'::timestamptz as after_previous_microsecond,
+          ('2026-11-03 14:00:00.000001+00'::timestamptz, ${highId}::uuid) > (${decodeSweepCursorTimestamp(encoded)}, ${lowId}::uuid) as equal_ts_higher_id_after,
+          ('2026-11-03 14:00:00.000001+00'::timestamptz, ${lowId}::uuid) > (${decodeSweepCursorTimestamp(encoded)}, ${lowId}::uuid) as equal_ts_same_id_after`);
+        expect(row).toMatchObject({
+          exact: true,
+          after_previous_microsecond: true,
+          equal_ts_higher_id_after: true,
+          equal_ts_same_id_after: false,
+        });
+      }
+    });
+  });
   describe("with a small sweep batch", () => {
     const previousBatchSize = process.env.PAPERCLIP_DECISIONS_SWEEP_BATCH_SIZE;
     beforeAll(() => {
@@ -387,6 +460,116 @@ describeEmbeddedPostgres("decision expiry sweep with non-invokable origin agents
       for (const origin of parkedOrigins) expect(await wakeCount(origin.agentId)).toBe(0);
       expect(warn).not.toHaveBeenCalledWith(expect.anything(), SKIP_MESSAGE);
       expect(warn).not.toHaveBeenCalledWith(expect.anything(), SUMMARY_MESSAGE);
+    });
+
+    it("pages rows that share one microsecond updated_at by id, and still reaches the active one within 2 sweeps", async () => {
+      const companyId = await seedCompany();
+      const manager = await seedOriginAgent(companyId, "terminated");
+      const ids: string[] = [];
+      for (let index = 0; index < 3; index += 1) {
+        const orphan = await seedOriginAgent(companyId, "idle", manager.agentId);
+        ids.push((await seedPendingExpiredDecision(orphan)).id);
+      }
+      const active = await seedOriginAgent(companyId, "idle");
+      const activeDecision = await seedPendingExpiredDecision(active);
+      ids.push(activeDecision.id);
+      for (const id of ids) {
+        await db.update(decisions).set({ updatedAt: sql`'2026-11-03 13:00:00.654321+00'::timestamptz` }).where(eq(decisions.id, id));
+      }
+      const service = decisionService(db, { wakeOriginAgent: realWake() });
+
+      const first = await service.sweepExpired();
+      const second = await service.sweepExpired();
+
+      expect(first.continuationsDelivered + second.continuationsDelivered).toBe(1);
+      expect(first.continuationsNotInvokableSkipped + second.continuationsNotInvokableSkipped).toBe(3);
+      expect(await storedMetadata(activeDecision.id)).toMatchObject({ metadata: { continuationPending: false } });
+    });
+
+    function runningDecisionValues(origin: Origin, chosenOptionId: string, updatedAt: Date) {
+      return {
+        companyId: origin.companyId,
+        originAgentId: origin.agentId,
+        originIssueId: origin.issueId,
+        originRunId: origin.runId,
+        title: "Decided decision with effects in flight",
+        body: "Body",
+        options: [{ id: "ok", label: "OK", effects: [] }] as unknown as (typeof decisions.$inferInsert)["options"],
+        status: "decided" as const,
+        executionStatus: "running" as const,
+        chosenOptionId,
+        decidedByUserId: "owner-user",
+        decidedAt: updatedAt,
+        expiresAt: new Date(Date.now() + 60 * 60_000),
+        signedSpec: "unused-by-the-sweep",
+        targetSnapshots: {},
+        continuationPolicy: "wake_origin_agent" as const,
+        metadata: { continuationPending: true },
+        updatedAt,
+      };
+    }
+
+    it("moves the pending-continuation cursor past broken-chain rows so an active one is delivered within 2 sweeps", async () => {
+      const companyId = await seedCompany();
+      const manager = await seedOriginAgent(companyId, "terminated");
+      const orphans: Origin[] = [];
+      const orphanDecisions: Array<{ id: string }> = [];
+      for (let index = 0; index < 4; index += 1) {
+        const orphan = await seedOriginAgent(companyId, "idle", manager.agentId);
+        orphans.push(orphan);
+        orphanDecisions.push(await seedPendingExpiredDecision(orphan, new Date(Date.now() - (60 - index) * 60_000)));
+      }
+      const active = await seedOriginAgent(companyId, "idle");
+      const activeDecision = await seedPendingExpiredDecision(active, new Date());
+      const service = decisionService(db, { wakeOriginAgent: realWake() });
+
+      const first = await service.sweepExpired();
+      expect(first).toMatchObject({ continuationsDelivered: 0, continuationsNotInvokableSkipped: 3 });
+      const second = await service.sweepExpired();
+      expect(second).toMatchObject({ continuationsDelivered: 1, continuationsNotInvokableSkipped: 1 });
+      expect(await storedMetadata(activeDecision.id)).toMatchObject({ metadata: { continuationPending: false } });
+
+      // The short batch wrapped the cursor, so the next sweep starts over.
+      const third = await service.sweepExpired();
+      expect(third).toMatchObject({ continuationsDelivered: 0, continuationsNotInvokableSkipped: 3 });
+      for (const decision of orphanDecisions) {
+        expect(await storedMetadata(decision.id)).toMatchObject({ metadata: { continuationPending: true } });
+      }
+      for (const orphan of orphans) expect(await wakeCount(orphan.agentId)).toBe(0);
+    });
+
+    it("pages running recovery with a cursor and throttles the effect-recovery ERROR", async () => {
+      const error = vi.spyOn(logger, "error");
+      const warn = vi.spyOn(logger, "warn");
+      const companyId = await seedCompany();
+      const stuck: Array<{ id: string }> = [];
+      for (let index = 0; index < 4; index += 1) {
+        const origin = await seedOriginAgent(companyId, "idle");
+        // The stored option is gone, so runEffects throws on every sweep.
+        const [row] = await db.insert(decisions)
+          .values(runningDecisionValues(origin, "missing-option", new Date(Date.now() - (60 - index) * 60_000))).returning();
+        stuck.push(row!);
+      }
+      const healthyOrigin = await seedOriginAgent(companyId, "idle");
+      const [healthy] = await db.insert(decisions)
+        .values(runningDecisionValues(healthyOrigin, "ok", new Date(Date.now() - 10 * 60_000))).returning();
+      const service = decisionService(db, { wakeOriginAgent: realWake() });
+
+      const first = await service.sweepExpired();
+      expect(first).toMatchObject({ resumed: 0, resumeFailed: 3 });
+      const second = await service.sweepExpired();
+      expect(second).toMatchObject({ resumed: 1, resumeFailed: 1, continuationsDelivered: 1 });
+      expect(await storedMetadata(healthy!.id)).toMatchObject({ metadata: { continuationPending: false } });
+      const third = await service.sweepExpired();
+      expect(third).toMatchObject({ resumed: 0, resumeFailed: 3 });
+
+      const recoveryErrors = error.mock.calls.filter(([, message]) =>
+        message === "decision effect recovery failed - decision stays running, continuing with the next one");
+      expect(recoveryErrors).toHaveLength(4);
+      expect(new Set(recoveryErrors.map(([context]) => (context as { decisionId: string }).decisionId)))
+        .toEqual(new Set(stuck.map((row) => row.id)));
+      // The third sweep only re-failed already-logged rows, so it adds no WARN.
+      expect(warn.mock.calls.filter(([, message]) => message === SUMMARY_MESSAGE)).toHaveLength(2);
     });
   });
 
@@ -454,5 +637,38 @@ describeEmbeddedPostgres("decision expiry sweep with non-invokable origin agents
     expect(brokenRow).toMatchObject({ executionStatus: "running" });
     expect(await storedMetadata(healthy!.id)).toMatchObject({ metadata: { continuationPending: false } });
     expect(await wakeCount(healthyOrigin.agentId)).toBeGreaterThanOrEqual(1);
+  });
+});
+
+describe("createSweepLogThrottle", () => {
+  it("logs each key at most once per interval", () => {
+    let clock = 0;
+    const throttle = createSweepLogThrottle({ intervalMs: 1_000, maxEntries: 10, now: () => clock });
+    expect(throttle.shouldLog("a")).toBe(true);
+    clock = 999;
+    expect(throttle.shouldLog("a")).toBe(false);
+    clock = 1_000;
+    expect(throttle.shouldLog("a")).toBe(true);
+    throttle.forget("a");
+    expect(throttle.shouldLog("a")).toBe(true);
+  });
+
+  it("has a hard cap and evicts the oldest entries first", () => {
+    let clock = 0;
+    const throttle = createSweepLogThrottle({ intervalMs: 60_000, maxEntries: 3, now: () => clock });
+    for (const key of ["a", "b", "c"]) {
+      expect(throttle.shouldLog(key)).toBe(true);
+      clock += 1;
+    }
+    expect(throttle.shouldLog("d")).toBe(true);
+    expect(throttle.size).toBe(3);
+    // "a" was the oldest and was evicted, so it logs again; that evicts "b".
+    expect(throttle.shouldLog("a")).toBe(true);
+    expect(throttle.size).toBe(3);
+    expect(throttle.shouldLog("c")).toBe(false);
+    expect(throttle.shouldLog("d")).toBe(false);
+    expect(throttle.shouldLog("b")).toBe(true);
+    for (let index = 0; index < 100; index += 1) throttle.shouldLog(`k${index}`);
+    expect(throttle.size).toBe(3);
   });
 });
