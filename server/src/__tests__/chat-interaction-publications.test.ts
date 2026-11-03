@@ -250,6 +250,10 @@ describeEmbeddedPostgres(
         companyId: fixture.companyId,
         agentId: foreignAgentId,
         status: "succeeded",
+        // The run of a card on this issue is a run on this issue, so it carries
+        // the issue binding. The scope check refuses a source run that is
+        // bound to no issue at all.
+        contextSnapshot: { issueId: fixture.issueId },
       });
       const question = {
         kind: "ask_user_questions" as const,
