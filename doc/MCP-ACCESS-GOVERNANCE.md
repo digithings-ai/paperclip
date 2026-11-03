@@ -193,9 +193,9 @@ curl -fsS -X PATCH -H "Authorization: Bearer $BOARD_API_KEY" -H "Content-Type: a
   -d '{"enabled": false, "status": "disabled"}' | jq '{id, enabled, status}'
 ```
 
-Connection statuses: `draft`, `active`, `disabled`, `archived`. Health statuses: `ok`, `healthy`, `unchecked`, `unknown`, `degraded`, `failed`, `error`, `missing_secret`, `tool_timeout`, `probe_failed`.
+Connection statuses: `draft`, `active`, `disabled`, `archived`. Health statuses: `ok`, `healthy`, `unchecked`, `unknown`, `degraded`, `failed`, `error`, `missing_secret`, `tool_timeout`, `probe_failed`, `remote_failed`.
 
-A connection with the status `error` or `missing_secret` is hidden from every session, because every call to it will fail. A connection with the status `tool_timeout` or `probe_failed` stays discoverable: one timed-out call or one failed background probe is one sample, not proof that every call fails. A call that really fails then answers with the real error at call time.
+A connection with the status `error` or `missing_secret` is hidden from every session, because every call to it will fail. A connection with the status `tool_timeout`, `probe_failed` or `remote_failed` stays discoverable: one timed-out call, one failed background probe or one failed remote call is one sample, not proof that every call fails. A call that really fails then answers with the real error at call time.
 
 ## Catalog and risk classification
 

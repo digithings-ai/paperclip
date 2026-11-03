@@ -1279,10 +1279,13 @@ export function createToolGatewayService(
       // out call says nothing about the connection's other tools.
       // "probe_failed" is kept discoverable for the same reason: one failed
       // background probe is one sample, not proof that every call will fail.
+      // "remote_failed" is kept discoverable for the same reason: a failed
+      // remote call says nothing about the connection's other tools, and a
+      // later successful call restores "ok".
       // Only a state in which every call will fail ("error",
       // "missing_secret") hides the connection's tools.
       or(
-        inArray(toolConnections.healthStatus, ["ok", "healthy", "tool_timeout", "probe_failed"]),
+        inArray(toolConnections.healthStatus, ["ok", "healthy", "tool_timeout", "probe_failed", "remote_failed"]),
         eq(toolConnections.credentialPolicy, "per_user"),
       ),
       eq(toolApplications.companyId, companyId),
@@ -6198,7 +6201,7 @@ export function createToolGatewayService(
         // Session expiration is recoverable on an explicit retry. Marking the
         // connection unhealthy here would hide every tool and prevent it.
         if (!sessionExpired) {
-          await markRemoteConnectionHealth(connection, "error", "Remote MCP server returned an HTTP error.");
+          await markRemoteConnectionHealth(connection, "remote_failed", "Remote MCP server returned an HTTP error.");
         }
         throw new ToolGatewayHttpError(
           502,
@@ -6219,7 +6222,7 @@ export function createToolGatewayService(
       } catch {
         await markRemoteConnectionHealth(
           connection,
-          "error",
+          "remote_failed",
           "Remote MCP server returned invalid JSON.",
         );
         throw new ToolGatewayHttpError(
@@ -6253,7 +6256,7 @@ export function createToolGatewayService(
         const errorRecord = asRecord(payloadRecord.error);
         await markRemoteConnectionHealth(
           connection,
-          "error",
+          "remote_failed",
           "Remote MCP server returned a JSON-RPC error.",
         );
         throw new ToolGatewayHttpError(
@@ -6304,7 +6307,7 @@ export function createToolGatewayService(
         const failure = error.reason === "too_large" ? responseTooLargeError()
           : error.reason === "malformed_response" ? malformedRemoteMcpResponse()
           : new ToolGatewayHttpError(502, "Remote MCP server returned invalid JSON", "mcp_remote_invalid_json");
-        await markRemoteConnectionHealth(connection, "error", failure.message);
+        await markRemoteConnectionHealth(connection, "remote_failed", failure.message);
         throw new ToolGatewayHttpError(failure.status, failure.message, failure.reasonCode, {
           connectionId: connection.id, catalogEntryId: entry.id, execution,
         });
@@ -6347,7 +6350,7 @@ export function createToolGatewayService(
       }
       await markRemoteConnectionHealth(
         connection,
-        "error",
+        "remote_failed",
         "Remote MCP tool call failed.",
       );
       throw new ToolGatewayHttpError(
