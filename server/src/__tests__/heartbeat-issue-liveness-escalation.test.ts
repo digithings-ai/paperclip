@@ -68,6 +68,9 @@ vi.mock("../adapters/index.ts", async () => {
 });
 
 import { heartbeatService } from "../services/heartbeat.ts";
+import { recoveryService } from "../services/recovery/service.ts";
+import { conflict } from "../errors.ts";
+import { logger } from "../middleware/logger.ts";
 import { attentionService } from "../services/attention.ts";
 import { issueService } from "../services/issues.ts";
 import { runningProcesses } from "../adapters/index.ts";
@@ -996,6 +999,150 @@ describeEmbeddedPostgres("heartbeat resolved dependency wake reconciliation", ()
     expect(skippedWake).toMatchObject({
       status: "skipped",
       reason: "heartbeat.wakeOnDemand.disabled",
+    });
+  });
+
+  describe("non-invokable dependent agents", () => {
+    const NON_INVOKABLE_SKIP_MESSAGE =
+      "issue graph liveness backstop skipped dependency wake for non-invokable agent";
+    const INVOKE_CONFLICT_SKIP_MESSAGE =
+      "issue graph liveness backstop skipped dependency wake after invoke conflict";
+
+    async function countWakeRequests(agentId: string) {
+      const rows = await db
+        .select({ id: agentWakeupRequests.id })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.agentId, agentId));
+      return rows.length;
+    }
+
+    for (const status of ["paused", "terminated", "pending_approval"] as const) {
+      it(`skips a ${status} dependent agent, logs the skip and completes the pass`, async () => {
+        const warn = vi.spyOn(logger, "warn");
+        const { agentId, blockedIssueId } =
+          await seedResolvedDependencyBackstopFixture({ workspaceState: "none" });
+        await db.update(agents).set({ status }).where(eq(agents.id, agentId));
+
+        const result = await heartbeatService(db).reconcileResolvedDependencyWakes();
+
+        expect(result.healed).toBe(0);
+        expect(result.notInvokableSkipped).toBe(1);
+        expect(result.enqueueFailed).toBe(0);
+        expect(result.deferredOrFailed).toBe(0);
+        // The skip happens before the invoke path, so no skipped wake row is written.
+        expect(await countWakeRequests(agentId)).toBe(0);
+        expect(warn).toHaveBeenCalledWith(
+          expect.objectContaining({
+            issueId: blockedIssueId,
+            agentId,
+            agentStatus: status,
+            reason: status,
+          }),
+          NON_INVOKABLE_SKIP_MESSAGE,
+        );
+        warn.mockRestore();
+      });
+    }
+
+    it("skips an idle dependent agent whose reporting chain is not invokable", async () => {
+      const warn = vi.spyOn(logger, "warn");
+      const { companyId, agentId, blockedIssueId } =
+        await seedResolvedDependencyBackstopFixture({ workspaceState: "none" });
+      const managerId = randomUUID();
+      await db.insert(agents).values({
+        id: managerId,
+        companyId,
+        name: "Retired manager",
+        role: "manager",
+        status: "terminated",
+        adapterType: "test_adapter",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+      await db.update(agents).set({ reportsTo: managerId }).where(eq(agents.id, agentId));
+
+      const result = await heartbeatService(db).reconcileResolvedDependencyWakes();
+
+      expect(result.healed).toBe(0);
+      expect(result.notInvokableSkipped).toBe(1);
+      expect(result.enqueueFailed).toBe(0);
+      expect(await countWakeRequests(agentId)).toBe(0);
+      expect(warn).toHaveBeenCalledWith(
+        expect.objectContaining({
+          issueId: blockedIssueId,
+          agentId,
+          agentStatus: "idle",
+          reason: "manager_terminated",
+        }),
+        NON_INVOKABLE_SKIP_MESSAGE,
+      );
+      warn.mockRestore();
+    });
+
+    it("still wakes an active dependent agent in the same pass as a paused one", async () => {
+      const paused = await seedResolvedDependencyBackstopFixture({ workspaceState: "none" });
+      await db.update(agents).set({ status: "paused" }).where(eq(agents.id, paused.agentId));
+      const active = await seedResolvedDependencyBackstopFixture({ workspaceState: "none" });
+
+      const result = await heartbeatService(db).reconcileResolvedDependencyWakes();
+
+      expect(result.notInvokableSkipped).toBe(1);
+      expect(result.healed).toBe(1);
+      expect(result.issueIds).toEqual([active.blockedIssueId]);
+      expect(await countWakeRequests(paused.agentId)).toBe(0);
+      const activeWake = await db
+        .select({ reason: agentWakeupRequests.reason })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.agentId, active.agentId))
+        .then((rows) => rows[0] ?? null);
+      expect(activeWake?.reason).toBe("issue_blockers_resolved");
+    });
+
+    it("treats a 409 from the invoke path as a logged skip and keeps going", async () => {
+      const warn = vi.spyOn(logger, "warn");
+      const first = await seedResolvedDependencyBackstopFixture({ workspaceState: "none" });
+      const second = await seedResolvedDependencyBackstopFixture({ workspaceState: "none" });
+      // Simulate an agent that is paused between the invokability check and
+      // the invoke: the first wake throws the invoke-path 409, the second heals.
+      const enqueueWakeup = vi.fn(async (agentId: string) => {
+        if (agentId === first.agentId) {
+          throw conflict("Agent is not invokable in its current state", {
+            status: "paused",
+            reason: "paused",
+          });
+        }
+        return { id: randomUUID() } as never;
+      });
+
+      const result = await recoveryService(db, { enqueueWakeup })
+        .reconcileResolvedDependencyWakeBackstop();
+
+      expect(enqueueWakeup).toHaveBeenCalledTimes(2);
+      expect(result.notInvokableSkipped).toBe(1);
+      expect(result.enqueueFailed).toBe(0);
+      expect(result.healed).toBe(1);
+      expect(result.issueIds).toEqual([second.blockedIssueId]);
+      expect(warn).toHaveBeenCalledWith(
+        expect.objectContaining({ issueId: first.blockedIssueId, agentId: first.agentId }),
+        INVOKE_CONFLICT_SKIP_MESSAGE,
+      );
+      warn.mockRestore();
+    });
+
+    it("keeps non-409 invoke errors on the enqueueFailed path", async () => {
+      const { agentId } = await seedResolvedDependencyBackstopFixture({ workspaceState: "none" });
+      const enqueueWakeup = vi.fn(async () => {
+        throw new Error("database unavailable");
+      });
+
+      const result = await recoveryService(db, { enqueueWakeup })
+        .reconcileResolvedDependencyWakeBackstop();
+
+      expect(enqueueWakeup).toHaveBeenCalledWith(agentId, expect.anything());
+      expect(result.notInvokableSkipped).toBe(0);
+      expect(result.enqueueFailed).toBe(1);
+      expect(result.deferredOrFailed).toBe(1);
     });
   });
 
