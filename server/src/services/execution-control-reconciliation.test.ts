@@ -84,6 +84,18 @@ describeEmbeddedPostgres("reconcileAbandonedExecutionControl reports a genuine f
     const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
     expect(run?.status).toBe("failed");
     expect(run?.errorCode).toBe("execution_finalization_deadline_exceeded");
+    // DIG-5758: the deadline path states its cause. The substituted board
+    // instruction stays in `nextAction`, and the row carries the facts the
+    // adapter result would have carried instead of a null result.
+    expect(run?.error).toContain("Finalization deadline exceeded");
+    expect(run?.error).not.toContain("Inspect the failed run");
+    expect(run?.nextAction).toContain("Inspect the failed run");
+    expect(run?.resultJson).toMatchObject({
+      finalization: {
+        cause: "execution_finalization_deadline_exceeded",
+        providerProcessRecorded: false,
+      },
+    });
 
     await vi.waitFor(() => {
       expect(mockCaptureRunFailure.mock.calls.slice(captureCallsBefore)).toHaveLength(1);

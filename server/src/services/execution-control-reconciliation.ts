@@ -10,6 +10,12 @@ import {
 } from "@paperclipai/db";
 import { parseIssueExecutionState } from "./issue-execution-policy.js";
 import { issueRecoveryActionService } from "./issue-recovery-actions.js";
+import {
+  FINALIZATION_DEADLINE_ERROR_CODE,
+  FINALIZATION_DEADLINE_NEXT_ACTION,
+  finalizationDeadlineError,
+  finalizationDeadlineResultJson,
+} from "./finalization-deadline-failure.js";
 import { reportRunFailure } from "./run-failure-report.js";
 import { getNativeReviewAssignment, readNativeReviewAssignmentContext } from "./native-runtime/native-review-participant.js";
 
@@ -151,9 +157,16 @@ export async function reconcileAbandonedExecutionControl(
               .where(eq(nativeRunFinalizations.runId, run.id));
             return true;
           }
-          const cause = "execution_finalization_deadline_exceeded";
-          const nextAction =
-            "Inspect the failed run and verify its provider has stopped. Reconcile any uncertain external action before explicitly continuing this task.";
+          const cause = FINALIZATION_DEADLINE_ERROR_CODE;
+          // The board instruction is the next action, not the reason. A reader
+          // needs the cause: when the run last spoke, how much it produced, and
+          // whether a provider process is still recorded (DIG-5758).
+          const deadlineAt =
+            [coordinator?.controlDeadlineAt, run.executionControlDeadlineAt]
+              .filter((deadline): deadline is Date => Boolean(deadline))
+              .sort((left, right) => left.getTime() - right.getTime())[0] ?? null;
+          const errorMessage = finalizationDeadlineError(run, deadlineAt, now);
+          const nextAction = FINALIZATION_DEADLINE_NEXT_ACTION;
           if (coordinator)
             await tx
               .update(nativeRunFinalizations)
@@ -183,7 +196,13 @@ export async function reconcileAbandonedExecutionControl(
                 ? { nativePhase: "terminal_failure", nativePhaseUpdatedAt: now }
                 : {}),
               errorCode: cause,
-              error: nextAction,
+              error: errorMessage,
+              resultJson: finalizationDeadlineResultJson(
+                run,
+                deadlineAt,
+                now,
+                run.resultJson,
+              ),
               nextAction,
               updatedAt: now,
             })
