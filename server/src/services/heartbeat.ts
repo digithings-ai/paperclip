@@ -20112,7 +20112,8 @@ export function heartbeatService(
       const logContext = { sessionId: session.id, issueId: session.issueId };
       // Per-item isolation: one agent's error (for example a budget 409, which
       // is not an invokability skip) is counted as failed and logged, and the
-      // rest of the pass still runs. The next pass retries it.
+      // rest of the pass still runs. This pass only runs at server startup, so
+      // the item is retried on the next restart.
       try {
         if (await gate.skip(session.agentId, logContext)) continue;
         const outcome = await gate.wakeOrSkip(session.agentId, logContext, () =>
@@ -20198,7 +20199,8 @@ export function heartbeatService(
     for (const action of pending) {
       // Per-item isolation: one action's error (for example a budget 409) is
       // counted as failed and logged, the action stays as it was, and the rest
-      // of the pass still runs. The next pass retries it.
+      // of the pass still runs. This pass only runs at server startup, so the
+      // action is retried on the next restart.
       try {
         const control = parseNativeSessionGoalControl(action.payload);
         if (!control || control.requestId !== action.requestId) {
@@ -20244,8 +20246,9 @@ export function heartbeatService(
           continue;
         }
 
-        // A parked seat keeps its pending action; it is delivered on a later
-        // pass once the agent is invokable again.
+        // A parked seat keeps its pending action; it is delivered on the next
+        // restart after the agent is invokable again (this pass only runs at
+        // server startup).
         const logContext = { actionId: action.id, issueId: action.issueId };
         if (await gate.skip(action.agentId, logContext)) continue;
         const outcome = await gate.wakeOrSkip(action.agentId, logContext, () => enqueueWakeup(action.agentId, {
