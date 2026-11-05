@@ -403,12 +403,21 @@ export async function executeNativeCodexRunner(input: {
     stdio: ["ignore", "pipe", "pipe"],
   });
   const exit = waitForExit(child);
+  const onStdioError = (stream: "stdout" | "stderr", err: Error) => {
+    const code = (err as NodeJS.ErrnoException).code;
+    const detail = code === "EPIPE" || code === "ERR_STREAM_DESTROYED"
+      ? `[paperclip] native runner ${stream} closed (${code})\n`
+      : `[paperclip] native runner ${stream} error: ${err.message}\n`;
+    void input.onLog("stderr", detail).catch(() => undefined);
+  };
   child.stdout?.on("data", (chunk: Buffer) => {
     void input.onLog("stdout", chunk.toString("utf8"));
   });
+  child.stdout?.on("error", (err: Error) => onStdioError("stdout", err));
   child.stderr?.on("data", (chunk: Buffer) => {
     void input.onLog("stderr", chunk.toString("utf8"));
   });
+  child.stderr?.on("error", (err: Error) => onStdioError("stderr", err));
 
   try {
     if (!child.pid) throw new Error("paperclip_runner_process_not_started");

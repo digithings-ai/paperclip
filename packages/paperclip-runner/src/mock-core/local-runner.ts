@@ -227,12 +227,24 @@ class LocalRunnerController implements LocalRunnerRunHandle {
       env: runnerEnvironment(),
       stdio: "pipe",
     });
-    createInterface({ input: this.#process.stdout }).on("line", (line) => {
-      this.#handleLine(line);
-    });
-    createInterface({ input: this.#process.stderr }).on("line", (line) => {
-      this.#recordDiagnostic(`runner stderr: ${line}`);
-    });
+    const onPipeError = (error: Error) => {
+      const code = (error as NodeJS.ErrnoException).code;
+      this.#recordDiagnostic(`runner stdio ${code ?? "error"}: ${error.message}`);
+      if (code === "EPIPE" || code === "ERR_STREAM_DESTROYED") this.#fail(error);
+    };
+    this.#process.stdin.on("error", onPipeError);
+    this.#process.stdout.on("error", onPipeError);
+    this.#process.stderr.on("error", onPipeError);
+    createInterface({ input: this.#process.stdout })
+      .on("line", (line) => {
+        this.#handleLine(line);
+      })
+      .on("error", onPipeError);
+    createInterface({ input: this.#process.stderr })
+      .on("line", (line) => {
+        this.#recordDiagnostic(`runner stderr: ${line}`);
+      })
+      .on("error", onPipeError);
     this.#process.on("error", (error) => this.#fail(error));
     this.#process.on("exit", (code, signal) => this.#finish(code, signal));
   }
@@ -339,7 +351,10 @@ class LocalRunnerController implements LocalRunnerRunHandle {
     if (
       this.#settled ||
       this.#process.stdin.destroyed ||
-      !this.#process.stdin.writable
+      !this.#process.stdin.writable ||
+      this.#process.killed ||
+      this.#process.exitCode !== null ||
+      this.#process.signalCode !== null
     ) {
       return Promise.reject(
         new Error("This request expired because the local run already finished. Start a new run."),
@@ -491,7 +506,11 @@ class LocalRunnerController implements LocalRunnerRunHandle {
     this.#receiptWaiters.clear();
     this.#eventWaiters = [];
     this.#completionReject(error);
-    this.#process.stdin.end();
+    try {
+      this.#process.stdin.end();
+    } catch {
+      // The pipe is already closed. The rejection above is the run result.
+    }
   }
 }
 

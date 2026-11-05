@@ -116,6 +116,10 @@ export async function photonHeifPreview(body: Buffer): Promise<Buffer> {
       child.kill("SIGKILL");
       reject(new Error("HEIF preview conversion timed out"));
     }, 10_000);
+    let stdioFailed: Error | null = null;
+    const noteStdioError = (err: Error) => {
+      stdioFailed ??= err;
+    };
     child.stdout.on("data", (chunk: Buffer) => {
       length += chunk.length;
       if (length > MAX_ATTACHMENT_BYTES) {
@@ -123,17 +127,26 @@ export async function photonHeifPreview(body: Buffer): Promise<Buffer> {
         reject(new Error("HEIF preview exceeds the attachment byte limit"));
       } else chunks.push(chunk);
     });
+    child.stdout.on("error", noteStdioError);
     child.on("error", () => {
       clearTimeout(timer);
       reject(new Error("HEIF preview converter is unavailable"));
     });
     child.on("close", (code) => {
       clearTimeout(timer);
-      if (code === 0 && length > 0) resolve(Buffer.concat(chunks));
+      if (!stdioFailed && code === 0 && length > 0) resolve(Buffer.concat(chunks));
       else reject(new Error("HEIF preview conversion failed on this host"));
     });
-    child.stdin.on("error", () => {});
-    child.stdin.end(body);
+    child.stdin.on("error", noteStdioError);
+    if (child.killed || child.stdin.destroyed || child.exitCode !== null || child.signalCode !== null) {
+      stdioFailed ??= new Error("HEIF converter exited before the image was written");
+    } else {
+      try {
+        child.stdin.end(body);
+      } catch (err) {
+        stdioFailed ??= err instanceof Error ? err : new Error(String(err));
+      }
+    }
   });
   await validatePhotonImage(jpeg, "image/jpeg");
   return jpeg;

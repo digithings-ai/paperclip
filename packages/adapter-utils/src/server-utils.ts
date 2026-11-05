@@ -4632,6 +4632,11 @@ export async function removeMaintainerOnlySkillSymlinks(
   }
 }
 
+function isClosedPipeError(err: unknown): boolean {
+  const code = (err as NodeJS.ErrnoException | undefined)?.code;
+  return code === "EPIPE" || code === "ERR_STREAM_DESTROYED";
+}
+
 export async function ensureCommandResolvable(
   command: string,
   cwd: string,
@@ -4725,6 +4730,39 @@ export async function runChildProcess(
           shell: false,
           stdio: [opts.stdin != null ? "pipe" : "ignore", "pipe", "pipe"],
         }) as ChildProcessWithEvents;
+        // Attach before any write. A child that exits before reading its prompt
+        // emits 'error' (write EPIPE / ERR_STREAM_DESTROYED) on stdin. Without a
+        // listener that event is uncaught and takes down the whole server.
+        let stdioFailure: { stream: "stdin" | "stdout" | "stderr"; code: string } | null = null;
+        let timedOut = false;
+        const reportStdio = (err: unknown, message: string) => {
+          try {
+            onLogError(err, runId, message);
+          } catch {
+            // Logging a stream failure must not become the next uncaught error.
+          }
+        };
+        const noteClosedStdio = (
+          stream: "stdin" | "stdout" | "stderr",
+          err: unknown,
+        ) => {
+          // A timeout already killed the child; the closed pipe is a consequence.
+          if (timedOut || stdioFailure) return;
+          const error = err instanceof Error ? err : new Error(String(err));
+          const code = (error as NodeJS.ErrnoException).code ?? "EPIPE";
+          stdioFailure = { stream, code };
+          reportStdio(error, `${stream} closed before the adapter finished (${code})`);
+        };
+        const onStdioError = (stream: "stdin" | "stdout" | "stderr") => (err: Error) => {
+          if (isClosedPipeError(err)) {
+            noteClosedStdio(stream, err);
+            return;
+          }
+          reportStdio(err, `${stream} stream error`);
+        };
+        child.stdin?.on("error", onStdioError("stdin"));
+        child.stdout?.on("error", onStdioError("stdout"));
+        child.stderr?.on("error", onStdioError("stderr"));
         const startedAt = new Date().toISOString();
         const processGroupId = resolveProcessGroupId(child);
 
@@ -4747,7 +4785,7 @@ export async function runChildProcess(
           processGroupId,
         });
 
-        let timedOut = false;
+        let stdinWriteSettled: Promise<void> = Promise.resolve();
         let stdout = "";
         let stderr = "";
         let logChain: Promise<void> = Promise.resolve();
@@ -4878,11 +4916,53 @@ export async function runChildProcess(
 
         const stdin = child.stdin;
         if (opts.stdin != null && stdin) {
-          void spawnPersistPromise.finally(() => {
-            if (child.killed || stdin.destroyed) return;
-            stdin.write(opts.stdin as string);
-            stdin.end();
-          });
+          stdinWriteSettled = spawnPersistPromise.then(
+            () =>
+              new Promise<void>((done) => {
+                let settled = false;
+                const finish = () => {
+                  if (settled) return;
+                  settled = true;
+                  stdin.off("error", onWriteError);
+                  stdin.off("finish", finish);
+                  done();
+                };
+                const onWriteError = () => finish();
+                if (
+                  child.killed ||
+                  stdin.destroyed ||
+                  child.exitCode !== null ||
+                  child.signalCode !== null
+                ) {
+                  // A timeout already owns the failure. An early exit does not:
+                  // the prompt never landed, so record it for the close path.
+                  if (
+                    !timedOut &&
+                    !child.killed &&
+                    (stdin.destroyed || child.exitCode !== null || child.signalCode !== null)
+                  ) {
+                    noteClosedStdio(
+                      "stdin",
+                      Object.assign(new Error("adapter exited before its prompt was written"), {
+                        code: "EPIPE",
+                      }),
+                    );
+                  }
+                  finish();
+                  return;
+                }
+                stdin.once("error", onWriteError);
+                stdin.once("finish", finish);
+                try {
+                  stdin.write(opts.stdin as string);
+                  stdin.end();
+                } catch (err) {
+                  if (isClosedPipeError(err)) noteClosedStdio("stdin", err);
+                  else reportStdio(err, "failed to write adapter stdin");
+                  finish();
+                }
+              }),
+          );
         }
 
         child.on("error", (err: Error) => {
@@ -4910,30 +4990,43 @@ export async function runChildProcess(
             clearTerminalCleanupTimers();
             runningProcesses.delete(runId);
             void logChain.finally(() => {
-              void Promise.resolve()
-                .then(() => target.cleanup?.())
-                .finally(() => {
-                  resolve({
-                    exitCode: code,
-                    signal,
-                    timedOut,
-                    stdout,
-                    stderr,
-                    pid: child.pid ?? null,
-                    startedAt,
-                    terminalResultCleanup: terminalCleanupStarted
-                      ? {
-                          kind: "terminal_result_cleanup",
-                          stopped: true,
-                          stopReason: UNMANAGED_BACKGROUND_TASK_STOP_REASON,
-                          reason: UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON,
-                          terminalResultSeen,
-                          signal: terminalCleanupSignal,
-                          forceKilled: terminalCleanupForceKilled,
-                        }
-                      : null,
+              void stdinWriteSettled.finally(() => {
+                void Promise.resolve()
+                  .then(() => target.cleanup?.())
+                  .finally(() => {
+                    let exitCode = code;
+                    let resolvedStderr = stderr;
+                    if (
+                      stdioFailure &&
+                      !timedOut &&
+                      (exitCode === 0 || exitCode === null)
+                    ) {
+                      exitCode = 1;
+                      const note = `[paperclip] ${stdioFailure.stream} closed before the adapter read its input (${stdioFailure.code}).`;
+                      resolvedStderr = `${stderr}${stderr.length > 0 && !stderr.endsWith("\n") ? "\n" : ""}${note}\n`;
+                    }
+                    resolve({
+                      exitCode,
+                      signal,
+                      timedOut,
+                      stdout,
+                      stderr: resolvedStderr,
+                      pid: child.pid ?? null,
+                      startedAt,
+                      terminalResultCleanup: terminalCleanupStarted
+                        ? {
+                            kind: "terminal_result_cleanup",
+                            stopped: true,
+                            stopReason: UNMANAGED_BACKGROUND_TASK_STOP_REASON,
+                            reason: UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON,
+                            terminalResultSeen,
+                            signal: terminalCleanupSignal,
+                            forceKilled: terminalCleanupForceKilled,
+                          }
+                        : null,
+                    });
                   });
-                });
+              });
             });
           },
         );

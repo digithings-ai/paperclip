@@ -64,8 +64,13 @@ export async function runRailwaySshCommand(input: RailwaySshInput & { privateKey
         if (stream === "out") stdout += text; else stderr += text;
         if (bytes > 64 * 1024) { truncated = true; stop(); }
       };
+      const noteStdioError = (_err: Error) => {
+        deliveryFailed = true;
+      };
       child.stdout.on("data", (chunk: Buffer) => receive(chunk, "out"));
+      child.stdout.on("error", noteStdioError);
       child.stderr.on("data", (chunk: Buffer) => receive(chunk, "err"));
+      child.stderr.on("error", noteStdioError);
       const timer = setTimeout(() => { timedOut = true; stop(); }, input.timeoutSeconds * 1000);
       const abort = () => stop();
       input.signal.addEventListener("abort", abort, { once: true });
@@ -83,9 +88,21 @@ export async function runRailwaySshCommand(input: RailwaySshInput & { privateKey
         if (completion) stdout = stdout.slice(0, completion.index);
         resolve({ exitCode: completion ? Number(completion[1]) : exitCode, stdout: redactSensitiveText(stdout), stderr: redactSensitiveText(stderr), truncated, timedOut });
       });
-      child.stdin.on("error", () => { deliveryFailed = true; });
+      child.stdin.on("error", (err: Error) => {
+        const code = (err as NodeJS.ErrnoException).code;
+        if (code === "EPIPE" || code === "ERR_STREAM_DESTROYED") deliveryFailed = true;
+      });
       const quotedCommand = "'" + input.command.replace(/'/g, "'\\''") + "'";
-      child.stdin.end(`sh -c ${quotedCommand} </dev/null\npaperclip_command_status=$?\nprintf '\\n${marker}:%d\\n' "$paperclip_command_status"\nexit "$paperclip_command_status"\n`);
+      if (child.killed || child.stdin.destroyed || child.exitCode !== null || child.signalCode !== null) {
+        deliveryFailed = true;
+      } else {
+        try {
+          child.stdin.end(`sh -c ${quotedCommand} </dev/null\npaperclip_command_status=$?\nprintf '\\n${marker}:%d\\n' "$paperclip_command_status"\nexit "$paperclip_command_status"\n`);
+        } catch (err) {
+          const code = (err as NodeJS.ErrnoException).code;
+          if (code === "EPIPE" || code === "ERR_STREAM_DESTROYED") deliveryFailed = true;
+        }
+      }
     });
   } finally { await rm(directory, { recursive: true, force: true }); }
 }

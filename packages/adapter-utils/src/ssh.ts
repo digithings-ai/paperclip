@@ -220,6 +220,20 @@ async function execFileText(
   });
 }
 
+function isClosedPipeError(err: unknown): boolean {
+  const code = (err as NodeJS.ErrnoException | undefined)?.code;
+  return code === "EPIPE" || code === "ERR_STREAM_DESTROYED";
+}
+
+function childExitedBeforeStdinWrite(child: {
+  killed: boolean;
+  exitCode: number | null;
+  signalCode: NodeJS.Signals | null;
+  stdin: { destroyed: boolean } | null;
+}): boolean {
+  return child.killed || Boolean(child.stdin?.destroyed) || child.exitCode !== null || child.signalCode !== null;
+}
+
 async function spawnText(
   file: string,
   args: string[],
@@ -292,6 +306,20 @@ async function spawnText(
       if (killEscalation) clearTimeout(killEscalation);
     };
 
+    let stdinFailure: NodeJS.ErrnoException | null = null;
+    const noteStdioError = (stream: "stdin" | "stdout" | "stderr", error: Error) => {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (isClosedPipeError(error)) {
+        stdinFailure ??= Object.assign(error, { code: code ?? "EPIPE" });
+        console.warn({ err: error, stream, code }, "child stdio closed before the write finished");
+        return;
+      }
+      console.warn({ err: error, stream }, "child stdio error");
+    };
+    child.stdin?.on("error", (error) => noteStdioError("stdin", error));
+    child.stdout?.on("error", (error) => noteStdioError("stdout", error));
+    child.stderr?.on("error", (error) => noteStdioError("stderr", error));
+
     child.stdout?.on("data", (chunk) => {
       append("stdout", chunk);
     });
@@ -306,23 +334,49 @@ async function spawnText(
 
     child.on("close", (code, signal) => {
       clearTimers();
-      if (settled) return;
-      settled = true;
-      if (code === 0) {
-        resolve({ stdout, stderr });
-        return;
-      }
-      reject(Object.assign(new Error(stderr.trim() || stdout.trim() || `Process exited with code ${code ?? -1}`), {
-        stdout,
-        stderr,
-        code,
-        signal,
-        killed: timedOut,
-      }));
+      // Closed-pipe errors arrive on a later turn than the write. Settle after
+      // that turn so EPIPE becomes this rejection instead of an uncaught throw.
+      setImmediate(() => {
+        if (settled) return;
+        settled = true;
+        if (stdinFailure && !timedOut && (code === 0 || code === null) && signal == null) {
+          reject(Object.assign(new Error(stdinFailure.message || "child stdin closed before the prompt was written"), {
+            stdout,
+            stderr,
+            code: code ?? 1,
+            signal,
+            killed: false,
+          }));
+          return;
+        }
+        if (code === 0) {
+          resolve({ stdout, stderr });
+          return;
+        }
+        reject(Object.assign(new Error(stderr.trim() || stdout.trim() || `Process exited with code ${code ?? -1}`), {
+          stdout,
+          stderr,
+          code,
+          signal,
+          killed: timedOut,
+        }));
+      });
     });
 
     if (options.stdin != null && child.stdin) {
-      child.stdin.end(options.stdin);
+      if (childExitedBeforeStdinWrite(child)) {
+        if (!child.killed) {
+          stdinFailure ??= Object.assign(new Error("child exited before stdin was written"), { code: "EPIPE" });
+          console.warn({ code: "EPIPE" }, "child exited before stdin was written");
+        }
+      } else {
+        try {
+          child.stdin.end(options.stdin);
+        } catch (error) {
+          const err = error instanceof Error ? error : new Error(String(error));
+          noteStdioError("stdin", err);
+        }
+      }
     }
   });
 }
@@ -683,6 +737,8 @@ async function streamLocalFileToSsh(input: {
     ssh.stderr?.on("data", (chunk) => {
       sshStderr += String(chunk);
     });
+    ssh.stdin?.on("error", fail);
+    ssh.stderr?.on("error", fail);
     source.on("error", fail);
     ssh.on("error", fail);
     if (input.progress) {
@@ -744,6 +800,8 @@ async function streamSshToLocalFile(input: {
     ssh.stderr?.on("data", (chunk) => {
       sshStderr += String(chunk);
     });
+    ssh.stdout?.on("error", fail);
+    ssh.stderr?.on("error", fail);
     ssh.on("error", fail);
     sink.on("error", fail);
     ssh.on("close", (code) => {
@@ -1501,6 +1559,10 @@ export async function syncDirectoryToSsh(input: {
     ssh.stderr?.on("data", (chunk) => {
       sshStderr += String(chunk);
     });
+    tar.stdout?.on("error", fail);
+    tar.stderr?.on("error", fail);
+    ssh.stdin?.on("error", fail);
+    ssh.stderr?.on("error", fail);
 
     tar.on("error", fail);
     ssh.on("error", fail);
@@ -1612,6 +1674,10 @@ export async function syncDirectoryFromSsh(input: {
       tar.stderr?.on("data", (chunk) => {
         tarStderr += String(chunk);
       });
+      ssh.stdout?.on("error", fail);
+      ssh.stderr?.on("error", fail);
+      tar.stdin?.on("error", fail);
+      tar.stderr?.on("error", fail);
 
       ssh.on("error", fail);
       tar.on("error", fail);

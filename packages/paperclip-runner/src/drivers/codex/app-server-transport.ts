@@ -442,6 +442,7 @@ export class ProcessCodexAppServerTransport implements CodexAppServerTransport {
     this.#process.stderr.on("data", (chunk: Buffer) =>
       this.#stderrDecoder.write(chunk),
     );
+    this.#process.stderr.on("error", (error) => this.#fatal(error));
     this.#process.stderr.on("end", () => this.#stderrDecoder.end());
     this.#process.stdin.on("error", (error) => this.#fatal(error));
     this.#process.on("error", (error) => this.#fatal(error));
@@ -572,6 +573,16 @@ export class ProcessCodexAppServerTransport implements CodexAppServerTransport {
       throw error;
     }
     if (
+      this.#process.killed ||
+      this.#process.exitCode !== null ||
+      this.#process.signalCode !== null ||
+      this.#process.stdin.destroyed ||
+      !this.#process.stdin.writable
+    ) {
+      this.#fatal(new Error("codex app-server exited before the request was written"));
+      return;
+    }
+    if (
       this.#process.stdin.writableLength + lineBytes >
       this.#maxBufferedOutputBytes
     ) {
@@ -586,6 +597,8 @@ export class ProcessCodexAppServerTransport implements CodexAppServerTransport {
     } catch (error) {
       const failure = error instanceof Error ? error : new Error(String(error));
       this.#fatal(failure);
+      const code = (failure as NodeJS.ErrnoException).code;
+      if (code === "EPIPE" || code === "ERR_STREAM_DESTROYED") return;
       throw failure;
     }
   }

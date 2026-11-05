@@ -907,12 +907,17 @@ async function executeProcess(input: {
     });
     const stdout = createProcessOutputCapture(input.maxStdoutBytes ?? DEFAULT_EXECUTE_PROCESS_OUTPUT_BYTES);
     const stderr = createProcessOutputCapture(input.maxStderrBytes ?? DEFAULT_EXECUTE_PROCESS_OUTPUT_BYTES);
+    const onStdioError = (err: Error) => {
+      reject(err);
+    };
     child.stdout?.on("data", (chunk) => {
       stdout.append(String(chunk));
     });
+    child.stdout?.on("error", onStdioError);
     child.stderr?.on("data", (chunk) => {
       stderr.append(String(chunk));
     });
+    child.stderr?.on("error", onStdioError);
     child.on("error", reject);
     child.on("close", (code) => resolve({ stdout, stderr, code }));
   });

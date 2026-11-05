@@ -116,6 +116,16 @@ async function runGit(directory: string, args: string[], token: string, options:
         }
       })().catch(stop).finally(() => { reporting = null; if (latest && !failure && !closed) report(); });
     };
+    const noteStdioError = (err: Error) => {
+      const code = (err as NodeJS.ErrnoException).code;
+      stop(unprocessable(
+        code === 'EPIPE' || code === 'ERR_STREAM_DESTROYED'
+          ? 'Repository download closed before it finished. Try again.'
+          : 'Could not read the repository download. Try again.',
+      ));
+    };
+    child.stdout.on('error', noteStdioError);
+    child.stderr.on('error', noteStdioError);
     child.stdout.on('data', (chunk: Buffer) => {
       bytes += chunk.length;
       if (bytes > (options.maxOutput ?? MAX_TREE_BYTES)) stop(unprocessable('Repository contents exceed the scan limit. Use a smaller skills repository.'));
