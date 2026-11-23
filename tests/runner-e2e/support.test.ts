@@ -175,6 +175,7 @@ describe("runner E2E local binary resolution", () => {
         runnerBinary,
         undefined,
         "linux",
+        "x64",
       ),
     ).toBe(runnerBinary);
     expect(
@@ -183,6 +184,7 @@ describe("runner E2E local binary resolution", () => {
         runnerBinary,
         undefined,
         "linux",
+        "x64",
       ),
     ).toBeUndefined();
     expect(
@@ -201,7 +203,14 @@ describe("runner E2E local binary resolution", () => {
         "darwin",
       ),
     ).toBe("/cross-compiled/paperclip-runnerd");
+    expect(resolvePaperclipRemoteRunnerBinaryForHarness(
+      [remoteNativeExecution], runnerBinary, undefined, "linux", "arm64",
+    )).toBeUndefined();
+    expect(resolvePaperclipRemoteRunnerBinaryForHarness(
+      [remoteNativeExecution], runnerBinary, "/cross-compiled/linux-x64-runnerd", "linux", "arm64",
+    )).toBe("/cross-compiled/linux-x64-runnerd");
   });
+
 });
 
 describe("runner E2E provider environment", () => {
@@ -922,6 +931,8 @@ describe("runner E2E server isolation", () => {
         XAI_API_KEY: "xai",
         GROK_AUTH_JSON: "grok-auth-json",
         DAYTONA_API_KEY: "daytona",
+        GITHUB_TOKEN: "github-private-repository",
+        GH_TOKEN: "github-cli",
         XAI_ORG_ID: "xai-sensitive",
         GROK_HOME: "/outside/grok",
         OPENAI_ORG_ID: "also-provider-sensitive",
@@ -946,6 +957,8 @@ describe("runner E2E server isolation", () => {
     expect(env.PATH).toBe("/bin");
     expect(env.DATABASE_URL).toBeUndefined();
     expect(env.OPENAI_API_KEY).toBeUndefined();
+    expect(env.GITHUB_TOKEN).toBeUndefined();
+    expect(env.GH_TOKEN).toBeUndefined();
     expect(env.KIMI_MODEL_API_KEY).toBeUndefined();
     expect(env.XAI_API_KEY).toBeUndefined();
     expect(env.GROK_AUTH_JSON).toBeUndefined();
@@ -1451,6 +1464,13 @@ describe("persisted final response selection", () => {
   it("fails closed when the selected final comment is missing or belongs to another run", () => {
     expect(persistedFinalRunMessage(comments.slice(0, 1), run)).toBe("");
     expect(persistedFinalRunMessage(comments, { ...run, resultJson: { presentationDecision: { commentId: "other-run" } } })).toBe("");
+  });
+  it("waits for the native response receipt and its selected comment, not an earlier attachment comment", () => {
+    const native = { ...run, runtimeMode: "native" };
+    expect(persistedFinalRunMessage(comments.slice(0, 1), { id: native.id, runtimeMode: "native" })).toBe("");
+    expect(persistedFinalRunMessage(comments, { id: native.id, runtimeMode: "native", resultJson: { summary: "FINAL" } })).toBe("");
+    expect(persistedFinalRunMessage(comments.slice(0, 1), native)).toBe("");
+    expect(persistedFinalRunMessage(comments, native)).toBe("FINAL");
   });
   it("keeps legacy fallback and does not replace absent visible text with a summary", () => {
     expect(persistedFinalRunMessage(comments, { id: "run-1" })).toBe("Prepared file for this response.\nFINAL");

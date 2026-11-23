@@ -1,7 +1,7 @@
 import type { NativeEvidenceAssessment } from "./evidence-classifier.js";
 import { NATIVE_MODEL_REJECTION_MESSAGE, NATIVE_PROVIDER_CAPACITY_MAX_RETRIES, NATIVE_PROVIDER_OVERLOADED_CODE, NATIVE_PROVIDER_OVERLOADED_MESSAGE } from "./native-provider-failure.js";
 
-export const NATIVE_STATUS_ARBITER_POLICY_VERSION = "phase6-v9";
+export const NATIVE_STATUS_ARBITER_POLICY_VERSION = "phase6-v13";
 
 export type NativeAuthoritativeIssueStatus =
   | "backlog"
@@ -91,6 +91,34 @@ export interface NativeStatusDecision {
   effects: NativeStatusEffect[];
 }
 
+/**
+ * Completion is the current owner's decision. A run whose task was reassigned
+ * away (to another agent or to a user) keeps its accepted result as history,
+ * but its done report cannot close the new owner's task.
+ */
+export function ownsNativeTaskCompletion(
+  issue: { assigneeAgentId: string | null; assigneeUserId: string | null },
+  agentId: string,
+) {
+  return issue.assigneeAgentId === agentId && !issue.assigneeUserId;
+}
+
+export function supersedeStaleOwnerCompletion(
+  decision: NativeStatusDecision,
+  issue: { status: string; assigneeAgentId: string | null; assigneeUserId: string | null },
+  agentId: string,
+): NativeStatusDecision {
+  if (decision.statusAction !== "done" || ownsNativeTaskCompletion(issue, agentId)) return decision;
+  return {
+    policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,
+    statusAction: "preserve",
+    toStatus: issue.status as NativeAuthoritativeIssueStatus,
+    reasonCode: "completion_owner_superseded",
+    unblockDescriptor: null,
+    effects: [],
+  };
+}
+
 /** Pure authority boundary: model prose is evidence, never a status command. */
 export function arbitrateNativeStatus(input: {
   assessment: NativeEvidenceAssessment;
@@ -98,6 +126,8 @@ export function arbitrateNativeStatus(input: {
   workspaceFinalizeStatus: "succeeded" | "failed";
   governanceGate?: NativeGovernanceGate | null;
   completionClaimPolicyAccepted?: boolean;
+  /** Canonical exact-output human verdicts, only for an explicitly opted-in requirement. */
+  requiredQualityReviewSatisfied?: boolean;
   allowIncompleteContinuation?: boolean;
   /**
    * True when the issue already has a durable unresolved dependency edge.
@@ -105,14 +135,28 @@ export function arbitrateNativeStatus(input: {
    * checkout is intentionally gated until the dependency resolves.
    */
   hasUnresolvedIssueBlockers?: boolean;
+  /** A newer native child result still has an undelivered parent wake. */
+  hasPendingChildCompletion?: boolean;
   /** A governance interaction created by this run was accepted before the run settled. */
   governanceResolvedForRun?: boolean;
   externalChatResponseWaitAuthorization?:
     "authorized" | "revoked" | "not_applicable";
+  hasUnprovenPreservedResultStatus?: boolean;
+  publishedExternalReview?: boolean;
+  /** Server-verified accepted plan request and normal provider terminal. */
+  planWaitAuthorized?: boolean;
+  monitorWaitAuthorized?: boolean;
+  caseHandoffAuthorized?: boolean;
+  /** The saved timer already admitted another run and this run no longer owns checkout. */
+  monitorWaitDispatched?: boolean;
+  monitorWaitPreserved?: boolean;
+  monitorWaitSuperseded?: boolean;
   boardResponseWaitAuthorized?: boolean;
   boardResponseWaitOrigin?: boolean;
   isConversation?: boolean;
   hasActivePauseHold?: boolean;
+  /** The run only compacted the agent's context; it carries no task outcome. */
+  contextCompactionRun?: boolean;
   reviewOwnerUserId?: string | null;
   /** Review decisions own task state; a reviewer's finish report cannot override them. */
   nativeReviewOutcome?: "resolved" | "pending" | "stale";
@@ -124,6 +168,16 @@ export function arbitrateNativeStatus(input: {
   agentId: string;
   priorIssueStatus: NativeAuthoritativeIssueStatus;
 }): NativeStatusDecision {
+  if (input.contextCompactionRun) {
+    return {
+      policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,
+      statusAction: "preserve",
+      toStatus: input.priorIssueStatus,
+      reasonCode: "context_compaction_status_preserved",
+      unblockDescriptor: null,
+      effects: [],
+    };
+  }
   if (["done", "cancelled"].includes(input.priorIssueStatus)) {
     return {
       policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,
@@ -156,6 +210,12 @@ export function arbitrateNativeStatus(input: {
     policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,
     statusAction: "preserve", toStatus: input.priorIssueStatus,
     reasonCode: "provider_failure_authority_superseded", unblockDescriptor: null, effects: [],
+  };
+  if (input.caseHandoffAuthorized) return {
+    policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,
+    statusAction: "preserve", toStatus: input.priorIssueStatus,
+    reasonCode: "case_handoff_waiting_for_release", unblockDescriptor: null,
+    effects: [{ kind: "release_checkout" }],
   };
   if (input.providerModelRejected && input.terminalState === "failed" &&
       input.nativeReviewOutcome !== "stale" && input.nativeReviewOutcome !== "resolved") {
@@ -321,7 +381,7 @@ export function arbitrateNativeStatus(input: {
     input.assessment.hasBlockingRemainingWork;
   if (
     input.hasUnresolvedIssueBlockers === true &&
-    (["done", "blocked"].includes(input.assessment.reportedDisposition) || unfinishedResponseWait)
+    (["done", "blocked"].includes(input.assessment.reportedDisposition) || unfinishedResponseWait || input.assessment.continuation?.kind === "monitor")
   ) {
     const owner = input.assessment.blocker?.boardOwned
       ? ("board" as const)
@@ -340,6 +400,15 @@ export function arbitrateNativeStatus(input: {
       // Dependency completion owns the wake. Do not immediately rerun the
       // blocked issue merely because the provider mislabeled its scope/status.
       effects: [],
+    };
+  }
+  if (input.requiredQualityReviewSatisfied === false && input.assessment.reportedDisposition === "done") {
+    return {
+      policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,
+      statusAction: "in_progress", toStatus: "in_progress",
+      reasonCode: "required_quality_review_incomplete", unblockDescriptor: null,
+      effects: [{ kind: "release_checkout" }, { kind: "record_recovery", cause: "required_quality_review_incomplete",
+        nextAction: "Request or resume the task's required quality review for exact output versions; do not repeat completed work or create a generic completion approval.", agentId: input.agentId }],
     };
   }
   const evidenceComplete =
@@ -363,6 +432,17 @@ export function arbitrateNativeStatus(input: {
     input.assessment.attentionRequests.length === 0 &&
     !input.assessment.hasBlockingRemainingWork;
   const complete = evidenceComplete || policyClaimComplete;
+  if (complete && input.hasPendingChildCompletion) {
+    return {
+      policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,
+      statusAction: "in_progress",
+      toStatus: "in_progress",
+      reasonCode: "native_child_completion_pending",
+      unblockDescriptor: null,
+      // The durable outbox/deferred wake already owns exactly one continuation.
+      effects: [{ kind: "release_checkout" }],
+    };
+  }
   if (complete) {
     return {
       policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,
@@ -446,15 +526,62 @@ export function arbitrateNativeStatus(input: {
       ],
     };
   }
+  if (input.assessment.reportedDisposition === "yielded" && input.assessment.continuation?.kind === "monitor") {
+    if (input.monitorWaitDispatched) {
+      return {
+        policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,
+        statusAction: "preserve", toStatus: input.priorIssueStatus,
+        reasonCode: "scheduled_monitor_dispatched", unblockDescriptor: null,
+        // Delivery already happened. Preserve successor ownership and never
+        // re-arm its timer or repeat the completed provider turn.
+        effects: [],
+      };
+    }
+    if (input.monitorWaitSuperseded) return {
+      policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,
+      statusAction: "preserve", toStatus: input.priorIssueStatus,
+      reasonCode: "scheduled_monitor_superseded", unblockDescriptor: null, effects: [],
+    };
+    if (input.monitorWaitPreserved) {
+      return {
+        policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,
+        statusAction: "preserve", toStatus: input.priorIssueStatus,
+        reasonCode: "scheduled_monitor_preserved", unblockDescriptor: null, effects: [],
+      };
+    }
+    if (input.monitorWaitAuthorized) {
+      return {
+        policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,
+        statusAction: input.publishedExternalReview ? "in_review" : "preserve",
+        toStatus: input.publishedExternalReview ? "in_review" : input.priorIssueStatus,
+        reasonCode: "scheduled_monitor_waiting", unblockDescriptor: null,
+        // The persisted timer owns delivery, never enqueue an immediate wake.
+        effects: [{ kind: "release_checkout" }],
+      };
+    }
+    return {
+      policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,
+      statusAction: "preserve", toStatus: input.priorIssueStatus,
+      reasonCode: "monitor_wait_authority_lost", unblockDescriptor: null,
+      effects: [{ kind: "record_finalization_error", cause: "monitor_wait_authority_lost",
+        nextAction: "The scheduled monitor was cleared or became ineligible. Re-establish a valid task action path.",
+        agentId: input.agentId }],
+    };
+  }
   if (
     input.assessment.reportedDisposition === "yielded" &&
     input.assessment.continuation?.kind === "response_wake" &&
     input.externalChatResponseWaitAuthorization === "authorized"
   ) {
+    if (input.hasUnprovenPreservedResultStatus) return {
+      policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,
+      statusAction: "preserve", toStatus: input.priorIssueStatus,
+      reasonCode: "preserved_result_status_unproven", unblockDescriptor: null, effects: [],
+    };
     return {
       policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,
-      statusAction: "in_progress",
-      toStatus: "in_progress",
+      statusAction: input.publishedExternalReview ? "in_review" : "in_progress",
+      toStatus: input.publishedExternalReview ? "in_review" : "in_progress",
       reasonCode: "external_chat_response_waiting",
       unblockDescriptor: null,
       // The active, authorized provider conversation is the durable liveness
@@ -520,8 +647,24 @@ export function arbitrateNativeStatus(input: {
     };
   }
   if (
+    input.planWaitAuthorized === true &&
+    input.assessment.reportedDisposition === "yielded" &&
+    input.assessment.continuation?.kind === "response_wake"
+  ) {
+    return {
+      policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,
+      statusAction: "in_progress", toStatus: "in_progress",
+      reasonCode: "native_plan_accepted_waiting_for_continuation",
+      unblockDescriptor: null,
+      // An answered native plan is not task completion or permission to
+      // change modes. Only a new explicit user cause may continue the work.
+      effects: [],
+    };
+  }
+  if (
     input.assessment.reportedDisposition === "yielded" &&
     input.assessment.continuation &&
+    input.assessment.continuation.kind !== "case_handoff" &&
     !unfinishedResponseWait
   ) {
     return {
