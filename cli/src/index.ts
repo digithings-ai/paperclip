@@ -1,3 +1,4 @@
+import { registerRuntimeCommands } from "./commands/runtime.js";
 import { registerEmailCommands } from "./commands/client/email.js";
 import { registerMcpCommands } from "./commands/mcp.js";
 import { Command } from "commander";
@@ -23,7 +24,6 @@ import { registerApprovalCommands } from "./commands/client/approval.js";
 import { registerActivityCommands } from "./commands/client/activity.js";
 import { registerDashboardCommands } from "./commands/client/dashboard.js";
 import { registerRoutineCommands } from "./commands/routines.js";
-import { registerPipelineCommands } from "./commands/pipelines.js";
 import { registerFeedbackCommands } from "./commands/client/feedback.js";
 import { registerSecretCommands } from "./commands/client/secrets.js";
 import { registerSkillsCommands } from "./commands/client/skills.js";
@@ -102,6 +102,7 @@ program
   .action(updateCommand);
 
 program.hook("preAction", async (_thisCommand, actionCommand) => {
+  if (actionCommand.parent?.name() === "runtime") return; // Public runtime setup never reads instance config or credentials.
   const options = actionCommand.optsWithGlobals() as DataDirOptionLike & TestDriveOptions;
   let dataDirOptions: DataDirOptionLike = options;
   if (actionCommand.name() === "test-drive") {
@@ -125,6 +126,7 @@ program.hook("preAction", async (_thisCommand, actionCommand) => {
 });
 
 registerTestDriveCommand(program);
+registerRuntimeCommands(program);
 
 program
   .command("onboard")
@@ -255,7 +257,6 @@ registerManagedAgentCommands(program);
 registerAssetCommands(program);
 registerSkillCommands(program);
 registerRoutineCommands(program);
-registerPipelineCommands(program);
 registerFeedbackCommands(program);
 registerSecretCommands(program);
 registerSkillsCommands(program);
